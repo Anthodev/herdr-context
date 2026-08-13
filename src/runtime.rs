@@ -3,30 +3,20 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Sender};
-use std::thread;
-use std::time::Duration;
 
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-    MouseEventKind,
-};
-use crossterm::execute;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::Widget;
 
 use crate::files::tree::{DirectorySnapshot, TreeNodeKind};
 use crate::files::{FilesModel, PreparedRefreshResult};
 use crate::host::LaunchContext;
+use crate::intent::{Intent, PointerAction};
 use crate::project::resolve_project_context;
 use crate::ui::files::FilesView;
 use crate::vcs::git::GitService;
 use crate::vcs::{VcsBackendMetadata, VcsWorkspace};
-
-const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(50);
+use crate::worker::{Job, JobKey, JobKind, Priority, SubmitStatus, WorkerRuntime};
 
 #[derive(Clone, Debug)]
 struct GitRefresh {
@@ -38,6 +28,8 @@ struct GitRefresh {
 #[derive(Debug)]
 pub struct FilesRuntime {
     model: FilesModel,
+    root: PathBuf,
+    background_active: bool,
     git: Option<GitRefresh>,
     expanded: BTreeSet<PathBuf>,
     desired_expanded: BTreeSet<PathBuf>,
@@ -46,13 +38,14 @@ pub struct FilesRuntime {
     viewport_height: usize,
     viewport_y: u16,
     filesystem_generation: u64,
+    filesystem_applied_generation: u64,
     filesystem_running: Option<u64>,
+    filesystem_expansions_running: BTreeSet<PathBuf>,
     filesystem_reload_running: bool,
     pending_expansions: BTreeSet<PathBuf>,
     reload_pending: bool,
+    filesystem_panic_retried: bool,
     filesystem_notice: Option<String>,
-    vcs_cancel: Option<Arc<AtomicBool>>,
-    vcs_worker: Option<thread::JoinHandle<()>>,
 }
 
 impl FilesRuntime {
@@ -88,6 +81,8 @@ impl FilesRuntime {
 
         let mut runtime = Self {
             model,
+            root: project.files_root().to_path_buf(),
+            background_active: true,
             git,
             expanded: BTreeSet::new(),
             desired_expanded: BTreeSet::new(),
@@ -96,13 +91,14 @@ impl FilesRuntime {
             viewport_height: usize::MAX,
             viewport_y: 0,
             filesystem_generation: 0,
+            filesystem_applied_generation: 0,
             filesystem_running: None,
             filesystem_reload_running: false,
+            filesystem_expansions_running: BTreeSet::new(),
             pending_expansions: BTreeSet::new(),
             reload_pending: false,
+            filesystem_panic_retried: false,
             filesystem_notice: None,
-            vcs_cancel: None,
-            vcs_worker: None,
         };
         runtime.rebuild_visible_rows();
         Ok(runtime)
@@ -133,49 +129,71 @@ impl FilesRuntime {
         .render(area, buffer);
     }
 
-    fn handle_event(&mut self, input: Event, sender: &Sender<RuntimeMessage>) -> EventOutcome {
-        match input {
-            Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key.code, sender),
-            Event::Mouse(mouse) => {
-                let redraw = match mouse.kind {
-                    MouseEventKind::Down(MouseButton::Left) => self.select_viewport_row(mouse.row),
-                    MouseEventKind::Down(MouseButton::Right) => {
-                        self.toggle_viewport_row(mouse.row, sender)
-                    }
-                    MouseEventKind::ScrollUp => self.move_selection(-1),
-                    MouseEventKind::ScrollDown => self.move_selection(1),
-                    _ => false,
-                };
-                EventOutcome {
-                    redraw,
-                    quit: false,
-                }
-            }
-            Event::Resize(_, _) => EventOutcome {
-                redraw: true,
-                quit: false,
+    pub(crate) fn handle_intent(&mut self, intent: &Intent, workers: &mut WorkerRuntime) -> bool {
+        match intent {
+            Intent::SelectPrevious => self.move_selection(-1),
+            Intent::SelectNext => self.move_selection(1),
+            Intent::SelectFirst => self.select_index(0),
+            Intent::SelectLast => self.select_index(self.visible_rows.len().saturating_sub(1)),
+            Intent::ExpandOrDescend => self.expand_or_descend(workers),
+            Intent::CollapseOrAscend => self.collapse_or_ascend(),
+            Intent::ToggleSelected => self.toggle_selected(workers),
+            Intent::Refresh => self.request_reload(workers),
+            Intent::Pointer { row, action, .. } => match action {
+                PointerAction::Select => self.select_viewport_row(*row),
+                PointerAction::Toggle => self.toggle_viewport_row(*row, workers),
             },
-            _ => EventOutcome::default(),
+            Intent::Scroll(delta) => self.move_selection(isize::from(*delta)),
+            Intent::Resize => true,
+            Intent::Quit | Intent::SwitchView(_) | Intent::NextView | Intent::PreviousView => false,
         }
     }
 
-    fn handle_key(&mut self, code: KeyCode, sender: &Sender<RuntimeMessage>) -> EventOutcome {
-        let (redraw, quit) = match code {
-            KeyCode::Esc | KeyCode::Char('q') => (false, true),
-            KeyCode::Up | KeyCode::Char('k') => (self.move_selection(-1), false),
-            KeyCode::Down | KeyCode::Char('j') => (self.move_selection(1), false),
-            KeyCode::Home => (self.select_index(0), false),
-            KeyCode::End => (
-                self.select_index(self.visible_rows.len().saturating_sub(1)),
-                false,
-            ),
-            KeyCode::Right | KeyCode::Char('l') => (self.expand_or_descend(sender), false),
-            KeyCode::Left | KeyCode::Char('h') => (self.collapse_or_ascend(), false),
-            KeyCode::Enter | KeyCode::Char(' ') => (self.toggle_selected(sender), false),
-            KeyCode::Char('r') => (self.request_reload(sender), false),
-            _ => (false, false),
+    #[cfg(test)]
+    fn handle_event(
+        &mut self,
+        event: crossterm::event::Event,
+        workers: &mut WorkerRuntime,
+    ) -> EventOutcome {
+        use crate::input::{InputMode, map_event};
+        use crate::model::UiGeometry;
+
+        let geometry = UiGeometry::new(
+            Rect::default(),
+            Rect::default(),
+            Rect::new(0, 0, u16::MAX, u16::MAX),
+        );
+        let Some(intent) = map_event(event, InputMode::Normal, &geometry) else {
+            return EventOutcome::default();
         };
-        EventOutcome { redraw, quit }
+        if intent == Intent::Quit {
+            return EventOutcome {
+                redraw: false,
+                quit: true,
+            };
+        }
+        EventOutcome {
+            redraw: self.handle_intent(&intent, workers),
+            quit: false,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn selection(&self) -> Option<&Path> {
+        self.model.tree().selection()
+    }
+
+    #[must_use]
+    pub(crate) const fn scroll(&self) -> usize {
+        self.viewport_offset
+    }
+
+    #[must_use]
+    pub(crate) const fn generations(&self) -> (u64, u64) {
+        (
+            self.filesystem_generation,
+            self.filesystem_applied_generation,
+        )
     }
 
     fn move_selection(&mut self, delta: isize) -> bool {
@@ -217,12 +235,12 @@ impl FilesRuntime {
         self.select_index(index)
     }
 
-    fn toggle_viewport_row(&mut self, terminal_row: u16, sender: &Sender<RuntimeMessage>) -> bool {
+    fn toggle_viewport_row(&mut self, terminal_row: u16, workers: &mut WorkerRuntime) -> bool {
         let Some(index) = self.viewport_index(terminal_row) else {
             return false;
         };
         let selection_changed = self.select_index(index);
-        self.toggle_selected(sender) || selection_changed
+        self.toggle_selected(workers) || selection_changed
     }
 
     fn viewport_index(&self, terminal_row: u16) -> Option<usize> {
@@ -234,7 +252,7 @@ impl FilesRuntime {
         (index < self.visible_rows.len()).then_some(index)
     }
 
-    fn expand_or_descend(&mut self, sender: &Sender<RuntimeMessage>) -> bool {
+    fn expand_or_descend(&mut self, workers: &mut WorkerRuntime) -> bool {
         let Some(path) = self.model.tree().selection().map(Path::to_path_buf) else {
             return false;
         };
@@ -254,22 +272,24 @@ impl FilesRuntime {
             }
             return selected;
         }
-        self.request_expansion(path, sender)
+        self.request_expansion(path, workers)
     }
 
-    fn toggle_selected(&mut self, sender: &Sender<RuntimeMessage>) -> bool {
+    fn toggle_selected(&mut self, workers: &mut WorkerRuntime) -> bool {
         let Some(path) = self.model.tree().selection().map(Path::to_path_buf) else {
             return false;
         };
         if self.desired_expanded.remove(&path) {
-            self.invalidate_filesystem();
+            if self.filesystem_running.is_some() {
+                self.invalidate_filesystem();
+            }
             self.pending_expansions.remove(&path);
             if self.expanded.remove(&path) {
                 self.rebuild_visible_rows();
             }
             return true;
         }
-        self.request_expansion(path, sender)
+        self.request_expansion(path, workers)
     }
 
     fn collapse_or_ascend(&mut self) -> bool {
@@ -277,7 +297,9 @@ impl FilesRuntime {
             return false;
         };
         if self.desired_expanded.remove(&path) {
-            self.invalidate_filesystem();
+            if self.filesystem_running.is_some() {
+                self.invalidate_filesystem();
+            }
             self.pending_expansions.remove(&path);
             if self.expanded.remove(&path) {
                 self.rebuild_visible_rows();
@@ -300,7 +322,7 @@ impl FilesRuntime {
         selected
     }
 
-    fn request_expansion(&mut self, path: PathBuf, sender: &Sender<RuntimeMessage>) -> bool {
+    fn request_expansion(&mut self, path: PathBuf, workers: &mut WorkerRuntime) -> bool {
         if self.model.tree().node(&path).map(|node| node.kind()) != Some(TreeNodeKind::Directory) {
             return false;
         }
@@ -308,20 +330,23 @@ impl FilesRuntime {
         if desired {
             self.invalidate_filesystem();
             self.pending_expansions.insert(path);
-            self.start_next_filesystem(sender);
+            self.start_next_filesystem(workers);
         }
         desired
     }
 
-    fn request_reload(&mut self, sender: &Sender<RuntimeMessage>) -> bool {
+    fn request_reload(&mut self, workers: &mut WorkerRuntime) -> bool {
         self.invalidate_filesystem();
         self.reload_pending = true;
-        self.start_next_filesystem(sender);
-        self.request_vcs_refresh(sender);
+        self.start_next_filesystem(workers);
+        self.request_vcs_refresh(workers);
         true
     }
 
-    fn start_next_filesystem(&mut self, sender: &Sender<RuntimeMessage>) {
+    fn start_next_filesystem(&mut self, workers: &mut WorkerRuntime) {
+        if !self.background_active {
+            return;
+        }
         if self.filesystem_running.is_some() {
             return;
         }
@@ -349,24 +374,43 @@ impl FilesRuntime {
         }
 
         let generation = self.filesystem_generation;
-        self.filesystem_running = Some(generation);
-        self.filesystem_reload_running = reload;
+        let result_expansions = expansions.clone();
         let loader = self.model.tree().directory_loader();
-        let sender = sender.clone();
-        thread::spawn(move || {
-            let result = directories
-                .into_iter()
-                .map(|directory| {
-                    let result = loader.load(directory.clone());
-                    (directory, result)
+        let job = Job::new(
+            JobKey::new(JobKind::Filesystem, &self.root),
+            generation,
+            Priority::High,
+            move |cancelled| {
+                let result = directories
+                    .into_iter()
+                    .take_while(|_| !cancelled.load(std::sync::atomic::Ordering::Relaxed))
+                    .map(|directory| {
+                        let result = loader.load(directory.clone());
+                        (directory, result)
+                    })
+                    .collect();
+                Box::new(RuntimeMessage::Filesystem {
+                    generation,
+                    expansions: result_expansions,
+                    result,
                 })
-                .collect();
-            let _ = sender.send(RuntimeMessage::Filesystem {
-                generation,
-                expansions,
-                result,
-            });
-        });
+            },
+        );
+        match workers.submit(job) {
+            SubmitStatus::Queued | SubmitStatus::Coalesced => {
+                self.filesystem_running = Some(generation);
+                self.filesystem_reload_running = reload;
+                self.filesystem_expansions_running = expansions;
+            }
+            SubmitStatus::RejectedStale
+            | SubmitStatus::Backpressure
+            | SubmitStatus::ShuttingDown => {
+                self.reload_pending |= reload;
+                self.pending_expansions.extend(expansions);
+                self.filesystem_notice =
+                    Some("background filesystem queue is unavailable".to_owned());
+            }
+        }
     }
 
     fn complete_filesystem(
@@ -374,8 +418,9 @@ impl FilesRuntime {
         generation: u64,
         expansions: BTreeSet<PathBuf>,
         result: Vec<DirectoryLoadResult>,
-        sender: &Sender<RuntimeMessage>,
+        workers: &mut WorkerRuntime,
     ) -> bool {
+        self.filesystem_expansions_running.clear();
         if self.filesystem_running != Some(generation) {
             return false;
         }
@@ -388,9 +433,14 @@ impl FilesRuntime {
                     .into_iter()
                     .filter(|path| self.desired_expanded.contains(path)),
             );
-            self.start_next_filesystem(sender);
+            if !self.reload_pending && self.pending_expansions.is_empty() {
+                self.filesystem_applied_generation = self.filesystem_generation;
+            }
+            self.start_next_filesystem(workers);
             return false;
         }
+        self.filesystem_panic_retried = false;
+        self.filesystem_applied_generation = generation;
 
         let mut loaded = BTreeSet::new();
         let mut notice = None;
@@ -433,16 +483,16 @@ impl FilesRuntime {
         if changed {
             self.rebuild_visible_rows();
         }
-        self.start_next_filesystem(sender);
+        self.start_next_filesystem(workers);
         true
     }
 
-    fn request_vcs_refresh(&mut self, sender: &Sender<RuntimeMessage>) -> bool {
+    fn request_vcs_refresh(&mut self, workers: &mut WorkerRuntime) -> bool {
         if self.git.is_none() {
             return false;
         }
         self.model.request_refresh();
-        self.start_next_vcs_refresh(sender);
+        self.start_next_vcs_refresh(workers);
         true
     }
 
@@ -450,40 +500,46 @@ impl FilesRuntime {
         self.filesystem_generation = self.filesystem_generation.saturating_add(1);
     }
 
-    fn start_next_vcs_refresh(&mut self, sender: &Sender<RuntimeMessage>) {
+    fn start_next_vcs_refresh(&mut self, workers: &mut WorkerRuntime) {
+        if !self.background_active {
+            return;
+        }
         let Some(generation) = self.model.begin_refresh() else {
             return;
         };
         let Some(git) = self.git.clone() else {
+            self.model.cancel_refresh_start(generation);
             return;
         };
         let input = self.model.status_merge_input();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        self.vcs_cancel = Some(Arc::clone(&cancelled));
-        let sender = sender.clone();
-        self.vcs_worker = Some(thread::spawn(move || {
+        let key = JobKey::new(JobKind::Vcs, git.workspace.root());
+        let job = Job::new(key, generation, Priority::High, move |cancelled| {
             let snapshot = git
                 .service
-                .refresh_status_cancellable(&git.workspace, &cancelled);
-            let result = PreparedRefreshResult::prepare(generation, input, snapshot);
-            let _ = sender.send(RuntimeMessage::Vcs(result));
-        }));
+                .refresh_status_cancellable(&git.workspace, cancelled);
+            Box::new(RuntimeMessage::Vcs(PreparedRefreshResult::prepare(
+                generation, input, snapshot,
+            )))
+        });
+        if !matches!(
+            workers.submit(job),
+            SubmitStatus::Queued | SubmitStatus::Coalesced
+        ) {
+            self.model.cancel_refresh_start(generation);
+            self.filesystem_notice = Some("background VCS queue is unavailable".to_owned());
+        }
     }
 
     fn complete_vcs_refresh(
         &mut self,
         result: PreparedRefreshResult,
-        sender: &Sender<RuntimeMessage>,
+        workers: &mut WorkerRuntime,
     ) -> bool {
-        if let Some(worker) = self.vcs_worker.take() {
-            let _ = worker.join();
-        }
-        self.vcs_cancel = None;
         let changed = self.model.complete_prepared_refresh(result);
         if changed {
             self.rebuild_visible_rows();
         }
-        self.start_next_vcs_refresh(sender);
+        self.start_next_vcs_refresh(workers);
         true
     }
 
@@ -562,25 +618,94 @@ impl FilesRuntime {
             .min(self.visible_rows.len().saturating_sub(1));
     }
 
-    const fn has_pending_work(&self) -> bool {
-        self.filesystem_running.is_some() || self.model.refresh_is_running()
+    pub(crate) fn has_pending_work(&self) -> bool {
+        self.filesystem_running.is_some()
+            || self.model.refresh_is_running()
+            || (self.background_active
+                && (self.reload_pending || !self.pending_expansions.is_empty()))
     }
 
-    fn shutdown_workers(&mut self) {
-        if let Some(cancelled) = &self.vcs_cancel {
-            cancelled.store(true, Ordering::Relaxed);
+    pub(crate) fn start_background(&mut self, workers: &mut WorkerRuntime) {
+        self.background_active = true;
+        self.request_vcs_refresh(workers);
+        self.retry_pending(workers);
+    }
+
+    pub(crate) const fn pause_background(&mut self) {
+        self.background_active = false;
+    }
+
+    pub(crate) fn complete_background(
+        &mut self,
+        message: RuntimeMessage,
+        workers: &mut WorkerRuntime,
+    ) -> bool {
+        match message {
+            RuntimeMessage::Filesystem {
+                generation,
+                expansions,
+                result,
+            } => self.complete_filesystem(generation, expansions, result, workers),
+            RuntimeMessage::Vcs(result) => self.complete_vcs_refresh(result, workers),
         }
-        if let Some(worker) = self.vcs_worker.take() {
-            let _ = worker.join();
+    }
+
+    pub(crate) fn retry_pending(&mut self, workers: &mut WorkerRuntime) {
+        self.start_next_filesystem(workers);
+        self.start_next_vcs_refresh(workers);
+    }
+
+    pub(crate) fn fail_background(
+        &mut self,
+        kind: JobKind,
+        generation: u64,
+        workers: &mut WorkerRuntime,
+    ) {
+        match kind {
+            JobKind::Filesystem if self.filesystem_running.is_some() => {
+                self.filesystem_running = None;
+                self.reload_pending |= std::mem::take(&mut self.filesystem_reload_running);
+                self.pending_expansions.extend(
+                    std::mem::take(&mut self.filesystem_expansions_running)
+                        .into_iter()
+                        .filter(|path| self.desired_expanded.contains(path)),
+                );
+                self.invalidate_filesystem();
+                if !self.filesystem_panic_retried
+                    && (self.reload_pending || !self.pending_expansions.is_empty())
+                {
+                    self.filesystem_panic_retried = true;
+                    self.filesystem_notice =
+                        Some("background filesystem worker stopped; retrying once".to_owned());
+                } else {
+                    self.reload_pending = false;
+                    self.pending_expansions.clear();
+                    self.filesystem_applied_generation = self.filesystem_generation;
+                    self.filesystem_notice =
+                        Some("background filesystem worker stopped unexpectedly".to_owned());
+                }
+            }
+            JobKind::Vcs => {
+                self.model.cancel_refresh_start(generation);
+                self.model.request_refresh();
+                self.filesystem_notice =
+                    Some("background VCS worker stopped unexpectedly".to_owned());
+            }
+            JobKind::Bootstrap
+            | JobKind::ConversationDiscovery
+            | JobKind::Process
+            | JobKind::Filesystem => {}
         }
-        self.vcs_cancel = None;
+        if kind != JobKind::Filesystem || self.filesystem_panic_retried {
+            self.retry_pending(workers);
+        }
     }
 }
 
 type DirectoryLoadResult = (PathBuf, io::Result<DirectorySnapshot>);
 
 #[derive(Debug)]
-enum RuntimeMessage {
+pub(crate) enum RuntimeMessage {
     Filesystem {
         generation: u64,
         expansions: BTreeSet<PathBuf>,
@@ -589,126 +714,11 @@ enum RuntimeMessage {
     Vcs(PreparedRefreshResult),
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct EventOutcome {
     redraw: bool,
     quit: bool,
-}
-
-/// Draws immediately, then bootstraps filesystem and Git work on workers.
-pub fn run_files_terminal(context: LaunchContext) -> Result<(), FilesRuntimeError> {
-    let (sender, receiver) = mpsc::channel();
-    let (bootstrap_sender, bootstrap_receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let _ = bootstrap_sender.send(FilesRuntime::bootstrap(&context));
-    });
-
-    let _mouse_capture = MouseCapture::enable()?;
-    ratatui::run(|terminal| {
-        terminal.draw(|frame| {
-            frame.render_widget(Paragraph::new("Loading Files…"), frame.area());
-        })?;
-        let mut runtime = None;
-        let mut startup_error = None;
-        let mut bootstrap_pending = true;
-        let mut redraw = false;
-        loop {
-            if bootstrap_pending {
-                match bootstrap_receiver.try_recv() {
-                    Ok(result) => {
-                        bootstrap_pending = false;
-                        match result {
-                            Ok(mut ready) => {
-                                ready.request_vcs_refresh(&sender);
-                                runtime = Some(ready);
-                            }
-                            Err(error) => startup_error = Some(error.to_string()),
-                        }
-                        redraw = true;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        bootstrap_pending = false;
-                        startup_error = Some("Files worker stopped unexpectedly".to_owned());
-                        redraw = true;
-                    }
-                }
-            }
-            while let Ok(message) = receiver.try_recv() {
-                redraw = true;
-                match message {
-                    RuntimeMessage::Filesystem {
-                        generation,
-                        expansions,
-                        result,
-                    } => {
-                        if let Some(runtime) = &mut runtime {
-                            runtime.complete_filesystem(generation, expansions, result, &sender);
-                        }
-                    }
-                    RuntimeMessage::Vcs(result) => {
-                        if let Some(runtime) = &mut runtime {
-                            runtime.complete_vcs_refresh(result, &sender);
-                        }
-                    }
-                }
-            }
-
-            if redraw {
-                terminal.draw(|frame| {
-                    if let Some(runtime) = &mut runtime {
-                        runtime.render(frame.area(), frame.buffer_mut());
-                    } else if let Some(error) = &startup_error {
-                        frame.render_widget(Paragraph::new(error.as_str()), frame.area());
-                    } else {
-                        frame.render_widget(Paragraph::new("Loading Files…"), frame.area());
-                    }
-                })?;
-                redraw = false;
-            }
-
-            let worker_pending =
-                bootstrap_pending || runtime.as_ref().is_some_and(FilesRuntime::has_pending_work);
-            let input = if worker_pending {
-                event::poll(WORKER_POLL_INTERVAL)?
-                    .then(event::read)
-                    .transpose()?
-            } else {
-                Some(event::read()?)
-            };
-            if let Some(input) = input {
-                if let Some(runtime) = &mut runtime {
-                    let outcome = runtime.handle_event(input, &sender);
-                    redraw |= outcome.redraw;
-                    if outcome.quit {
-                        runtime.shutdown_workers();
-                        return Ok::<(), io::Error>(());
-                    }
-                } else if let Event::Key(key) = input
-                    && key.kind == KeyEventKind::Press
-                    && matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
-                {
-                    return Ok(());
-                }
-            }
-        }
-    })
-    .map_err(FilesRuntimeError::from)
-}
-
-struct MouseCapture;
-
-impl MouseCapture {
-    fn enable() -> io::Result<Self> {
-        execute!(io::stdout(), EnableMouseCapture)?;
-        Ok(Self)
-    }
-}
-
-impl Drop for MouseCapture {
-    fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableMouseCapture);
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -721,6 +731,10 @@ impl FilesRuntimeError {
         Self {
             message: message.into(),
         }
+    }
+
+    pub(crate) fn cancelled() -> Self {
+        Self::new("Files bootstrap was cancelled")
     }
 }
 
@@ -744,7 +758,6 @@ mod tests {
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
-    use std::sync::mpsc;
     use std::time::Duration;
 
     use crossterm::event::{
@@ -757,6 +770,8 @@ mod tests {
     use super::{FilesRuntime, RuntimeMessage};
     use crate::host::LaunchContext;
     use crate::vcs::{VcsEntryStatus, VcsStatusKind, VcsStatusSnapshot};
+    use crate::worker::WorkerRuntime;
+
     fn runtime(temp: &TempDir) -> FilesRuntime {
         let context = LaunchContext::from_vars([(
             "HERDR_PLUGIN_CONTEXT_JSON",
@@ -773,6 +788,19 @@ mod tests {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
     }
 
+    fn workers() -> WorkerRuntime {
+        WorkerRuntime::with_capacities(4, 2)
+    }
+
+    fn receive(workers: &mut WorkerRuntime) -> RuntimeMessage {
+        workers
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker result")
+            .downcast::<RuntimeMessage>()
+            .map(|message| *message)
+            .expect("Files runtime message")
+    }
+
     #[test]
     fn navigates_expands_and_collapses_without_eagerly_loading_descendants() {
         let temp = TempDir::new().expect("tempdir");
@@ -780,7 +808,7 @@ mod tests {
         fs::write(temp.path().join("src/child.rs"), []).expect("child");
         fs::write(temp.path().join("root.rs"), []).expect("root file");
         let mut runtime = runtime(&temp);
-        let (sender, receiver) = mpsc::channel();
+        let mut workers = workers();
 
         assert_eq!(
             runtime.visible_rows,
@@ -794,20 +822,18 @@ mod tests {
                 .is_none()
         );
 
-        let outcome = runtime.handle_event(press(KeyCode::Right), &sender);
+        let outcome = runtime.handle_event(press(KeyCode::Right), &mut workers);
         assert!(outcome.redraw);
         let RuntimeMessage::Filesystem {
             generation,
             expansions,
             result,
-        } = receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("filesystem result")
+        } = receive(&mut workers)
         else {
             panic!("unexpected worker result");
         };
 
-        assert!(runtime.complete_filesystem(generation, expansions, result, &sender));
+        assert!(runtime.complete_filesystem(generation, expansions, result, &mut workers));
         assert_eq!(
             runtime.visible_rows,
             [
@@ -817,17 +843,22 @@ mod tests {
             ]
         );
 
-        runtime.handle_event(press(KeyCode::Down), &sender);
+        runtime.handle_event(press(KeyCode::Down), &mut workers);
         assert_eq!(
             runtime.model.tree().selection(),
             Some(Path::new("src/child.rs"))
         );
-        runtime.handle_event(press(KeyCode::Left), &sender);
+        runtime.handle_event(press(KeyCode::Left), &mut workers);
         assert_eq!(runtime.model.tree().selection(), Some(Path::new("src")));
-        runtime.handle_event(press(KeyCode::Left), &sender);
+        runtime.handle_event(press(KeyCode::Left), &mut workers);
         assert_eq!(
             runtime.visible_rows,
             [Path::new("src"), Path::new("root.rs")]
+        );
+        assert_eq!(
+            runtime.generations().0,
+            runtime.generations().1,
+            "quiescent collapse must not leave an unapplied generation"
         );
     }
     #[test]
@@ -836,21 +867,19 @@ mod tests {
         fs::create_dir(temp.path().join("src")).expect("src");
         fs::write(temp.path().join("src/child.rs"), []).expect("child");
         let mut runtime = runtime(&temp);
-        let (sender, receiver) = mpsc::channel();
+        let mut workers = workers();
 
-        runtime.handle_event(press(KeyCode::Enter), &sender);
-        runtime.handle_event(press(KeyCode::Enter), &sender);
+        runtime.handle_event(press(KeyCode::Enter), &mut workers);
+        runtime.handle_event(press(KeyCode::Enter), &mut workers);
         let RuntimeMessage::Filesystem {
             generation,
             expansions,
             result,
-        } = receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("filesystem result")
+        } = receive(&mut workers)
         else {
             panic!("unexpected worker result");
         };
-        runtime.complete_filesystem(generation, expansions, result, &sender);
+        runtime.complete_filesystem(generation, expansions, result, &mut workers);
 
         assert_eq!(runtime.visible_rows, [Path::new("src")]);
         assert!(runtime.expanded.is_empty());
@@ -862,24 +891,22 @@ mod tests {
         fs::write(temp.path().join("initial"), []).expect("initial");
         let mut runtime = runtime(&temp);
         fs::write(temp.path().join("added-later"), []).expect("added later");
-        let (sender, receiver) = mpsc::channel();
+        let mut workers = workers();
 
         assert!(
             runtime
-                .handle_event(press(KeyCode::Char('r')), &sender)
+                .handle_event(press(KeyCode::Char('r')), &mut workers)
                 .redraw
         );
         let RuntimeMessage::Filesystem {
             generation,
             expansions,
             result,
-        } = receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("filesystem refresh")
+        } = receive(&mut workers)
         else {
             panic!("unexpected worker result");
         };
-        assert!(runtime.complete_filesystem(generation, expansions, result, &sender));
+        assert!(runtime.complete_filesystem(generation, expansions, result, &mut workers));
 
         assert!(
             runtime
@@ -894,34 +921,30 @@ mod tests {
         fs::create_dir(temp.path().join("removed")).expect("directory");
         fs::write(temp.path().join("removed/child"), []).expect("child");
         let mut runtime = runtime(&temp);
-        let (sender, receiver) = mpsc::channel();
+        let mut workers = workers();
 
-        runtime.handle_event(press(KeyCode::Right), &sender);
+        runtime.handle_event(press(KeyCode::Right), &mut workers);
         let RuntimeMessage::Filesystem {
             generation,
             expansions,
             result,
-        } = receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("expansion")
+        } = receive(&mut workers)
         else {
             panic!("unexpected worker result");
         };
-        runtime.complete_filesystem(generation, expansions, result, &sender);
+        runtime.complete_filesystem(generation, expansions, result, &mut workers);
         fs::remove_dir_all(temp.path().join("removed")).expect("remove directory");
 
-        runtime.handle_event(press(KeyCode::Char('r')), &sender);
+        runtime.handle_event(press(KeyCode::Char('r')), &mut workers);
         let RuntimeMessage::Filesystem {
             generation,
             expansions,
             result,
-        } = receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("filesystem refresh")
+        } = receive(&mut workers)
         else {
             panic!("unexpected worker result");
         };
-        runtime.complete_filesystem(generation, expansions, result, &sender);
+        runtime.complete_filesystem(generation, expansions, result, &mut workers);
 
         assert!(runtime.model.tree().node(Path::new("removed")).is_none());
         assert!(runtime.filesystem_notice.is_none());
@@ -935,7 +958,7 @@ mod tests {
         fs::write(temp.path().join("root.rs"), []).expect("root file");
         let mut runtime = runtime(&temp);
 
-        let (sender, receiver) = mpsc::channel();
+        let mut workers = workers();
         let area = Rect::new(0, 0, 20, 2);
         runtime.render(area, &mut Buffer::empty(area));
 
@@ -946,7 +969,7 @@ mod tests {
                 row: 1,
                 modifiers: KeyModifiers::NONE,
             }),
-            &sender,
+            &mut workers,
         );
         assert_eq!(runtime.model.tree().selection(), Some(Path::new("root.rs")));
 
@@ -957,12 +980,12 @@ mod tests {
                 row: 0,
                 modifiers: KeyModifiers::NONE,
             }),
-            &sender,
+            &mut workers,
         );
         assert_eq!(runtime.model.tree().selection(), Some(Path::new("src")));
         assert!(matches!(
-            receiver.recv_timeout(Duration::from_secs(1)),
-            Ok(RuntimeMessage::Filesystem { .. })
+            receive(&mut workers),
+            RuntimeMessage::Filesystem { .. }
         ));
     }
     #[test]
@@ -977,7 +1000,7 @@ mod tests {
             .expect("stale descendant");
         fs::remove_dir_all(temp.path().join("removed")).expect("remove directory");
         let current_root = loader.load(PathBuf::new()).expect("current root");
-        let (sender, _receiver) = mpsc::channel();
+        let mut workers = workers();
         runtime.filesystem_running = Some(1);
         runtime.filesystem_generation = 1;
 
@@ -988,7 +1011,7 @@ mod tests {
                 (PathBuf::new(), Ok(current_root)),
                 (PathBuf::from("removed"), Ok(stale_descendant)),
             ],
-            &sender,
+            &mut workers,
         );
 
         assert!(runtime.model.tree().node(Path::new("removed")).is_none());
@@ -1005,7 +1028,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         fs::create_dir(temp.path().join("src")).expect("src");
         let mut runtime = runtime(&temp);
-        let (sender, receiver) = mpsc::channel();
+        let mut workers = workers();
         let area = Rect::new(0, 0, 20, 3);
         runtime.render(area, &mut Buffer::empty(area));
 
@@ -1016,15 +1039,12 @@ mod tests {
                 row: 2,
                 modifiers: KeyModifiers::NONE,
             }),
-            &sender,
+            &mut workers,
         );
 
         assert!(!outcome.redraw);
         assert!(runtime.expanded.is_empty());
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
-        ));
+        assert!(workers.try_recv().is_none());
     }
 
     #[test]
@@ -1034,12 +1054,12 @@ mod tests {
             fs::write(temp.path().join(name), []).expect("file");
         }
         let mut runtime = runtime(&temp);
-        let (sender, _receiver) = mpsc::channel();
+        let mut workers = workers();
         let area = Rect::new(0, 0, 10, 2);
         let mut buffer = Buffer::empty(area);
         runtime.render(area, &mut buffer);
 
-        runtime.handle_event(press(KeyCode::End), &sender);
+        runtime.handle_event(press(KeyCode::End), &mut workers);
         let cached_rows = runtime.visible_rows.as_ptr();
         runtime.render(area, &mut buffer);
 
@@ -1056,10 +1076,18 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         fs::write(temp.path().join("file"), []).expect("file");
         let mut runtime = runtime(&temp);
-        let (sender, _receiver) = mpsc::channel();
+        let mut workers = workers();
 
-        assert!(!runtime.handle_event(Event::FocusGained, &sender).redraw);
-        assert!(runtime.handle_event(Event::Resize(80, 24), &sender).redraw);
+        assert!(
+            !runtime
+                .handle_event(Event::FocusGained, &mut workers)
+                .redraw
+        );
+        assert!(
+            runtime
+                .handle_event(Event::Resize(80, 24), &mut workers)
+                .redraw
+        );
     }
 
     #[test]
@@ -1085,27 +1113,25 @@ mod tests {
             ))
             .expect("merge status");
         runtime.rebuild_visible_rows();
-        let (sender, receiver) = mpsc::channel();
+        let mut workers = workers();
 
-        runtime.handle_event(press(KeyCode::Right), &sender);
+        runtime.handle_event(press(KeyCode::Right), &mut workers);
         let RuntimeMessage::Filesystem {
             generation,
             expansions,
             result,
-        } = receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("filesystem result")
+        } = receive(&mut workers)
         else {
             panic!("unexpected worker result");
         };
-        runtime.complete_filesystem(generation, expansions, result, &sender);
-        runtime.handle_event(press(KeyCode::Right), &sender);
+        runtime.complete_filesystem(generation, expansions, result, &mut workers);
+        runtime.handle_event(press(KeyCode::Right), &mut workers);
 
         assert_eq!(
             runtime.model.tree().selection(),
             Some(Path::new("src/removed/missing.rs"))
         );
-        runtime.handle_event(press(KeyCode::Left), &sender);
+        runtime.handle_event(press(KeyCode::Left), &mut workers);
         assert_eq!(runtime.model.tree().selection(), Some(Path::new("src")));
     }
 
@@ -1114,7 +1140,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         fs::create_dir(temp.path().join("src")).expect("src");
         let mut runtime = runtime(&temp);
-        let (sender, receiver) = mpsc::channel();
+        let mut workers = workers();
         runtime.filesystem_running = Some(1);
         runtime.filesystem_generation = 1;
         runtime.desired_expanded.insert(PathBuf::from("src"));
@@ -1129,13 +1155,13 @@ mod tests {
                     "denied",
                 )),
             )],
-            &sender,
+            &mut workers,
         );
-        runtime.handle_event(press(KeyCode::Right), &sender);
+        runtime.handle_event(press(KeyCode::Right), &mut workers);
 
         assert!(matches!(
-            receiver.recv_timeout(Duration::from_secs(1)),
-            Ok(RuntimeMessage::Filesystem { .. })
+            receive(&mut workers),
+            RuntimeMessage::Filesystem { .. }
         ));
     }
 
@@ -1178,13 +1204,13 @@ mod tests {
             .expect("src snapshot");
         runtime.filesystem_generation = 1;
         runtime.filesystem_running = Some(1);
-        let (sender, _receiver) = mpsc::channel();
+        let mut workers = workers();
 
         runtime.complete_filesystem(
             1,
             BTreeSet::new(),
             vec![(PathBuf::from("src"), Ok(snapshot))],
-            &sender,
+            &mut workers,
         );
 
         assert_eq!(
@@ -1199,19 +1225,17 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         fs::create_dir(temp.path().join("src")).expect("src");
         let mut runtime = runtime(&temp);
-        let (sender, receiver) = mpsc::channel();
-        runtime.request_expansion(PathBuf::from("src"), &sender);
+        let mut workers = workers();
+        runtime.request_expansion(PathBuf::from("src"), &mut workers);
         let RuntimeMessage::Filesystem {
             generation,
             expansions,
             ..
-        } = receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("first filesystem result")
+        } = receive(&mut workers)
         else {
             panic!("unexpected worker result");
         };
-        runtime.request_reload(&sender);
+        runtime.request_reload(&mut workers);
 
         assert!(!runtime.complete_filesystem(
             generation,
@@ -1220,7 +1244,7 @@ mod tests {
                 PathBuf::from("src"),
                 Err(io::Error::new(io::ErrorKind::PermissionDenied, "stale")),
             )],
-            &sender,
+            &mut workers,
         ));
         assert!(runtime.filesystem_notice.is_none());
 
@@ -1228,12 +1252,10 @@ mod tests {
             generation,
             expansions,
             result,
-        } = receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("replacement filesystem result")
+        } = receive(&mut workers)
         else {
             panic!("unexpected worker result");
         };
-        assert!(runtime.complete_filesystem(generation, expansions, result, &sender));
+        assert!(runtime.complete_filesystem(generation, expansions, result, &mut workers));
     }
 }
