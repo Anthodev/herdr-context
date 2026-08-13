@@ -28,8 +28,19 @@ impl HostClient for FakeHost {
         Ok((self.pane.pane_id() == pane_id).then(|| self.pane.clone()))
     }
 
-    fn panes_in_tab(&self, _tab_id: &TabId) -> Result<Vec<HostPane>, HostError> {
+    fn panes_in_tab(
+        &self,
+        _workspace_id: &herdr_context::host::WorkspaceId,
+        _tab_id: &TabId,
+    ) -> Result<Vec<HostPane>, HostError> {
         Ok(vec![self.pane.clone()])
+    }
+
+    fn verified_dock_identity(
+        &mut self,
+        pane: &HostPane,
+    ) -> Result<Option<herdr_context::host::DockIdentity>, HostError> {
+        Ok(pane.dock_identity())
     }
 
     fn open_dock(&mut self, _request: &OpenDockRequest) -> Result<PaneId, HostError> {
@@ -56,7 +67,7 @@ impl HostClient for FakeHost {
 fn inspect_host(client: &impl HostClient, pane_id: &PaneId) -> Result<PathBuf, HostError> {
     client
         .pane(pane_id)?
-        .map(|pane| pane.cwd().to_path_buf())
+        .and_then(|pane| pane.cwd().map(Path::to_path_buf))
         .ok_or_else(|| HostError::new(herdr_context::host::HostErrorKind::NotFound, "missing pane"))
 }
 
@@ -179,7 +190,13 @@ fn consumers_use_normalized_contracts_only() -> Result<(), Box<dyn std::error::E
     let pane_id = PaneId::new("pane")?;
     let tab_id = TabId::new("tab")?;
     let host = FakeHost {
-        pane: HostPane::new(pane_id.clone(), tab_id, project_root.clone(), None, true),
+        pane: HostPane::new(
+            pane_id.clone(),
+            tab_id,
+            Some(project_root.clone()),
+            None,
+            true,
+        ),
     };
     assert_eq!(inspect_host(&host, &pane_id)?, project_root);
 

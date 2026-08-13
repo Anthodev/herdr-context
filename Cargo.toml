@@ -1,6 +1,6 @@
 [package]
 name = "herdr-context"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97.1"
 description = "Project context dock for Herdr"
@@ -11,6 +11,7 @@ command-group = "5.0.1"
 crossterm = "0.29.0"
 ignore = "0.4.25"
 ratatui = { version = "0.30.0", default-features = false, features = ["crossterm"] }
+libc = "0.2"
 serde_json = "1.0"
 
 [dev-dependencies]
