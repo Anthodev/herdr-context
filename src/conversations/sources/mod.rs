@@ -436,3 +436,76 @@ impl fmt::Display for ConversationSourceError {
 }
 
 impl Error for ConversationSourceError {}
+
+/// Deterministic set of conversation sources.
+///
+/// Sources are ordered lexicographically by their open `SourceId` namespace.
+/// Registration fails rather than selecting an arbitrary implementation when
+/// two sources claim the same ID.
+pub struct SourceRegistry {
+    sources: Vec<Box<dyn ConversationSource>>,
+}
+
+impl SourceRegistry {
+    pub fn new(mut sources: Vec<Box<dyn ConversationSource>>) -> Result<Self, SourceRegistryError> {
+        sources.sort_unstable_by(|left, right| {
+            left.source_id().as_str().cmp(right.source_id().as_str())
+        });
+        if let Some(source_id) = sources.windows(2).find_map(|pair| {
+            (pair[0].source_id() == pair[1].source_id()).then(|| pair[0].source_id().clone())
+        }) {
+            return Err(SourceRegistryError { source_id });
+        }
+        Ok(Self { sources })
+    }
+
+    #[must_use]
+    pub fn iter(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &dyn ConversationSource> + DoubleEndedIterator {
+        self.sources.iter().map(Box::as_ref)
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.sources.len()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
+}
+
+impl fmt::Debug for SourceRegistry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SourceRegistry")
+            .field("source_count", &self.sources.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceRegistryError {
+    source_id: SourceId,
+}
+
+impl SourceRegistryError {
+    #[must_use]
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+}
+
+impl fmt::Display for SourceRegistryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "duplicate conversation source ID: {}",
+            self.source_id.as_str()
+        )
+    }
+}
+
+impl Error for SourceRegistryError {}
