@@ -1,0 +1,21 @@
+id = "herdr-context"
+name = "herdr-context"
+version = "0.2.0"
+min_herdr_version = "0.8.0"
+description = "Per-tab project context dock"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked"]
+
+[[panes]]
+id = "dock"
+title = "herdr-context dock"
+placement = "split"
+command = ["./target/release/herdr-context", "dock"]
+
+[[actions]]
+id = "toggle"
+title = "herdr-context: toggle dock"
+contexts = ["workspace", "tab", "pane"]
+command = ["./target/release/herdr-context", "toggle"]

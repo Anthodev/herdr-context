@@ -1,5 +1,6 @@
 //! Herdr process boundary and normalized launch context.
 
+pub mod client;
 pub mod launch;
 
 use std::collections::BTreeMap;
@@ -114,7 +115,17 @@ impl LaunchContext {
             "HERDR_PANE_ID",
             PaneId::new,
         )?;
-        let cwd = required_path(&context, &["/cwd", "/focused_pane/cwd", "/pane/cwd"], "cwd")?;
+        let cwd = required_path(
+            &context,
+            &[
+                "/cwd",
+                "/focused_pane_cwd",
+                "/focused_pane/cwd",
+                "/pane/cwd",
+                "/workspace_cwd",
+            ],
+            "cwd",
+        )?;
         let foreground_cwd = optional_path(
             &context,
             &[
@@ -215,6 +226,10 @@ fn first_json_string(
     Ok(None)
 }
 
+pub const MIN_DOCK_WIDTH: u16 = 24;
+pub const DEFAULT_DOCK_WIDTH: u16 = 40;
+pub const MAX_DOCK_WIDTH: u16 = 60;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DockWidth(NonZeroU16);
 
@@ -224,18 +239,31 @@ impl DockWidth {
     }
 
     #[must_use]
+    pub fn clamped(columns: u16) -> Self {
+        let columns = columns.clamp(MIN_DOCK_WIDTH, MAX_DOCK_WIDTH);
+        Self(NonZeroU16::new(columns).unwrap_or(NonZeroU16::MIN))
+    }
+
+    #[must_use]
     pub const fn columns(self) -> u16 {
         self.0.get()
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DockIdentity {
+    PluginMetadata,
+    OscTitle,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostPane {
     pane_id: PaneId,
     tab_id: TabId,
-    cwd: PathBuf,
+    cwd: Option<PathBuf>,
     foreground_cwd: Option<PathBuf>,
     focused: bool,
+    dock_identity: Option<DockIdentity>,
 }
 
 impl HostPane {
@@ -243,7 +271,7 @@ impl HostPane {
     pub const fn new(
         pane_id: PaneId,
         tab_id: TabId,
-        cwd: PathBuf,
+        cwd: Option<PathBuf>,
         foreground_cwd: Option<PathBuf>,
         focused: bool,
     ) -> Self {
@@ -253,6 +281,7 @@ impl HostPane {
             cwd,
             foreground_cwd,
             focused,
+            dock_identity: None,
         }
     }
 
@@ -267,8 +296,8 @@ impl HostPane {
     }
 
     #[must_use]
-    pub fn cwd(&self) -> &Path {
-        &self.cwd
+    pub fn cwd(&self) -> Option<&Path> {
+        self.cwd.as_deref()
     }
 
     #[must_use]
@@ -280,10 +309,27 @@ impl HostPane {
     pub const fn is_focused(&self) -> bool {
         self.focused
     }
+
+    #[must_use]
+    pub const fn with_dock_identity(mut self, identity: DockIdentity) -> Self {
+        self.dock_identity = Some(identity);
+        self
+    }
+
+    #[must_use]
+    pub const fn dock_identity(&self) -> Option<DockIdentity> {
+        self.dock_identity
+    }
+
+    #[must_use]
+    pub const fn is_dock(&self) -> bool {
+        self.dock_identity.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenDockRequest {
+    origin_pane_id: PaneId,
     tab_id: TabId,
     cwd: PathBuf,
     width: DockWidth,
@@ -291,8 +337,23 @@ pub struct OpenDockRequest {
 
 impl OpenDockRequest {
     #[must_use]
-    pub const fn new(tab_id: TabId, cwd: PathBuf, width: DockWidth) -> Self {
-        Self { tab_id, cwd, width }
+    pub const fn new(
+        origin_pane_id: PaneId,
+        tab_id: TabId,
+        cwd: PathBuf,
+        width: DockWidth,
+    ) -> Self {
+        Self {
+            origin_pane_id,
+            tab_id,
+            cwd,
+            width,
+        }
+    }
+
+    #[must_use]
+    pub const fn origin_pane_id(&self) -> &PaneId {
+        &self.origin_pane_id
     }
 
     #[must_use]
@@ -314,7 +375,15 @@ impl OpenDockRequest {
 /// Herdr boundary required by launcher work. Implementations own CLI/socket details.
 pub trait HostClient: Send {
     fn pane(&self, pane_id: &PaneId) -> Result<Option<HostPane>, HostError>;
-    fn panes_in_tab(&self, tab_id: &TabId) -> Result<Vec<HostPane>, HostError>;
+    fn panes_in_tab(
+        &self,
+        workspace_id: &WorkspaceId,
+        tab_id: &TabId,
+    ) -> Result<Vec<HostPane>, HostError>;
+    fn verified_dock_identity(
+        &mut self,
+        pane: &HostPane,
+    ) -> Result<Option<DockIdentity>, HostError>;
     fn open_dock(&mut self, request: &OpenDockRequest) -> Result<PaneId, HostError>;
     fn focus_pane(&mut self, pane_id: &PaneId) -> Result<(), HostError>;
     fn close_pane(&mut self, pane_id: &PaneId) -> Result<(), HostError>;
@@ -437,6 +506,17 @@ mod tests {
 
         assert_eq!(context.focused_pane_id().as_str(), "pane");
         assert_eq!(context.foreground_cwd(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn supports_public_plugin_invocation_context_shape() -> Result<(), Box<dyn std::error::Error>> {
+        let context = LaunchContext::from_vars([(
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            r#"{"workspace_id":"workspace","tab_id":"tab","focused_pane_id":"pane","focused_pane_cwd":"/project","workspace_cwd":"/workspace"}"#,
+        )])?;
+
+        assert_eq!(context.cwd(), Path::new("/project"));
         Ok(())
     }
 
