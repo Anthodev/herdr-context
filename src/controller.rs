@@ -291,6 +291,8 @@ const fn accepted(status: SubmitStatus) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
     use std::fs;
     use std::path::Path;
 
@@ -413,5 +415,64 @@ mod tests {
 
         assert!(!files.has_pending_work());
         assert_eq!(files.generations().0, files.generations().1);
+    }
+    #[test]
+    fn switching_views_retains_expansion_selection_and_scroll() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join("src")).expect("src");
+        fs::write(temp.path().join("src/child"), []).expect("child");
+        fs::write(temp.path().join("z-file"), []).expect("root file");
+        let mut controller = controller(&temp);
+        let mut workers = WorkerRuntime::with_capacities(2, 1);
+        controller.files = Some(
+            crate::runtime::FilesRuntime::bootstrap(controller.model.launch_context())
+                .expect("files"),
+        );
+
+        let files = controller.files.as_mut().expect("files");
+        assert_eq!(files.selection(), Some(Path::new("src")));
+        assert!(files.handle_intent(&Intent::ExpandOrDescend, &mut workers));
+        while files.has_pending_work() || workers.has_pending_work() {
+            let result = workers
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("filesystem result");
+            files.complete_background(
+                *result
+                    .downcast::<crate::runtime::RuntimeMessage>()
+                    .expect("runtime message"),
+                &mut workers,
+            );
+        }
+        assert!(files.handle_intent(&Intent::ExpandOrDescend, &mut workers));
+        let area = Rect::new(0, 0, 20, 1);
+        files.render(area, &mut Buffer::empty(area));
+        let selected = files.selection().map(Path::to_path_buf);
+        let scroll = files.scroll();
+        assert_eq!(selected.as_deref(), Some(Path::new("src/child")));
+        assert_eq!(scroll, 1);
+
+        assert!(
+            controller
+                .apply(Intent::SwitchView(View::Conversations), &mut workers)
+                .dirty
+        );
+        assert!(
+            controller
+                .apply(Intent::SwitchView(View::Files), &mut workers)
+                .dirty
+        );
+
+        let files = controller.files.as_mut().expect("files");
+        assert_eq!(files.selection(), selected.as_deref());
+        assert_eq!(files.scroll(), scroll);
+        let area = Rect::new(0, 0, 20, 2);
+        let mut buffer = Buffer::empty(area);
+        files.render(area, &mut buffer);
+        let rendered = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("src/child"));
     }
 }

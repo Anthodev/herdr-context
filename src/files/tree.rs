@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::vcs::{VcsStatusKind, VcsStatusSnapshot};
 
-use super::ignore::IgnorePolicy;
+use super::ignore::{DefaultVisibilityPolicy, IgnorePolicy, VisibilityPolicy, VisibleEntryKind};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TreeNodeKind {
@@ -46,29 +46,24 @@ impl TreeNode {
 
 #[derive(Clone, Debug)]
 pub(crate) struct DirectoryLoader {
-    root: PathBuf,
     ignore: IgnorePolicy,
 }
 
 impl DirectoryLoader {
     pub(crate) fn load(&self, directory: PathBuf) -> io::Result<DirectorySnapshot> {
-        let paths = self.ignore.visible_children(&directory)?;
-        let mut nodes = Vec::with_capacity(paths.len());
-        for path in paths {
-            let metadata = std::fs::symlink_metadata(self.root.join(&path))?;
-            let kind = if metadata.file_type().is_symlink() {
-                TreeNodeKind::Symlink
-            } else if metadata.is_dir() {
-                TreeNodeKind::Directory
-            } else {
-                TreeNodeKind::File
-            };
-            nodes.push(TreeNode {
-                path,
-                kind,
+        let entries = self.ignore.visible_entries(&directory)?;
+        let nodes = entries
+            .into_iter()
+            .map(|entry| TreeNode {
+                path: entry.path,
+                kind: match entry.kind {
+                    VisibleEntryKind::Directory => TreeNodeKind::Directory,
+                    VisibleEntryKind::File => TreeNodeKind::File,
+                    VisibleEntryKind::Symlink => TreeNodeKind::Symlink,
+                },
                 status: None,
-            });
-        }
+            })
+            .collect();
         Ok(DirectorySnapshot { directory, nodes })
     }
 }
@@ -90,10 +85,16 @@ pub struct FilesTree {
 
 impl FilesTree {
     pub fn new(root: PathBuf) -> io::Result<Self> {
-        let root = std::fs::canonicalize(root)?;
-        let ignore = IgnorePolicy::new(root.clone())?;
+        Self::with_visibility_policy(root, Arc::new(DefaultVisibilityPolicy))
+    }
+
+    pub fn with_visibility_policy(
+        root: PathBuf,
+        visibility: Arc<dyn VisibilityPolicy>,
+    ) -> io::Result<Self> {
+        let ignore = IgnorePolicy::with_visibility_policy(root, visibility)?;
         Ok(Self {
-            loader: DirectoryLoader { root, ignore },
+            loader: DirectoryLoader { ignore },
             nodes: Arc::new(BTreeMap::new()),
             statuses: Arc::new(BTreeMap::new()),
             children: Arc::new(BTreeMap::new()),
@@ -174,7 +175,9 @@ impl FilesTree {
         let mut statuses = BTreeMap::new();
         let mut virtual_candidates = BTreeMap::new();
         for entry in snapshot.entries() {
-            if let Ok(path) = entry.path().strip_prefix(files_prefix) {
+            if let Ok(path) = entry.path().strip_prefix(files_prefix)
+                && self.loader.ignore.is_visible(path)
+            {
                 let path = path.to_path_buf();
                 insert_preferred_status(&mut statuses, path.clone(), entry.kind());
                 if entry.kind() == VcsStatusKind::Deleted
@@ -186,6 +189,7 @@ impl FilesTree {
             }
             if let Some(source) = entry.source_path()
                 && let Ok(path) = source.strip_prefix(files_prefix)
+                && self.loader.ignore.is_visible(path)
             {
                 insert_preferred_status(&mut virtual_candidates, path.to_path_buf(), entry.kind());
             }
@@ -193,7 +197,7 @@ impl FilesTree {
 
         let mut virtual_nodes = Vec::with_capacity(capacity.min(virtual_candidates.len()));
         for (path, status) in virtual_candidates {
-            match std::fs::symlink_metadata(self.loader.root.join(&path)) {
+            match self.loader.ignore.symlink_metadata(&path) {
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     virtual_nodes.push(TreeNode {
@@ -202,7 +206,7 @@ impl FilesTree {
                         status: Some(status),
                     });
                 }
-                Err(error) => return Err(error),
+                Err(_) => continue,
             }
         }
 
@@ -476,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn non_missing_metadata_errors_do_not_create_virtual_nodes() {
+    fn non_missing_metadata_errors_skip_virtual_nodes() {
         let temp = TempDir::new().expect("tempdir");
         fs::write(temp.path().join("blocked"), []).expect("blocking file");
         fs::write(temp.path().join("visible"), []).expect("visible");
@@ -488,7 +492,7 @@ mod tests {
             false,
         ));
 
-        assert!(result.is_err());
+        assert!(result.is_ok());
         assert!(tree.node(Path::new("blocked/child")).is_none());
         assert!(tree.node(Path::new("visible")).is_some());
     }
