@@ -1,4 +1,9 @@
 //! Conversation source boundary.
+mod generic_jsonl;
+mod project_local;
+
+pub use generic_jsonl::GenericJsonlSource;
+pub use project_local::{ProjectLocalLocation, ProjectLocalLocationError};
 
 use std::error::Error;
 use std::fmt;

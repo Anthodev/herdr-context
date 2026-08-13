@@ -74,6 +74,18 @@ require a dedicated adapter and cannot be inferred safely.
 - left click selects, right click toggles a Files row, and the mouse wheel navigates;
 - `q`, `Esc`, or `Ctrl+C`: close the TUI and restore the terminal.
 
+### Project-local generic conversations
+
+The Conversations view checks only these registered project-relative locations:
+`.herdr/conversations/` (direct children only), `.herdr/conversations.jsonl`,
+and `.herdr/conversations.json`. It never scans the project recursively.
+
+Generic JSONL records require `session_id`, the canonical project-root `cwd`, an
+RFC 3339 `timestamp`, a `role` (`user`, `assistant`, `system`, or `tool`), and a
+string `message`. A `.json` file contains one record with the same schema.
+Discovery is read-only and bounded; message bodies are validated but never
+returned to the UI or diagnostics.
+
 ## Design principles
 
 - **Public Herdr integration**: manifest, injected context, CLI, and socket API.

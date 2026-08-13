@@ -139,6 +139,10 @@ pub fn assert_source_conforms(case: SourceConformanceCase<'_>) {
     assert_eq!(candidate_error.source_id(), source_id);
 }
 
+#[allow(
+    dead_code,
+    reason = "integration test crates reuse conformance helpers independently"
+)]
 pub fn assert_discovery_failure_is_scoped(
     source: &dyn ConversationSource,
     project: &ProjectIdentity,
