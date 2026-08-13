@@ -28,9 +28,14 @@ upstream Herdr, and keeps the plugin independently installable.
 - represent deleted files even though they no longer exist on disk;
 - never intentionally modify project files or VCS history.
 
-Jujutsu refreshes follow its documented automatic working-copy snapshot
-semantics. The plugin will not issue commit, bookmark, operation-rewrite, or
-other explicit mutation commands.
+Jujutsu status requires `jj` 0.37 or newer and is integration-tested against
+`jj` 0.44.0, the latest upstream release when this adapter was implemented.
+The default `Fresh` mode follows Jujutsu's documented automatic working-copy
+snapshot semantics only when Files is activated or manually refreshed with
+`r`; it never polls in the background.
+The injectable `Passive` mode adds `--ignore-working-copy` and marks the
+displayed status as potentially stale. The plugin never issues commit,
+bookmark, operation-rewrite, or other explicit mutation commands.
 
 ### Conversations
 

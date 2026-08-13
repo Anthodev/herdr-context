@@ -22,7 +22,7 @@ pub(crate) struct StatusMergeInput {
 pub(crate) struct PreparedRefreshResult {
     generation: u64,
     tree_revision: u64,
-    tree: Result<Option<FilesTree>, VcsError>,
+    tree: Result<(FilesTree, bool), VcsError>,
 }
 
 impl PreparedRefreshResult {
@@ -31,21 +31,18 @@ impl PreparedRefreshResult {
         input: StatusMergeInput,
         snapshot: Result<VcsStatusSnapshot, VcsError>,
     ) -> Self {
-        let tree = match snapshot {
-            Ok(snapshot) if snapshot.is_stale() => Ok(None),
-            Ok(snapshot) => {
-                let mut tree = input.tree;
-                tree.merge_workspace_status(&snapshot, &input.workspace_prefix)
-                    .map(|()| Some(tree))
-                    .map_err(|error| {
-                        VcsError::new(
-                            VcsErrorKind::Io,
-                            format!("cannot merge VCS status: {error}"),
-                        )
-                    })
-            }
-            Err(error) => Err(error),
-        };
+        let tree = snapshot.and_then(|snapshot| {
+            let stale = snapshot.is_stale();
+            let mut tree = input.tree;
+            tree.merge_workspace_status(&snapshot, &input.workspace_prefix)
+                .map(|()| (tree, stale))
+                .map_err(|error| {
+                    VcsError::new(
+                        VcsErrorKind::Io,
+                        format!("cannot merge VCS status: {error}"),
+                    )
+                })
+        });
         Self {
             generation,
             tree_revision: input.tree_revision,
@@ -54,13 +51,14 @@ impl PreparedRefreshResult {
     }
 }
 
-/// Files view state. Failed or stale VCS refreshes never replace the current tree.
+/// Files view state. Failed VCS refreshes never replace the current tree.
 #[derive(Debug)]
 pub struct FilesModel {
     tree: FilesTree,
     refresh: RefreshCoordinator,
     workspace_prefix: PathBuf,
     failure_notice: Option<String>,
+    status_is_stale: bool,
     tree_revision: u64,
 }
 
@@ -82,10 +80,11 @@ impl FilesModel {
             })?
             .to_path_buf();
         Ok(Self {
-            tree: FilesTree::new(files_root)?,
+            tree: FilesTree::for_workspace(files_root, workspace_root)?,
             refresh: RefreshCoordinator::new(),
             workspace_prefix,
             failure_notice: None,
+            status_is_stale: false,
             tree_revision: 0,
         })
     }
@@ -112,6 +111,19 @@ impl FilesModel {
     #[must_use]
     pub fn failure_notice(&self) -> Option<&str> {
         self.failure_notice.as_deref()
+    }
+
+    #[must_use]
+    pub const fn status_is_stale(&self) -> bool {
+        self.status_is_stale
+    }
+
+    pub(crate) const fn mark_status_stale(&mut self) -> bool {
+        if self.status_is_stale {
+            return false;
+        }
+        self.status_is_stale = true;
+        true
     }
 
     pub const fn request_refresh(&mut self) -> u64 {
@@ -149,14 +161,14 @@ impl FilesModel {
             return false;
         }
         match result.tree {
-            Ok(Some(mut tree)) => {
+            Ok((mut tree, stale)) => {
                 let selected = self.tree.selection().map(Path::to_path_buf);
                 tree.restore_selection_from(selected.as_deref());
                 self.tree = tree;
                 self.failure_notice = None;
+                self.status_is_stale = stale;
                 true
             }
-            Ok(None) => false,
             Err(error) => {
                 self.failure_notice = Some(error.to_string());
                 false
@@ -170,21 +182,24 @@ impl FilesModel {
             return false;
         }
         match result.into_snapshot() {
-            Ok(snapshot) if snapshot.is_stale() => false,
-            Ok(snapshot) => match self
-                .tree
-                .merge_workspace_status(&snapshot, &self.workspace_prefix)
-            {
-                Ok(()) => {
-                    self.tree_revision = self.tree_revision.saturating_add(1);
-                    self.failure_notice = None;
-                    true
+            Ok(snapshot) => {
+                let stale = snapshot.is_stale();
+                match self
+                    .tree
+                    .merge_workspace_status(&snapshot, &self.workspace_prefix)
+                {
+                    Ok(()) => {
+                        self.tree_revision = self.tree_revision.saturating_add(1);
+                        self.failure_notice = None;
+                        self.status_is_stale = stale;
+                        true
+                    }
+                    Err(error) => {
+                        self.failure_notice = Some(error.to_string());
+                        false
+                    }
                 }
-                Err(error) => {
-                    self.failure_notice = Some(error.to_string());
-                    false
-                }
-            },
+            }
             Err(error) => {
                 self.failure_notice = Some(error.to_string());
                 false
@@ -211,7 +226,7 @@ mod tests {
     use crate::vcs::{VcsEntryStatus, VcsError, VcsErrorKind, VcsStatusKind, VcsStatusSnapshot};
 
     #[test]
-    fn failed_and_stale_refreshes_preserve_the_visible_tree() {
+    fn failed_and_superseded_refreshes_preserve_the_visible_tree() {
         let temp = TempDir::new().expect("tempdir");
         fs::write(temp.path().join("visible"), []).expect("file");
         let mut files = FilesModel::new(temp.path().to_path_buf()).expect("model");
@@ -329,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_marked_stale_does_not_replace_the_current_tree() {
+    fn snapshot_marked_stale_replaces_status_and_marks_the_metadata() {
         let temp = TempDir::new().expect("tempdir");
         let mut files = FilesModel::new(temp.path().to_path_buf()).expect("model");
         files.request_refresh();
@@ -342,18 +357,13 @@ mod tests {
             None,
         )
         .expect("status");
+
         assert!(files.complete_refresh(RefreshResult::new(
             generation,
-            Ok(VcsStatusSnapshot::new(vec![deleted], false)),
-        )));
-
-        files.request_refresh();
-        let generation = files.begin_refresh().expect("next generation");
-        assert!(!files.complete_refresh(RefreshResult::new(
-            generation,
-            Ok(VcsStatusSnapshot::new(Vec::new(), true)),
+            Ok(VcsStatusSnapshot::new(vec![deleted], true)),
         )));
 
         assert!(files.tree().node(Path::new("missing")).is_some());
+        assert!(files.status_is_stale());
     }
 }

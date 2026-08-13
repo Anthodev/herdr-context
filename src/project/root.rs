@@ -9,8 +9,8 @@ use super::{CanonicalPath, DetectedVcs, ProjectContext, ProjectIdentity, VcsBack
 /// Resolves project identity without running VCS commands or scanning descendants.
 ///
 /// Files remain rooted at `opening_directory`. Conversation identity uses the
-/// canonical nearest valid Jujutsu workspace, then nearest valid Git worktree,
-/// then canonical opening directory.
+/// nearest valid VCS workspace; when Jujutsu and Git are colocated at that
+/// nearest root, Jujutsu is authoritative.
 pub fn resolve_project_context(
     opening_directory: impl AsRef<Path>,
 ) -> Result<ProjectContext, ProjectResolutionError> {
@@ -25,21 +25,23 @@ pub fn resolve_project_context(
         ));
     }
 
-    let mut nearest_jj = None;
-    let mut nearest_git = None;
+    let mut selected = None;
     for ancestor in canonical_opening.as_path().ancestors() {
         if valid_jj_marker(ancestor)? {
-            nearest_jj = Some(CanonicalPath::from_canonicalized(ancestor.to_path_buf()));
+            selected = Some((
+                "jj",
+                CanonicalPath::from_canonicalized(ancestor.to_path_buf()),
+            ));
             break;
         }
-        if nearest_git.is_none() && valid_git_marker(ancestor)? {
-            nearest_git = Some(CanonicalPath::from_canonicalized(ancestor.to_path_buf()));
+        if valid_git_marker(ancestor)? {
+            selected = Some((
+                "git",
+                CanonicalPath::from_canonicalized(ancestor.to_path_buf()),
+            ));
+            break;
         }
     }
-
-    let selected = nearest_jj
-        .map(|root| ("jj", root))
-        .or_else(|| nearest_git.map(|root| ("git", root)));
 
     let (identity_root, vcs) = match selected {
         Some((backend, root)) => {

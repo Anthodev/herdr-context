@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read};
@@ -10,14 +9,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-
 use command_group::{CommandGroup, GroupChild};
 
 use super::{
     VcsBackendMetadata, VcsEntryStatus, VcsError, VcsErrorKind, VcsService, VcsStatusKind,
-    VcsStatusSnapshot, VcsWorkspace,
+    VcsStatusSnapshot, VcsWorkspace, find_executable,
 };
 
 const GIT_BACKEND_ID: &str = "git";
@@ -836,42 +832,6 @@ fn io_error(operation: &str, path: &Path, error: io::Error) -> VcsError {
     )
 }
 
-fn find_executable(name: &str) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-    find_executable_in(name, env::split_paths(&path))
-}
-
-fn find_executable_in(
-    name: &str,
-    directories: impl IntoIterator<Item = PathBuf>,
-) -> Option<PathBuf> {
-    directories
-        .into_iter()
-        .map(|directory| directory.join(executable_name(name)))
-        .find(|candidate| is_executable(candidate))
-}
-
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(windows)]
-fn is_executable(path: &Path) -> bool {
-    path.is_file()
-}
-
-#[cfg(windows)]
-fn executable_name(name: &str) -> OsString {
-    OsString::from(format!("{name}.exe"))
-}
-
-#[cfg(not(windows))]
-fn executable_name(name: &str) -> OsString {
-    OsString::from(name)
-}
-
 #[cfg(windows)]
 const fn hooks_path_config() -> &'static str {
     "core.hooksPath=NUL"
@@ -908,11 +868,8 @@ mod tests {
     #[cfg(unix)]
     use tempfile::TempDir;
 
-    use super::{
-        MAX_STATUS_ENTRIES, OutputLimits, find_executable_in, parse_porcelain_v2, read_limited,
-        run_status,
-    };
-    use crate::vcs::{VcsErrorKind, VcsStatusKind};
+    use super::{MAX_STATUS_ENTRIES, OutputLimits, parse_porcelain_v2, read_limited, run_status};
+    use crate::vcs::{VcsErrorKind, VcsStatusKind, find_executable_in};
 
     const HASH: &str = "0123456789012345678901234567890123456789";
 

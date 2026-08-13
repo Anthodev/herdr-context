@@ -102,6 +102,7 @@ const fn status_marker(status: Option<VcsStatusKind>) -> (&'static str, Style) {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::{Path, PathBuf};
 
     use ratatui::buffer::Buffer;
@@ -152,5 +153,42 @@ mod tests {
                 .modifier
                 .contains(ratatui::style::Modifier::REVERSED)
         );
+    }
+    #[test]
+    fn renders_conflict_marker_and_passive_stale_notice() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("conflicted"), []).expect("file");
+        let mut tree = FilesTree::new(temp.path().to_path_buf()).expect("tree");
+        tree.load_directory(Path::new("")).expect("root");
+        let conflicted = VcsEntryStatus::new(
+            PathBuf::from("conflicted"),
+            None,
+            VcsStatusKind::Conflicted,
+            None,
+            Some(VcsStatusKind::Conflicted),
+        )
+        .expect("conflicted status");
+        tree.merge_status(&VcsStatusSnapshot::new(vec![conflicted], true))
+            .expect("merge status");
+        let rows = [PathBuf::from("conflicted")];
+        let area = Rect::new(0, 0, 56, 2);
+        let mut buffer = Buffer::empty(area);
+
+        FilesView::new(
+            &tree,
+            &rows,
+            None,
+            Some(("VCS stale", "passive mode; working copy not snapshotted")),
+        )
+        .render(area, &mut buffer);
+
+        let first = (0..area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>();
+        let second = (0..area.width)
+            .map(|x| buffer[(x, 1)].symbol())
+            .collect::<String>();
+        assert!(first.starts_with("! conflicted"));
+        assert!(second.starts_with("VCS stale: passive mode"));
     }
 }
