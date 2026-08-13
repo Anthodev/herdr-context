@@ -1,0 +1,2 @@
+{"parentUuid":null,"isSidechain":false,"userType":"external","cwd":"/workspace/project","sessionId":"66666666-6666-4666-8666-666666666666","version":"2.1.143","gitBranch":"main","entrypoint":"cli","type":"user","message":{"role":"user","content":"sanitized user message"},"promptId":"synthetic-prompt-2","uuid":"77777777-7777-4777-8777-777777777777","timestamp":"2026-01-03T03:04:05.000Z"}
+{"parentUuid":"77777777-7777-4777-8777-777777777777","isSidechain":false,"type":"assistant","message":
