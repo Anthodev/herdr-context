@@ -33,10 +33,10 @@ impl VcsEntryStatus {
         index_state: Option<VcsStatusKind>,
         worktree_state: Option<VcsStatusKind>,
     ) -> Result<Self, VcsEntryStatusError> {
-        validate_relative_path(&path, "path")?;
-        if let Some(source_path) = &source_path {
-            validate_relative_path(source_path, "source_path")?;
-        }
+        let path = normalize_relative_path(path, "path")?;
+        let source_path = source_path
+            .map(|path| normalize_relative_path(path, "source_path"))
+            .transpose()?;
         if matches!(kind, VcsStatusKind::Renamed | VcsStatusKind::Copied) && source_path.is_none() {
             return Err(VcsEntryStatusError::MissingSourcePath(kind));
         }
@@ -75,20 +75,25 @@ impl VcsEntryStatus {
     }
 }
 
-fn validate_relative_path(path: &Path, field: &'static str) -> Result<(), VcsEntryStatusError> {
-    let mut components = path.components();
-    let Some(first) = components.next() else {
-        return Err(VcsEntryStatusError::EmptyPath(field));
-    };
-    if first != Component::Normal(first.as_os_str())
-        || components.any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(VcsEntryStatusError::NonNormalizedPath {
-            field,
-            path: path.to_path_buf(),
-        });
+fn normalize_relative_path(
+    path: PathBuf,
+    field: &'static str,
+) -> Result<PathBuf, VcsEntryStatusError> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        let Component::Normal(component) = component else {
+            return Err(VcsEntryStatusError::NonNormalizedPath { field, path });
+        };
+        normalized.push(component);
     }
-    Ok(())
+    if normalized.as_os_str().is_empty() {
+        return Err(VcsEntryStatusError::EmptyPath(field));
+    }
+    if normalized.as_os_str() == path.as_os_str() {
+        Ok(path)
+    } else {
+        Ok(normalized)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -190,5 +195,19 @@ mod tests {
                 VcsStatusKind::Renamed
             ))
         );
+    }
+
+    #[test]
+    fn normalizes_equivalent_relative_path_spellings() {
+        let status = VcsEntryStatus::new(
+            PathBuf::from("src//./lib.rs/"),
+            None,
+            VcsStatusKind::Modified,
+            None,
+            Some(VcsStatusKind::Modified),
+        )
+        .expect("normalized status");
+
+        assert_eq!(status.path(), PathBuf::from("src/lib.rs"));
     }
 }

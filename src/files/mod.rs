@@ -1,0 +1,355 @@
+//! Lazy filesystem tree, ignore policy, and VCS refresh coordination.
+
+pub mod ignore;
+pub mod refresh;
+pub mod tree;
+
+use std::io;
+use std::path::{Path, PathBuf};
+
+use crate::vcs::{VcsError, VcsErrorKind, VcsStatusSnapshot};
+use refresh::{RefreshCoordinator, RefreshResult};
+use tree::FilesTree;
+
+#[derive(Debug)]
+pub(crate) struct StatusMergeInput {
+    pub(crate) tree: FilesTree,
+    pub(crate) workspace_prefix: PathBuf,
+    pub(crate) tree_revision: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedRefreshResult {
+    generation: u64,
+    tree_revision: u64,
+    tree: Result<Option<FilesTree>, VcsError>,
+}
+
+impl PreparedRefreshResult {
+    pub(crate) fn prepare(
+        generation: u64,
+        input: StatusMergeInput,
+        snapshot: Result<VcsStatusSnapshot, VcsError>,
+    ) -> Self {
+        let tree = match snapshot {
+            Ok(snapshot) if snapshot.is_stale() => Ok(None),
+            Ok(snapshot) => {
+                let mut tree = input.tree;
+                tree.merge_workspace_status(&snapshot, &input.workspace_prefix)
+                    .map(|()| Some(tree))
+                    .map_err(|error| {
+                        VcsError::new(
+                            VcsErrorKind::Io,
+                            format!("cannot merge VCS status: {error}"),
+                        )
+                    })
+            }
+            Err(error) => Err(error),
+        };
+        Self {
+            generation,
+            tree_revision: input.tree_revision,
+            tree,
+        }
+    }
+}
+
+/// Files view state. Failed or stale VCS refreshes never replace the current tree.
+#[derive(Debug)]
+pub struct FilesModel {
+    tree: FilesTree,
+    refresh: RefreshCoordinator,
+    workspace_prefix: PathBuf,
+    failure_notice: Option<String>,
+    tree_revision: u64,
+}
+
+impl FilesModel {
+    pub fn new(root: PathBuf) -> io::Result<Self> {
+        Self::for_workspace(root.clone(), root)
+    }
+
+    pub fn for_workspace(files_root: PathBuf, workspace_root: PathBuf) -> io::Result<Self> {
+        let files_root = std::fs::canonicalize(files_root)?;
+        let workspace_root = std::fs::canonicalize(workspace_root)?;
+        let workspace_prefix = files_root
+            .strip_prefix(&workspace_root)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "files root must be inside the VCS workspace",
+                )
+            })?
+            .to_path_buf();
+        Ok(Self {
+            tree: FilesTree::new(files_root)?,
+            refresh: RefreshCoordinator::new(),
+            workspace_prefix,
+            failure_notice: None,
+            tree_revision: 0,
+        })
+    }
+
+    #[must_use]
+    pub const fn tree(&self) -> &FilesTree {
+        &self.tree
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn tree_mut(&mut self) -> &mut FilesTree {
+        &mut self.tree
+    }
+
+    pub(crate) fn select(&mut self, path: &Path) -> bool {
+        self.tree.select(path)
+    }
+
+    pub(crate) fn apply_directory(&mut self, snapshot: tree::DirectorySnapshot) {
+        self.tree.apply_directory(snapshot);
+        self.tree_revision = self.tree_revision.saturating_add(1);
+    }
+
+    #[must_use]
+    pub fn failure_notice(&self) -> Option<&str> {
+        self.failure_notice.as_deref()
+    }
+
+    pub const fn request_refresh(&mut self) -> u64 {
+        self.refresh.request()
+    }
+
+    /// Returns work only when this workspace has no status command in flight.
+    pub const fn begin_refresh(&mut self) -> Option<u64> {
+        self.refresh.start_next()
+    }
+
+    #[must_use]
+    pub(crate) const fn refresh_is_running(&self) -> bool {
+        self.refresh.is_running()
+    }
+
+    pub(crate) fn status_merge_input(&self) -> StatusMergeInput {
+        StatusMergeInput {
+            tree: self.tree.clone(),
+            workspace_prefix: self.workspace_prefix.clone(),
+            tree_revision: self.tree_revision,
+        }
+    }
+
+    pub(crate) fn complete_prepared_refresh(&mut self, result: PreparedRefreshResult) -> bool {
+        if !self.refresh.finish(result.generation) {
+            return false;
+        }
+        if result.tree_revision != self.tree_revision {
+            self.refresh.request();
+            return false;
+        }
+        match result.tree {
+            Ok(Some(mut tree)) => {
+                let selected = self.tree.selection().map(Path::to_path_buf);
+                tree.restore_selection_from(selected.as_deref());
+                self.tree = tree;
+                self.failure_notice = None;
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                self.failure_notice = Some(error.to_string());
+                false
+            }
+        }
+    }
+
+    /// Applies a current successful result. Failures preserve all existing rows.
+    pub fn complete_refresh(&mut self, result: RefreshResult) -> bool {
+        if !self.refresh.finish(result.generation()) {
+            return false;
+        }
+        match result.into_snapshot() {
+            Ok(snapshot) if snapshot.is_stale() => false,
+            Ok(snapshot) => match self
+                .tree
+                .merge_workspace_status(&snapshot, &self.workspace_prefix)
+            {
+                Ok(()) => {
+                    self.tree_revision = self.tree_revision.saturating_add(1);
+                    self.failure_notice = None;
+                    true
+                }
+                Err(error) => {
+                    self.failure_notice = Some(error.to_string());
+                    false
+                }
+            },
+            Err(error) => {
+                self.failure_notice = Some(error.to_string());
+                false
+            }
+        }
+    }
+
+    pub fn load_directory(&mut self, directory: &Path) -> io::Result<()> {
+        self.tree.load_directory(directory)?;
+        self.tree_revision = self.tree_revision.saturating_add(1);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use tempfile::TempDir;
+
+    use super::refresh::RefreshResult;
+    use super::{FilesModel, PreparedRefreshResult};
+    use crate::vcs::{VcsEntryStatus, VcsError, VcsErrorKind, VcsStatusKind, VcsStatusSnapshot};
+
+    #[test]
+    fn failed_and_stale_refreshes_preserve_the_visible_tree() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("visible"), []).expect("file");
+        let mut files = FilesModel::new(temp.path().to_path_buf()).expect("model");
+        files.load_directory(Path::new("")).expect("root");
+
+        files.request_refresh();
+        let generation = files.begin_refresh().expect("generation");
+        let deleted = VcsEntryStatus::new(
+            PathBuf::from("missing"),
+            None,
+            VcsStatusKind::Deleted,
+            Some(VcsStatusKind::Deleted),
+            None,
+        )
+        .expect("status");
+        assert!(files.complete_refresh(RefreshResult::new(
+            generation,
+            Ok(VcsStatusSnapshot::new(vec![deleted], false)),
+        )));
+        assert!(files.tree().node(Path::new("missing")).is_some());
+
+        files.request_refresh();
+        let generation = files.begin_refresh().expect("next generation");
+        assert!(!files.complete_refresh(RefreshResult::new(
+            generation,
+            Err(VcsError::new(VcsErrorKind::CommandFailed, "Git failed")),
+        )));
+        assert!(files.tree().node(Path::new("visible")).is_some());
+        assert!(files.tree().node(Path::new("missing")).is_some());
+        assert_eq!(files.failure_notice(), Some("Git failed"));
+
+        files.request_refresh();
+        let generation = files.begin_refresh().expect("running generation");
+        assert!(!files.complete_refresh(RefreshResult::new(
+            generation + 1,
+            Ok(VcsStatusSnapshot::new(Vec::new(), false)),
+        )));
+        assert!(files.tree().node(Path::new("missing")).is_some());
+    }
+
+    #[test]
+    fn prepared_status_is_retried_after_a_concurrent_tree_change() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("initial"), []).expect("initial");
+        let mut files = FilesModel::new(temp.path().to_path_buf()).expect("model");
+        files.load_directory(Path::new("")).expect("root");
+        files.request_refresh();
+        let generation = files.begin_refresh().expect("generation");
+        let input = files.status_merge_input();
+        let deleted = VcsEntryStatus::new(
+            PathBuf::from("missing"),
+            None,
+            VcsStatusKind::Deleted,
+            Some(VcsStatusKind::Deleted),
+            None,
+        )
+        .expect("status");
+        let prepared = PreparedRefreshResult::prepare(
+            generation,
+            input,
+            Ok(VcsStatusSnapshot::new(vec![deleted], false)),
+        );
+        fs::write(temp.path().join("added"), []).expect("added");
+        files.load_directory(Path::new("")).expect("newer tree");
+
+        assert!(!files.complete_prepared_refresh(prepared));
+        assert!(files.tree().node(Path::new("missing")).is_none());
+        assert!(files.begin_refresh().is_some(), "merge was not retried");
+    }
+
+    #[test]
+    fn rebases_workspace_status_to_the_open_files_subtree() {
+        let temp = TempDir::new().expect("tempdir");
+        let opened = temp.path().join("src");
+        fs::create_dir(&opened).expect("opened subtree");
+        let mut files =
+            FilesModel::for_workspace(opened, temp.path().to_path_buf()).expect("model");
+        files.request_refresh();
+        let generation = files.begin_refresh().expect("generation");
+        let entries = vec![
+            VcsEntryStatus::new(
+                PathBuf::from("src/deleted.rs"),
+                None,
+                VcsStatusKind::Deleted,
+                Some(VcsStatusKind::Deleted),
+                None,
+            )
+            .expect("inside status"),
+            VcsEntryStatus::new(
+                PathBuf::from("outside.rs"),
+                None,
+                VcsStatusKind::Deleted,
+                Some(VcsStatusKind::Deleted),
+                None,
+            )
+            .expect("outside status"),
+            VcsEntryStatus::new(
+                PathBuf::from("src/renamed.rs"),
+                Some(PathBuf::from("outside-old.rs")),
+                VcsStatusKind::Renamed,
+                Some(VcsStatusKind::Renamed),
+                None,
+            )
+            .expect("rename status"),
+        ];
+
+        assert!(files.complete_refresh(RefreshResult::new(
+            generation,
+            Ok(VcsStatusSnapshot::new(entries, false)),
+        )));
+
+        assert!(files.tree().node(Path::new("deleted.rs")).is_some());
+        assert!(files.tree().node(Path::new("outside.rs")).is_none());
+        assert!(files.tree().node(Path::new("outside-old.rs")).is_none());
+    }
+
+    #[test]
+    fn snapshot_marked_stale_does_not_replace_the_current_tree() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut files = FilesModel::new(temp.path().to_path_buf()).expect("model");
+        files.request_refresh();
+        let generation = files.begin_refresh().expect("generation");
+        let deleted = VcsEntryStatus::new(
+            PathBuf::from("missing"),
+            None,
+            VcsStatusKind::Deleted,
+            Some(VcsStatusKind::Deleted),
+            None,
+        )
+        .expect("status");
+        assert!(files.complete_refresh(RefreshResult::new(
+            generation,
+            Ok(VcsStatusSnapshot::new(vec![deleted], false)),
+        )));
+
+        files.request_refresh();
+        let generation = files.begin_refresh().expect("next generation");
+        assert!(!files.complete_refresh(RefreshResult::new(
+            generation,
+            Ok(VcsStatusSnapshot::new(Vec::new(), true)),
+        )));
+
+        assert!(files.tree().node(Path::new("missing")).is_some());
+    }
+}

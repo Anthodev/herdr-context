@@ -1,5 +1,6 @@
 //! Backend-neutral VCS contracts.
 
+pub mod git;
 pub mod status;
 
 use std::error::Error;
