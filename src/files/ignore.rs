@@ -1,95 +1,345 @@
+use std::ffi::OsStr;
+use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use ignore::WalkBuilder;
+use cap_std::fs::{Dir, Metadata};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+
+/// Decides whether a root-relative filesystem entry is shown.
+///
+/// Implementations must be side-effect free in production. The seam is kept
+/// independent from configuration so roadmap #11 can replace the fixed default.
+pub trait VisibilityPolicy: fmt::Debug + Send + Sync {
+    fn is_visible(&self, relative_path: &Path) -> bool;
+}
+
+/// Fixed HDC-10 default: dot-prefixed entries are hidden.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DefaultVisibilityPolicy;
+
+impl VisibilityPolicy for DefaultVisibilityPolicy {
+    fn is_visible(&self, relative_path: &Path) -> bool {
+        relative_path.components().all(|component| {
+            let std::path::Component::Normal(name) = component else {
+                return false;
+            };
+            !name.as_encoded_bytes().starts_with(b".")
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VisibleEntryKind {
+    Directory,
+    File,
+    Symlink,
+}
+
+#[derive(Debug)]
+pub(crate) struct VisibleEntry {
+    pub(crate) path: PathBuf,
+    pub(crate) kind: VisibleEntryKind,
+}
 
 #[derive(Clone, Debug)]
 pub struct IgnorePolicy {
-    root: PathBuf,
+    root_path: PathBuf,
+    root: Arc<Dir>,
+    visibility: Arc<dyn VisibilityPolicy>,
+    gitignore_enabled: bool,
 }
 
 impl IgnorePolicy {
     pub fn new(root: PathBuf) -> io::Result<Self> {
+        Self::with_visibility_policy(root, Arc::new(DefaultVisibilityPolicy))
+    }
+
+    pub fn with_visibility_policy(
+        root: PathBuf,
+        visibility: Arc<dyn VisibilityPolicy>,
+    ) -> io::Result<Self> {
         if !root.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "root must be an absolute directory",
             ));
         }
-        let root = fs::canonicalize(root)?;
-        if !root.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "root must be a directory",
-            ));
-        }
-        Ok(Self { root })
+        let root_path = fs::canonicalize(root)?;
+        let root = Arc::new(open_ambient_directory_nofollow(&root_path)?);
+        let gitignore_enabled = root
+            .symlink_metadata(".git")
+            .is_ok_and(|metadata| !metadata.is_symlink());
+        Ok(Self {
+            root_path,
+            root,
+            visibility,
+            gitignore_enabled,
+        })
+    }
+
+    #[must_use]
+    pub fn is_visible(&self, relative_path: &Path) -> bool {
+        self.visibility.is_visible(relative_path)
     }
 
     pub fn visible_children(&self, relative_directory: &Path) -> io::Result<Vec<PathBuf>> {
-        validate_relative_directory(relative_directory)?;
-        let directory = self.root.join(relative_directory);
-        let canonical = fs::canonicalize(&directory)?;
-        if canonical != directory {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "tree directory must not contain symlinked components",
-            ));
-        }
-        let metadata = fs::symlink_metadata(&directory)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "tree directory must be a real directory",
-            ));
-        }
+        self.visible_entries(relative_directory)
+            .map(|entries| entries.into_iter().map(|entry| entry.path).collect())
+    }
 
-        let mut builder = WalkBuilder::new(&directory);
-        builder
-            .max_depth(Some(1))
-            .follow_links(false)
-            .hidden(false)
-            .ignore(false)
-            .git_ignore(true)
-            .git_global(false)
-            .git_exclude(true)
-            .parents(true)
-            .require_git(true);
-
+    pub(crate) fn visible_entries(
+        &self,
+        relative_directory: &Path,
+    ) -> io::Result<Vec<VisibleEntry>> {
+        let (directory, matchers) = self.open_directory_with_matchers(relative_directory)?;
         let mut children = Vec::new();
-        for result in builder.build().skip(1) {
-            let entry = result.map_err(ignore_error)?;
-            let relative = entry
-                .path()
-                .strip_prefix(&self.root)
-                .map_err(|_| io::Error::other("ignore walker escaped tree root"))?;
-            if relative == Path::new(".git") {
+        for result in directory.entries()? {
+            let entry = match result {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            let file_name = entry.file_name();
+            let relative = relative_directory.join(&file_name);
+            if !self.is_visible(&relative) {
                 continue;
             }
-            children.push(relative.to_path_buf());
+            let metadata = match directory.symlink_metadata(&file_name) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            let kind = if metadata.is_symlink() {
+                VisibleEntryKind::Symlink
+            } else if metadata.is_dir() {
+                VisibleEntryKind::Directory
+            } else {
+                VisibleEntryKind::File
+            };
+            if is_ignored(
+                &matchers,
+                &self.root_path.join(&relative),
+                kind == VisibleEntryKind::Directory,
+            ) {
+                continue;
+            }
+            children.push(VisibleEntry {
+                path: relative,
+                kind,
+            });
         }
-        children.sort_unstable();
+        children.sort_unstable_by(|left, right| left.path.cmp(&right.path));
         Ok(children)
     }
+
+    pub(crate) fn symlink_metadata(&self, relative_path: &Path) -> io::Result<Metadata> {
+        validate_relative_path(relative_path)?;
+        let parent = relative_path.parent().unwrap_or_else(|| Path::new(""));
+        let name = relative_path
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing file name"))?;
+        self.open_directory(parent)?.symlink_metadata(name)
+    }
+
+    fn open_directory(&self, relative_directory: &Path) -> io::Result<Dir> {
+        validate_relative_directory(relative_directory)?;
+        let mut directory = self.root.try_clone()?;
+        for component in relative_directory.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(invalid_relative_path());
+            };
+            directory = open_child_directory_nofollow(&directory, name)?;
+        }
+        Ok(directory)
+    }
+
+    fn open_directory_with_matchers(
+        &self,
+        relative_directory: &Path,
+    ) -> io::Result<(Dir, Vec<Gitignore>)> {
+        validate_relative_directory(relative_directory)?;
+        let mut directory = self.root.try_clone()?;
+        let mut prefix = PathBuf::new();
+        let mut matchers = Vec::new();
+        if self.gitignore_enabled {
+            if let Some(exclude) = self.git_exclude() {
+                matchers.push(exclude);
+            }
+            if let Some(matcher) = self.gitignore(&directory, &prefix) {
+                matchers.push(matcher);
+            }
+        }
+        for component in relative_directory.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(invalid_relative_path());
+            };
+            directory = open_child_directory_nofollow(&directory, name)?;
+            prefix.push(name);
+            if self.gitignore_enabled
+                && let Some(matcher) = self.gitignore(&directory, &prefix)
+            {
+                matchers.push(matcher);
+            }
+        }
+        Ok((directory, matchers))
+    }
+
+    fn gitignore(&self, directory: &Dir, prefix: &Path) -> Option<Gitignore> {
+        let matcher_root = self.root_path.join(prefix);
+        self.matcher_from_file(
+            directory,
+            OsStr::new(".gitignore"),
+            matcher_root.clone(),
+            matcher_root.join(".gitignore"),
+        )
+    }
+
+    fn git_exclude(&self) -> Option<Gitignore> {
+        let git = open_child_directory_nofollow(&self.root, OsStr::new(".git")).ok()?;
+        let info = open_child_directory_nofollow(&git, OsStr::new("info")).ok()?;
+        self.matcher_from_file(
+            &info,
+            OsStr::new("exclude"),
+            self.root_path.clone(),
+            self.root_path.join(".git/info/exclude"),
+        )
+    }
+
+    fn matcher_from_file(
+        &self,
+        directory: &Dir,
+        name: &OsStr,
+        matcher_root: PathBuf,
+        source: PathBuf,
+    ) -> Option<Gitignore> {
+        let mut file = open_file_nofollow(directory, name).ok()?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).ok()?;
+        let mut builder = GitignoreBuilder::new(matcher_root);
+        for (index, line) in contents.lines().enumerate() {
+            let line = if index == 0 {
+                line.strip_prefix('\u{feff}').unwrap_or(line)
+            } else {
+                line
+            };
+            let _ = builder.add_line(Some(source.clone()), line);
+        }
+        builder.build().ok()
+    }
+}
+
+fn is_ignored(matchers: &[Gitignore], path: &Path, is_directory: bool) -> bool {
+    let mut ignored = false;
+    for matcher in matchers {
+        let matched = matcher.matched_path_or_any_parents(path, is_directory);
+        if matched.is_ignore() {
+            ignored = true;
+        } else if matched.is_whitelist() {
+            ignored = false;
+        }
+    }
+    ignored
 }
 
 fn validate_relative_directory(path: &Path) -> io::Result<()> {
-    if path
-        .components()
-        .all(|component| matches!(component, std::path::Component::Normal(_)))
-        || path.as_os_str().is_empty()
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
     {
         return Ok(());
     }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        "tree path must be root-relative and normalized",
-    ))
+    Err(invalid_relative_path())
 }
 
-fn ignore_error(error: ignore::Error) -> io::Error {
-    io::Error::other(error)
+fn validate_relative_path(path: &Path) -> io::Result<()> {
+    if !path.as_os_str().is_empty()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Ok(());
+    }
+    Err(invalid_relative_path())
+}
+
+fn invalid_relative_path() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "tree path must be root-relative and normalized",
+    )
+}
+
+#[cfg(unix)]
+fn open_ambient_directory_nofollow(path: &Path) -> io::Result<Dir> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open("/")?;
+    let mut directory = Dir::from_std_file(file);
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(name) => {
+                directory = open_child_directory_nofollow(&directory, name)?;
+            }
+            _ => return Err(invalid_relative_path()),
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(not(unix))]
+fn open_ambient_directory_nofollow(path: &Path) -> io::Result<Dir> {
+    Dir::open_ambient_dir(path, cap_std::ambient_authority())
+}
+
+#[cfg(unix)]
+fn open_child_directory_nofollow(parent: &Dir, name: &OsStr) -> io::Result<Dir> {
+    use cap_std::fs::{OpenOptions, OpenOptionsExt};
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    let file = parent.open_with(name, &options)?;
+    Ok(Dir::from_std_file(file.into_std()))
+}
+
+#[cfg(not(unix))]
+fn open_child_directory_nofollow(parent: &Dir, name: &OsStr) -> io::Result<Dir> {
+    if parent.symlink_metadata(name)?.is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tree directory must not contain symlinked components",
+        ));
+    }
+    parent.open_dir(name)
+}
+
+#[cfg(unix)]
+fn open_file_nofollow(parent: &Dir, name: &OsStr) -> io::Result<cap_std::fs::File> {
+    use cap_std::fs::{OpenOptions, OpenOptionsExt};
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    parent.open_with(name, &options)
+}
+
+#[cfg(not(unix))]
+fn open_file_nofollow(parent: &Dir, name: &OsStr) -> io::Result<cap_std::fs::File> {
+    if parent.symlink_metadata(name)?.is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tree file must not be a symlink",
+        ));
+    }
+    parent.open(name)
 }
 
 #[cfg(test)]
@@ -137,6 +387,20 @@ mod tests {
             vec![PathBuf::from("build/keep.txt")]
         );
     }
+    #[test]
+    fn strips_utf8_bom_from_the_first_gitignore_rule() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join(".git")).expect("git marker");
+        fs::write(temp.path().join(".gitignore"), "\u{feff}ignored\n").expect("root ignore");
+        touch(temp.path().join("ignored"));
+        touch(temp.path().join("visible"));
+        let policy = IgnorePolicy::new(temp.path().to_path_buf()).expect("policy");
+
+        assert_eq!(
+            policy.visible_children(Path::new("")).expect("children"),
+            vec![PathBuf::from("visible")]
+        );
+    }
 
     #[test]
     fn nested_rules_override_parent_rules() {
@@ -177,6 +441,21 @@ mod tests {
             vec![PathBuf::from("visible.txt")]
         );
     }
+    #[test]
+    fn honors_repository_exclude_without_leaving_the_root_capability() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join(".git/info")).expect("git info");
+        fs::write(temp.path().join(".git/info/exclude"), "excluded\n").expect("exclude file");
+        touch(temp.path().join("excluded"));
+        touch(temp.path().join("visible"));
+        let policy = IgnorePolicy::new(temp.path().to_path_buf()).expect("policy");
+
+        assert_eq!(
+            policy.visible_children(Path::new("")).expect("children"),
+            vec![PathBuf::from("visible")]
+        );
+    }
+
     #[test]
     fn rejects_paths_outside_the_lazy_tree_root() {
         let temp = TempDir::new().expect("tempdir");

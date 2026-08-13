@@ -22,6 +22,7 @@ use super::{
 
 const GIT_BACKEND_ID: &str = "git";
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_EXECUTABLE_BUSY_RETRIES: usize = 10;
 const DEFAULT_OUTPUT_LIMITS: OutputLimits = OutputLimits {
     stdout: 64 * 1024 * 1024,
     stderr: 1024 * 1024,
@@ -202,20 +203,59 @@ struct ProcessOutput {
     stderr: Vec<u8>,
 }
 
+fn spawn_command(
+    command: &mut Command,
+    deadline: Option<Instant>,
+    cancelled: &AtomicBool,
+) -> Result<GroupChild, VcsError> {
+    for attempt in 0..=MAX_EXECUTABLE_BUSY_RETRIES {
+        match command.group_spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if executable_is_busy(&error) && attempt < MAX_EXECUTABLE_BUSY_RETRIES => {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(VcsError::new(
+                        VcsErrorKind::CommandFailed,
+                        "Git command was cancelled",
+                    ));
+                }
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Err(VcsError::new(
+                        VcsErrorKind::CommandFailed,
+                        "Git command timed out",
+                    ));
+                }
+                thread::sleep(POLL_INTERVAL);
+            }
+            Err(error) => {
+                let kind = if error.kind() == io::ErrorKind::NotFound {
+                    VcsErrorKind::Unavailable
+                } else {
+                    VcsErrorKind::Io
+                };
+                return Err(VcsError::new(kind, format!("cannot start Git: {error}")));
+            }
+        }
+    }
+    unreachable!("bounded spawn loop always returns")
+}
+
+#[cfg(unix)]
+fn executable_is_busy(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ETXTBSY)
+}
+
+#[cfg(not(unix))]
+fn executable_is_busy(_error: &io::Error) -> bool {
+    false
+}
+
 fn run_command(
     mut command: Command,
     deadline: Option<Instant>,
     limits: OutputLimits,
     cancelled: &AtomicBool,
 ) -> Result<ProcessOutput, VcsError> {
-    let mut child = command.group_spawn().map_err(|error| {
-        let kind = if error.kind() == io::ErrorKind::NotFound {
-            VcsErrorKind::Unavailable
-        } else {
-            VcsErrorKind::Io
-        };
-        VcsError::new(kind, format!("cannot start Git: {error}"))
-    })?;
+    let mut child = spawn_command(&mut command, deadline, cancelled)?;
     let stdout = child.inner().stdout.take().expect("piped stdout");
     let stderr = child.inner().stderr.take().expect("piped stderr");
     let stdout_exceeded = Arc::new(AtomicBool::new(false));
@@ -230,6 +270,7 @@ fn run_command(
         if exit_status.is_none() {
             match child.try_wait() {
                 Ok(status) => exit_status = status,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
                     terminate_group(&mut child);
                     return Err(VcsError::new(
@@ -354,7 +395,11 @@ fn read_limited(
     let mut bytes = Vec::with_capacity(limit.min(8192));
     let mut buffer = [0; 8192];
     loop {
-        let read = reader.read(&mut buffer)?;
+        let read = match reader.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
         if read == 0 {
             return Ok(bytes);
         }
@@ -850,6 +895,7 @@ const fn null_device() -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{self, Cursor, Read};
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -863,11 +909,44 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        MAX_STATUS_ENTRIES, OutputLimits, find_executable_in, parse_porcelain_v2, run_status,
+        MAX_STATUS_ENTRIES, OutputLimits, find_executable_in, parse_porcelain_v2, read_limited,
+        run_status,
     };
     use crate::vcs::{VcsErrorKind, VcsStatusKind};
 
     const HASH: &str = "0123456789012345678901234567890123456789";
+
+    struct InterruptOnce {
+        inner: Cursor<&'static [u8]>,
+        interrupted: bool,
+    }
+
+    impl Read for InterruptOnce {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            self.inner.read(buffer)
+        }
+    }
+
+    #[test]
+    fn retries_interrupted_stream_reads() {
+        let exceeded = Arc::new(AtomicBool::new(false));
+        let output = read_limited(
+            InterruptOnce {
+                inner: Cursor::new(b"status"),
+                interrupted: false,
+            },
+            16,
+            Arc::clone(&exceeded),
+        )
+        .expect("interrupted read is retried");
+
+        assert_eq!(output, b"status");
+        assert!(!exceeded.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn parses_every_porcelain_record_without_quoting_paths() {
@@ -977,6 +1056,42 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
+    fn retries_a_transiently_busy_git_executable() {
+        let temp = TempDir::new().expect("tempdir");
+        let script = temp.path().join("busy-git");
+        fs::write(&script, "#!/bin/sh\nexit 0\n").expect("script");
+        let mut permissions = fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script, permissions).expect("permissions");
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .expect("hold executable open for writing");
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            drop(writer);
+        });
+
+        let status = run_status(
+            &script,
+            temp.path(),
+            Duration::from_secs(5),
+            OutputLimits {
+                stdout: 64,
+                stderr: 64,
+            },
+            &AtomicBool::new(false),
+        );
+        release.join().expect("writer release");
+
+        assert_eq!(
+            status.expect("busy executable is retried"),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn bounds_stdout_and_stderr_from_the_git_process() {
         for (name, body) in [
             (
@@ -1021,7 +1136,7 @@ mod tests {
         fs::set_permissions(&script, permissions).expect("permissions");
         let cancelled = Arc::new(AtomicBool::new(false));
         let trigger = Arc::clone(&cancelled);
-        thread::spawn(move || {
+        let trigger = thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
             trigger.store(true, Ordering::Relaxed);
         });
@@ -1038,8 +1153,9 @@ mod tests {
             &cancelled,
         )
         .expect_err("cancelled command");
+        trigger.join().expect("cancellation trigger");
 
-        assert_eq!(error.kind(), VcsErrorKind::CommandFailed);
+        assert_eq!(error.kind(), VcsErrorKind::CommandFailed, "{error}");
         assert!(started.elapsed() < Duration::from_secs(1));
     }
     #[cfg(unix)]
