@@ -123,6 +123,10 @@ impl FilesModel {
         self.refresh.start_next()
     }
 
+    pub(crate) fn cancel_refresh_start(&mut self, generation: u64) -> bool {
+        self.refresh.cancel_start(generation)
+    }
+
     #[must_use]
     pub(crate) const fn refresh_is_running(&self) -> bool {
         self.refresh.is_running()

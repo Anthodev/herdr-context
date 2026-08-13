@@ -9,6 +9,8 @@ use ratatui::widgets::Widget;
 use crate::files::tree::TreeNodeKind;
 use crate::vcs::VcsStatusKind;
 
+use super::{sanitize_terminal_cow, sanitize_terminal_text};
+
 /// Renders a caller-provided viewport slice; it never scans or indexes the tree.
 pub struct FilesView<'a> {
     tree: &'a crate::files::tree::FilesTree,
@@ -53,7 +55,9 @@ impl Widget for FilesView<'_> {
             let mut spans = Vec::with_capacity(4);
             spans.push(Span::styled(marker, marker_style));
             spans.push(Span::raw(" "));
-            spans.push(Span::raw(node.path().to_string_lossy()));
+            spans.push(Span::raw(sanitize_terminal_cow(
+                node.path().to_string_lossy(),
+            )));
             if node.kind() == TreeNodeKind::Virtual {
                 spans.push(Span::styled(" (missing)", Style::new().fg(Color::DarkGray)));
             }
@@ -67,7 +71,7 @@ impl Widget for FilesView<'_> {
         if let Some((label, notice)) = self.notice {
             Line::from(vec![
                 Span::styled(format!("{label}: "), Style::new().fg(Color::Red).bold()),
-                Span::styled(notice, Style::new().fg(Color::Red)),
+                Span::styled(sanitize_terminal_text(notice), Style::new().fg(Color::Red)),
             ])
             .render(
                 Rect::new(

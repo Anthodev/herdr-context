@@ -59,6 +59,16 @@ require a dedicated adapter and cannot be inferred safely.
 - the project context is captured from the originating terminal before the
   plugin receives focus.
 
+### Controls
+
+- `Tab` / `Shift+Tab` or `1` / `2`: switch views without restarting the dock;
+- arrow keys or `h` / `j` / `k` / `l`: navigate the Files tree;
+- `Home` / `End`: select the first or last visible row;
+- `Enter` / `Space`: expand or collapse the selected directory;
+- `r`: refresh the active view;
+- left click selects, right click toggles a Files row, and the mouse wheel navigates;
+- `q`, `Esc`, or `Ctrl+C`: close the TUI and restore the terminal.
+
 ## Design principles
 
 - **Public Herdr integration**: manifest, injected context, CLI, and socket API.

@@ -5,10 +5,10 @@ use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use herdr_context::app::App;
 use herdr_context::host::LaunchContext;
 use herdr_context::host::client::{CommandHostClient, DOCK_TITLE};
 use herdr_context::host::launch::DockLauncher;
-use herdr_context::runtime::run_files_terminal;
 
 fn main() -> ExitCode {
     match run(env::args_os().nth(1)) {
@@ -44,7 +44,7 @@ fn toggle() -> Result<(), Box<dyn Error>> {
 fn run_default() -> Result<(), Box<dyn Error>> {
     let context = LaunchContext::from_env()?;
     if io::stdout().is_terminal() {
-        run_files_terminal(context)?;
+        run_terminal(context)?;
     }
     Ok(())
 }
@@ -56,7 +56,13 @@ fn run_dock() -> Result<(), Box<dyn Error>> {
     stdout.flush()?;
     drop(stdout);
     if io::stdout().is_terminal() {
-        run_files_terminal(context)?;
+        run_terminal(context)?;
     }
+    Ok(())
+}
+
+fn run_terminal(context: LaunchContext) -> Result<(), Box<dyn Error>> {
+    let mut app = App::new(context);
+    ratatui::run(|terminal| app.run(terminal))?;
     Ok(())
 }

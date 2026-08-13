@@ -32,6 +32,15 @@ impl RefreshCoordinator {
         self.running
     }
 
+    /// Releases a claimed generation when it could not be queued.
+    pub fn cancel_start(&mut self, generation: u64) -> bool {
+        if self.running != Some(generation) {
+            return false;
+        }
+        self.running = None;
+        true
+    }
+
     /// Completes the active command and returns whether its result is still current.
     pub fn finish(&mut self, generation: u64) -> bool {
         if self.running != Some(generation) {
@@ -112,5 +121,16 @@ mod tests {
         assert!(!refresh.finish(99));
         assert!(refresh.is_running());
         assert!(refresh.finish(1));
+    }
+
+    #[test]
+    fn releases_a_claim_that_could_not_be_queued() {
+        let mut refresh = RefreshCoordinator::new();
+        refresh.request();
+        assert_eq!(refresh.start_next(), Some(1));
+
+        assert!(refresh.cancel_start(1));
+        assert!(!refresh.is_running());
+        assert_eq!(refresh.start_next(), Some(1));
     }
 }

@@ -16,10 +16,16 @@ fn normalize_nonempty(value: impl Into<String>) -> Option<String> {
     Some(value.trim().to_owned())
 }
 
+pub mod app;
+mod controller;
 pub mod conversations;
 pub mod files;
 pub mod host;
+pub mod input;
+pub mod intent;
+pub mod model;
 pub mod project;
 pub mod runtime;
 pub mod ui;
 pub mod vcs;
+pub mod worker;
