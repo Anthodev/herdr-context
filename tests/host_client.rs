@@ -124,6 +124,31 @@ fn missing_binary_is_a_structured_host_error() {
 }
 
 #[test]
+fn transiently_busy_executable_is_retried() -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs::OpenOptions;
+    use std::thread;
+    use std::time::Duration;
+
+    let temp = TempDir::new()?;
+    let script = temp.path().join("busy-herdr");
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf '%s\\n' '{\"id\":\"test\",\"result\":{\"type\":\"pane_info\",\"pane\":{\"pane_id\":\"pane\",\"tab_id\":\"tab\",\"cwd\":\"/project\",\"focused\":false}}}'\n",
+    )?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+    let writer = OpenOptions::new().write(true).open(&script)?;
+    let release = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(30));
+        drop(writer);
+    });
+
+    let client = CommandHostClient::new(script);
+    assert!(client.pane(&PaneId::new("pane")?)?.is_some());
+    release.join().expect("release writer");
+    Ok(())
+}
+
+#[test]
 fn stalled_command_returns_a_bounded_structured_error() -> Result<(), Box<dyn std::error::Error>> {
     use std::time::{Duration, Instant};
 

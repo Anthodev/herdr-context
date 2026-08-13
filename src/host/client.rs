@@ -23,6 +23,7 @@ const MAX_RESIZE_ATTEMPTS: usize = 8;
 const MIN_OTHER_PANE_WIDTH: u16 = 10;
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_EXECUTABLE_BUSY_RETRIES: usize = 10;
 const MAX_COMMAND_OUTPUT: u64 = 1024 * 1024;
 
 /// `HostClient` backed only by Herdr's public argv CLI.
@@ -411,7 +412,7 @@ fn run_command(mut command: Command, timeout: Duration) -> io::Result<ProcessOut
     let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "command timeout is too large")
     })?;
-    let mut child = command.group_spawn()?;
+    let mut child = spawn_command(&mut command, deadline)?;
     let stdout = child
         .inner()
         .stdout
@@ -453,6 +454,40 @@ fn run_command(mut command: Command, timeout: Duration) -> io::Result<ProcessOut
         stdout: stdout?,
         stderr: stderr?,
     })
+}
+
+fn spawn_command(command: &mut Command, deadline: Instant) -> io::Result<GroupChild> {
+    let mut busy_retries = 0;
+    loop {
+        match command.group_spawn() {
+            Ok(child) => return Ok(child),
+            Err(error)
+                if error.kind() == io::ErrorKind::Interrupted
+                    || (executable_is_busy(&error)
+                        && busy_retries < MAX_EXECUTABLE_BUSY_RETRIES) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Herdr command timed out before it could start",
+                    ));
+                }
+                busy_retries += usize::from(executable_is_busy(&error));
+                thread::sleep(COMMAND_POLL_INTERVAL);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn executable_is_busy(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ETXTBSY)
+}
+
+#[cfg(not(unix))]
+fn executable_is_busy(_error: &io::Error) -> bool {
+    false
 }
 
 fn read_bounded(reader: impl Read) -> io::Result<Vec<u8>> {

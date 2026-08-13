@@ -1,19 +1,33 @@
 //! Intent transitions and orchestration between state and bounded workers.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
+use crate::conversations::Conversation;
+use crate::conversations::discovery::discover_conversations;
+use crate::conversations::sources::{
+    DiscoveryLimit, GenericJsonlSource, MetadataBudget, SourceRegistry,
+};
 use crate::host::LaunchContext;
 use crate::intent::{Intent, View};
 use crate::model::{AppModel, LoadingState};
+use crate::project::resolve_project_context;
 use crate::runtime::{FilesRuntime, RuntimeMessage};
 use crate::ui::render_shell;
 use crate::worker::{CompletedJob, Job, JobKey, JobKind, Priority, SubmitStatus, WorkerRuntime};
 
 struct BootstrapResult(Result<FilesRuntime, crate::runtime::FilesRuntimeError>);
-struct ConversationsReady;
+struct ConversationsResult(ConversationJobResult);
+
+enum ConversationJobResult {
+    Ready(Vec<Conversation>),
+    Cancelled,
+    Error(&'static str),
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Transition {
@@ -74,10 +88,10 @@ impl Controller {
             .unwrap_or_else(|| self.model.launch_context().cwd())
             .to_path_buf();
         let job = Job::new(
-            JobKey::new(JobKind::ConversationDiscovery, root),
+            JobKey::new(JobKind::ConversationDiscovery, &root),
             generation,
             Priority::Low,
-            |_| Box::new(ConversationsReady),
+            move |cancelled| Box::new(ConversationsResult(load_conversations(&root, cancelled))),
         );
         if !accepted(workers.submit(job)) {
             self.model
@@ -189,22 +203,39 @@ impl Controller {
             }
             JobKind::ConversationDiscovery => {
                 let generation = result.generation();
-                if result.downcast::<ConversationsReady>().is_ok() {
-                    self.model
-                        .conversations_mut()
-                        .set_loading(LoadingState::Ready);
-                    let requested = self.model.conversations().generations().0;
-                    self.model
-                        .conversations_mut()
-                        .set_generations(requested, generation);
-                } else {
+                let requested = self.model.conversations().generations().0;
+                if generation < requested {
+                    return false;
+                }
+                let Ok(result) = result.downcast::<ConversationsResult>() else {
                     self.model
                         .conversations_mut()
                         .set_loading(LoadingState::Error(
                             "invalid conversation worker result".to_owned(),
                         ));
+                    return true;
+                };
+                match result.0 {
+                    ConversationJobResult::Ready(conversations) => self
+                        .model
+                        .conversations_mut()
+                        .replace_items(conversations, generation),
+                    ConversationJobResult::Cancelled => {
+                        self.model
+                            .conversations_mut()
+                            .set_generations(requested, generation);
+                        self.model
+                            .conversations_mut()
+                            .set_loading(LoadingState::Ready);
+                        true
+                    }
+                    ConversationJobResult::Error(message) => {
+                        self.model
+                            .conversations_mut()
+                            .set_loading(LoadingState::Error(message.to_owned()));
+                        true
+                    }
                 }
-                true
             }
             JobKind::Filesystem | JobKind::Vcs => {
                 let Ok(message) = result.downcast::<RuntimeMessage>() else {
@@ -279,6 +310,47 @@ impl Controller {
         self.files
             .as_ref()
             .is_some_and(FilesRuntime::has_pending_work)
+    }
+}
+
+fn load_conversations(root: &Path, cancelled: &AtomicBool) -> ConversationJobResult {
+    if cancelled.load(Ordering::Relaxed) {
+        return ConversationJobResult::Cancelled;
+    }
+    let project = match resolve_project_context(root) {
+        Ok(context) => context.conversation_identity().clone(),
+        Err(_) => return ConversationJobResult::Error("project identity is unavailable"),
+    };
+    if cancelled.load(Ordering::Relaxed) {
+        return ConversationJobResult::Cancelled;
+    }
+    let source = match GenericJsonlSource::for_project(project.clone()) {
+        Ok(source) => source,
+        Err(_) => {
+            return ConversationJobResult::Error(
+                "project-local conversation source is unavailable",
+            );
+        }
+    };
+    let registry = match SourceRegistry::new(vec![Box::new(source)]) {
+        Ok(registry) => registry,
+        Err(_) => {
+            return ConversationJobResult::Error(
+                "project-local conversation source registration failed",
+            );
+        }
+    };
+    let discovery = discover_conversations(
+        &registry,
+        &project,
+        &HashMap::new(),
+        DiscoveryLimit::new(256).expect("non-zero conversation discovery limit"),
+        MetadataBudget::new(256 * 1024).expect("non-zero conversation metadata budget"),
+    );
+    if cancelled.load(Ordering::Relaxed) {
+        ConversationJobResult::Cancelled
+    } else {
+        ConversationJobResult::Ready(discovery.into_conversations())
     }
 }
 
@@ -471,5 +543,53 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("src/child"));
+    }
+    #[test]
+    fn low_priority_orchestration_loads_project_local_conversations() {
+        let temp = TempDir::new().expect("tempdir");
+        let directory = temp.path().join(".herdr/conversations");
+        fs::create_dir_all(&directory).expect("conversation directory");
+        fs::write(
+            directory.join("session.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "session_id": "controller-session",
+                    "cwd": temp.path(),
+                    "timestamp": "2026-01-02T03:04:05Z",
+                    "role": "user",
+                    "message": "private controller fixture",
+                })
+            ),
+        )
+        .expect("conversation fixture");
+        let mut controller = controller(&temp);
+        controller.model.set_active_view(View::Conversations);
+        let mut workers = WorkerRuntime::with_capacities(2, 1);
+        controller.start(&mut workers);
+
+        loop {
+            let result = workers
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("worker result");
+            let kind = result.key().kind();
+            controller.apply_result(result, &mut workers);
+            if kind == JobKind::ConversationDiscovery {
+                break;
+            }
+        }
+
+        assert!(matches!(
+            controller.model.conversations().loading(),
+            LoadingState::Ready
+        ));
+        assert_eq!(controller.model.conversations().items().len(), 1);
+        assert_eq!(
+            controller.model.conversations().items()[0]
+                .session_reference()
+                .id(),
+            "controller-session"
+        );
+        workers.shutdown();
     }
 }
