@@ -45,12 +45,9 @@ impl Controller {
             1,
             Priority::High,
             move |cancelled| {
-                let result = if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                    Err(crate::runtime::FilesRuntimeError::cancelled())
-                } else {
-                    FilesRuntime::bootstrap(&context)
-                };
-                Box::new(BootstrapResult(result))
+                Box::new(BootstrapResult(FilesRuntime::bootstrap_cancellable(
+                    &context, cancelled,
+                )))
             },
         );
         if !accepted(workers.submit(bootstrap)) {

@@ -1,10 +1,16 @@
 //! Backend-neutral VCS contracts.
 
 pub mod git;
+pub mod jj;
 pub mod status;
 
+use std::env;
 use std::error::Error;
+use std::ffi::OsString;
 use std::fmt;
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 pub use status::{VcsEntryStatus, VcsEntryStatusError, VcsStatusKind, VcsStatusSnapshot};
@@ -129,3 +135,43 @@ impl fmt::Display for VcsError {
 }
 
 impl Error for VcsError {}
+
+pub(crate) fn find_executable(name: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    find_executable_in(name, env::split_paths(&path))
+}
+
+pub(crate) fn find_executable_in(
+    name: &str,
+    directories: impl IntoIterator<Item = PathBuf>,
+) -> Option<PathBuf> {
+    directories
+        .into_iter()
+        .map(|directory| directory.join(executable_name(name)))
+        .find_map(|candidate| {
+            is_executable(&candidate)
+                .then(|| fs::canonicalize(candidate).ok())
+                .flatten()
+        })
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(windows)]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
+}
+
+#[cfg(windows)]
+fn executable_name(name: &str) -> OsString {
+    OsString::from(format!("{name}.exe"))
+}
+
+#[cfg(not(windows))]
+fn executable_name(name: &str) -> OsString {
+    OsString::from(name)
+}

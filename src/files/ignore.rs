@@ -48,6 +48,9 @@ pub(crate) struct VisibleEntry {
 pub struct IgnorePolicy {
     root_path: PathBuf,
     root: Arc<Dir>,
+    ignore_root_path: PathBuf,
+    ignore_root: Arc<Dir>,
+    files_prefix: PathBuf,
     visibility: Arc<dyn VisibilityPolicy>,
     gitignore_enabled: bool,
 }
@@ -61,20 +64,56 @@ impl IgnorePolicy {
         root: PathBuf,
         visibility: Arc<dyn VisibilityPolicy>,
     ) -> io::Result<Self> {
-        if !root.is_absolute() {
+        Self::with_workspace_visibility_policy(root.clone(), root, visibility)
+    }
+
+    pub(crate) fn for_workspace(root: PathBuf, workspace_root: PathBuf) -> io::Result<Self> {
+        Self::with_workspace_visibility_policy(
+            root,
+            workspace_root,
+            Arc::new(DefaultVisibilityPolicy),
+        )
+    }
+
+    fn with_workspace_visibility_policy(
+        root: PathBuf,
+        workspace_root: PathBuf,
+        visibility: Arc<dyn VisibilityPolicy>,
+    ) -> io::Result<Self> {
+        if !root.is_absolute() || !workspace_root.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "root must be an absolute directory",
+                "root and workspace root must be absolute directories",
             ));
         }
         let root_path = fs::canonicalize(root)?;
+        let ignore_root_path = fs::canonicalize(workspace_root)?;
+        let files_prefix = root_path
+            .strip_prefix(&ignore_root_path)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "root must be inside the VCS workspace",
+                )
+            })?
+            .to_path_buf();
         let root = Arc::new(open_ambient_directory_nofollow(&root_path)?);
-        let gitignore_enabled = root
-            .symlink_metadata(".git")
-            .is_ok_and(|metadata| !metadata.is_symlink());
+        let ignore_root = if root_path == ignore_root_path {
+            Arc::new(root.try_clone()?)
+        } else {
+            Arc::new(open_ambient_directory_nofollow(&ignore_root_path)?)
+        };
+        let gitignore_enabled = [".jj", ".git"].into_iter().any(|marker| {
+            ignore_root
+                .symlink_metadata(marker)
+                .is_ok_and(|metadata| !metadata.is_symlink())
+        });
         Ok(Self {
             root_path,
             root,
+            ignore_root_path,
+            ignore_root,
+            files_prefix,
             visibility,
             gitignore_enabled,
         })
@@ -94,7 +133,11 @@ impl IgnorePolicy {
         &self,
         relative_directory: &Path,
     ) -> io::Result<Vec<VisibleEntry>> {
-        let (directory, matchers) = self.open_directory_with_matchers(relative_directory)?;
+        let (directory, matchers, ancestor_ignored) =
+            self.open_directory_with_matchers(relative_directory)?;
+        if ancestor_ignored {
+            return Ok(Vec::new());
+        }
         let mut children = Vec::new();
         for result in directory.entries()? {
             let entry = match result {
@@ -157,11 +200,18 @@ impl IgnorePolicy {
     fn open_directory_with_matchers(
         &self,
         relative_directory: &Path,
-    ) -> io::Result<(Dir, Vec<Gitignore>)> {
+    ) -> io::Result<(Dir, Vec<Gitignore>, bool)> {
+        let directory = self.open_directory(relative_directory)?;
+        let (matchers, ancestor_ignored) = self.ignore_matchers(relative_directory)?;
+        Ok((directory, matchers, ancestor_ignored))
+    }
+
+    fn ignore_matchers(&self, relative_directory: &Path) -> io::Result<(Vec<Gitignore>, bool)> {
         validate_relative_directory(relative_directory)?;
-        let mut directory = self.root.try_clone()?;
+        let mut directory = self.ignore_root.try_clone()?;
         let mut prefix = PathBuf::new();
         let mut matchers = Vec::new();
+        let mut ancestor_ignored = false;
         if self.gitignore_enabled {
             if let Some(exclude) = self.git_exclude() {
                 matchers.push(exclude);
@@ -170,23 +220,28 @@ impl IgnorePolicy {
                 matchers.push(matcher);
             }
         }
-        for component in relative_directory.components() {
+        let target = self.files_prefix.join(relative_directory);
+        for component in target.components() {
             let std::path::Component::Normal(name) = component else {
                 return Err(invalid_relative_path());
             };
-            directory = open_child_directory_nofollow(&directory, name)?;
             prefix.push(name);
+            if is_ignored(&matchers, &self.ignore_root_path.join(&prefix), true) {
+                ancestor_ignored = true;
+                break;
+            }
+            directory = open_child_directory_nofollow(&directory, name)?;
             if self.gitignore_enabled
                 && let Some(matcher) = self.gitignore(&directory, &prefix)
             {
                 matchers.push(matcher);
             }
         }
-        Ok((directory, matchers))
+        Ok((matchers, ancestor_ignored))
     }
 
     fn gitignore(&self, directory: &Dir, prefix: &Path) -> Option<Gitignore> {
-        let matcher_root = self.root_path.join(prefix);
+        let matcher_root = self.ignore_root_path.join(prefix);
         self.matcher_from_file(
             directory,
             OsStr::new(".gitignore"),
@@ -196,13 +251,13 @@ impl IgnorePolicy {
     }
 
     fn git_exclude(&self) -> Option<Gitignore> {
-        let git = open_child_directory_nofollow(&self.root, OsStr::new(".git")).ok()?;
+        let git = open_child_directory_nofollow(&self.ignore_root, OsStr::new(".git")).ok()?;
         let info = open_child_directory_nofollow(&git, OsStr::new("info")).ok()?;
         self.matcher_from_file(
             &info,
             OsStr::new("exclude"),
-            self.root_path.clone(),
-            self.root_path.join(".git/info/exclude"),
+            self.ignore_root_path.clone(),
+            self.ignore_root_path.join(".git/info/exclude"),
         )
     }
 

@@ -89,7 +89,8 @@ fn valid_gitfile_sets_identity_without_changing_files_root()
 }
 
 #[test]
-fn closest_jj_workspace_wins_over_closest_git_worktree() -> Result<(), Box<dyn std::error::Error>> {
+fn closest_workspace_wins_when_git_is_nested_inside_jujutsu()
+-> Result<(), Box<dyn std::error::Error>> {
     let temp = TempDir::new()?;
     let jj_workspace = temp.path().join("jj-workspace");
     let git_worktree = jj_workspace.join("nested-git");
@@ -102,11 +103,11 @@ fn closest_jj_workspace_wins_over_closest_git_worktree() -> Result<(), Box<dyn s
 
     assert_eq!(
         context.conversation_identity().root(),
-        fs::canonicalize(&jj_workspace)?
+        fs::canonicalize(&git_worktree)?
     );
     assert_eq!(
-        context.vcs().expect("detected Jujutsu").backend().as_str(),
-        "jj"
+        context.vcs().expect("detected Git").backend().as_str(),
+        "git"
     );
     Ok(())
 }

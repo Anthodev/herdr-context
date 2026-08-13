@@ -4,8 +4,8 @@ use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, Read};
-use std::path::PathBuf;
-use std::process::{ExitStatus, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -16,6 +16,7 @@ use command_group::{CommandGroup, GroupChild};
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_OUTPUT_LIMIT: usize = 1024 * 1024;
+const MAX_EXECUTABLE_BUSY_RETRIES: usize = 10;
 
 #[derive(Clone, Debug)]
 pub struct ProcessSpec {
@@ -166,7 +167,7 @@ pub fn run(spec: &ProcessSpec, cancelled: &AtomicBool) -> Result<ProcessOutput, 
             "subprocess timeout is too large",
         )
     })?;
-    let mut command = std::process::Command::new(&spec.program);
+    let mut command = Command::new(&spec.program);
     command
         .args(&spec.args)
         .stdin(Stdio::null())
@@ -176,13 +177,7 @@ pub fn run(spec: &ProcessSpec, cancelled: &AtomicBool) -> Result<ProcessOutput, 
         command.current_dir(current_dir);
     }
 
-    let mut child = command.group_spawn().map_err(|source| {
-        ProcessError::with_source(
-            ProcessErrorKind::Spawn,
-            format!("cannot start {}", spec.program.display()),
-            source,
-        )
-    })?;
+    let mut child = spawn_command(&mut command, &spec.program, deadline, cancelled)?;
     let stdout = child
         .inner()
         .stdout
@@ -203,6 +198,7 @@ pub fn run(spec: &ProcessSpec, cancelled: &AtomicBool) -> Result<ProcessOutput, 
         if exit_status.is_none() {
             match child.try_wait() {
                 Ok(status) => exit_status = status,
+                Err(source) if source.kind() == io::ErrorKind::Interrupted => {}
                 Err(source) => {
                     return fail_and_collect(
                         &mut child,
@@ -263,6 +259,57 @@ pub fn run(spec: &ProcessSpec, cancelled: &AtomicBool) -> Result<ProcessOutput, 
     })
 }
 
+fn spawn_command(
+    command: &mut Command,
+    program: &Path,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<GroupChild, ProcessError> {
+    let mut busy_retries = 0;
+    loop {
+        match command.group_spawn() {
+            Ok(child) => return Ok(child),
+            Err(source)
+                if source.kind() == io::ErrorKind::Interrupted
+                    || (executable_is_busy(&source)
+                        && busy_retries < MAX_EXECUTABLE_BUSY_RETRIES) =>
+            {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(ProcessError::new(
+                        ProcessErrorKind::Cancelled,
+                        "subprocess was cancelled",
+                    ));
+                }
+                if Instant::now() >= deadline {
+                    return Err(ProcessError::new(
+                        ProcessErrorKind::TimedOut,
+                        "subprocess timed out",
+                    ));
+                }
+                busy_retries += usize::from(executable_is_busy(&source));
+                thread::sleep(POLL_INTERVAL);
+            }
+            Err(source) => {
+                return Err(ProcessError::with_source(
+                    ProcessErrorKind::Spawn,
+                    format!("cannot start {}", program.display()),
+                    source,
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn executable_is_busy(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ETXTBSY)
+}
+
+#[cfg(not(unix))]
+fn executable_is_busy(_error: &io::Error) -> bool {
+    false
+}
+
 fn spawn_reader(
     reader: impl Read + Send + 'static,
     limit: usize,
@@ -275,7 +322,11 @@ fn read_limited(mut reader: impl Read, limit: usize, exceeded: &AtomicBool) -> i
     let mut bytes = Vec::with_capacity(limit.min(8192));
     let mut buffer = [0_u8; 8192];
     loop {
-        let count = reader.read(&mut buffer)?;
+        let count = match reader.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
         if count == 0 {
             return Ok(bytes);
         }

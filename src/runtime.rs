@@ -15,13 +15,56 @@ use crate::intent::{Intent, PointerAction};
 use crate::project::resolve_project_context;
 use crate::ui::files::FilesView;
 use crate::vcs::git::GitService;
+use crate::vcs::jj::{JjService, JujutsuMode};
 use crate::vcs::{VcsBackendMetadata, VcsWorkspace};
 use crate::worker::{Job, JobKey, JobKind, Priority, SubmitStatus, WorkerRuntime};
 
 #[derive(Clone, Debug)]
-struct GitRefresh {
-    service: GitService,
-    workspace: VcsWorkspace,
+enum VcsRefresh {
+    Git {
+        service: GitService,
+        workspace: VcsWorkspace,
+    },
+    Jujutsu {
+        service: JjService,
+        workspace: VcsWorkspace,
+    },
+}
+
+impl VcsRefresh {
+    const fn workspace(&self) -> &VcsWorkspace {
+        match self {
+            Self::Git { workspace, .. } | Self::Jujutsu { workspace, .. } => workspace,
+        }
+    }
+
+    fn refresh_status_cancellable(
+        &self,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<crate::vcs::VcsStatusSnapshot, crate::vcs::VcsError> {
+        match self {
+            Self::Git { service, workspace } => {
+                service.refresh_status_cancellable(workspace, cancelled)
+            }
+            Self::Jujutsu { service, workspace } => {
+                service.refresh_status_cancellable(workspace, cancelled)
+            }
+        }
+    }
+
+    const fn jujutsu_mode(&self) -> Option<JujutsuMode> {
+        match self {
+            Self::Jujutsu { service, .. } => Some(service.mode()),
+            Self::Git { .. } => None,
+        }
+    }
+
+    fn set_jujutsu_mode(&mut self, mode: JujutsuMode) -> bool {
+        match self {
+            Self::Jujutsu { service, .. } => service.set_mode(mode),
+            Self::Git { .. } => false,
+        }
+    }
 }
 
 /// Fully connected Files surface. Filesystem and VCS work is dispatched separately.
@@ -30,7 +73,7 @@ pub struct FilesRuntime {
     model: FilesModel,
     root: PathBuf,
     background_active: bool,
-    git: Option<GitRefresh>,
+    vcs: Option<VcsRefresh>,
     expanded: BTreeSet<PathBuf>,
     desired_expanded: BTreeSet<PathBuf>,
     visible_rows: Vec<PathBuf>,
@@ -50,40 +93,86 @@ pub struct FilesRuntime {
 
 impl FilesRuntime {
     pub fn bootstrap(context: &LaunchContext) -> Result<Self, FilesRuntimeError> {
+        static NOT_CANCELLED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        Self::bootstrap_with_jujutsu_mode_cancellable(context, JujutsuMode::Fresh, &NOT_CANCELLED)
+    }
+
+    pub fn bootstrap_with_jujutsu_mode(
+        context: &LaunchContext,
+        jujutsu_mode: JujutsuMode,
+    ) -> Result<Self, FilesRuntimeError> {
+        static NOT_CANCELLED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        Self::bootstrap_with_jujutsu_mode_cancellable(context, jujutsu_mode, &NOT_CANCELLED)
+    }
+
+    pub(crate) fn bootstrap_cancellable(
+        context: &LaunchContext,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<Self, FilesRuntimeError> {
+        Self::bootstrap_with_jujutsu_mode_cancellable(context, JujutsuMode::Fresh, cancelled)
+    }
+
+    fn bootstrap_with_jujutsu_mode_cancellable(
+        context: &LaunchContext,
+        jujutsu_mode: JujutsuMode,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<Self, FilesRuntimeError> {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(FilesRuntimeError::cancelled());
+        }
         let opening_directory = context.foreground_cwd().unwrap_or_else(|| context.cwd());
         let project = resolve_project_context(opening_directory)
             .map_err(|error| FilesRuntimeError::new(error.to_string()))?;
-        let mut model = match project.vcs() {
-            Some(vcs) => FilesModel::for_workspace(
-                project.files_root().to_path_buf(),
-                vcs.workspace_root().to_path_buf(),
-            )?,
-            None => FilesModel::new(project.files_root().to_path_buf())?,
-        };
-        model.load_directory(Path::new(""))?;
-
-        let git = project
-            .vcs()
-            .filter(|vcs| vcs.backend().as_str() == "git")
-            .map(|vcs| {
+        let vcs = match project.vcs() {
+            Some(detected) if detected.backend().as_str() == "git" => {
                 let workspace = VcsWorkspace::new(
-                    vcs.workspace_root().to_path_buf(),
+                    detected.workspace_root().to_path_buf(),
                     VcsBackendMetadata::new("git", "Git", false)
                         .map_err(|error| FilesRuntimeError::new(error.to_string()))?,
                 )
                 .map_err(|error| FilesRuntimeError::new(error.to_string()))?;
-                Ok::<_, FilesRuntimeError>(GitRefresh {
+                Some(VcsRefresh::Git {
                     service: GitService::default(),
                     workspace,
                 })
-            })
-            .transpose()?;
+            }
+            Some(detected) if detected.backend().as_str() == "jj" => {
+                let fallback = VcsWorkspace::new(
+                    detected.workspace_root().to_path_buf(),
+                    VcsBackendMetadata::new("jj", "Jujutsu", true)
+                        .map_err(|error| FilesRuntimeError::new(error.to_string()))?,
+                )
+                .map_err(|error| FilesRuntimeError::new(error.to_string()))?;
+                let service = JjService::new(jujutsu_mode, std::time::Duration::from_secs(5));
+                let workspace = match service.detect_cancellable(project.files_root(), cancelled) {
+                    Ok(Some(workspace)) => workspace,
+                    Ok(None) => fallback,
+                    Err(_) if !cancelled.load(std::sync::atomic::Ordering::Relaxed) => fallback,
+                    Err(_) => return Err(FilesRuntimeError::cancelled()),
+                };
+                Some(VcsRefresh::Jujutsu { service, workspace })
+            }
+            Some(_) | None => None,
+        };
+        let mut model = match &vcs {
+            Some(vcs) => FilesModel::for_workspace(
+                project.files_root().to_path_buf(),
+                vcs.workspace().root().to_path_buf(),
+            )?,
+            None => FilesModel::new(project.files_root().to_path_buf())?,
+        };
+        model.load_directory(Path::new(""))?;
+        if vcs.as_ref().and_then(VcsRefresh::jujutsu_mode) == Some(JujutsuMode::Passive) {
+            model.mark_status_stale();
+        }
 
         let mut runtime = Self {
             model,
             root: project.files_root().to_path_buf(),
             background_active: true,
-            git,
+            vcs,
             expanded: BTreeSet::new(),
             desired_expanded: BTreeSet::new(),
             visible_rows: Vec::new(),
@@ -105,8 +194,10 @@ impl FilesRuntime {
     }
 
     pub fn render(&mut self, area: Rect, buffer: &mut Buffer) {
-        let notice_height =
-            usize::from(self.filesystem_notice.is_some() || self.model.failure_notice().is_some());
+        let has_notice = self.filesystem_notice.is_some()
+            || self.model.failure_notice().is_some()
+            || self.model.status_is_stale();
+        let notice_height = usize::from(has_notice);
         self.viewport_y = area.y;
         self.viewport_height = usize::from(area.height).saturating_sub(notice_height);
         self.ensure_selection_visible();
@@ -115,11 +206,22 @@ impl FilesRuntime {
             .saturating_add(self.viewport_height)
             .min(self.visible_rows.len());
         let rows = &self.visible_rows[self.viewport_offset.min(end)..end];
-        let notice = self
-            .filesystem_notice
-            .as_deref()
-            .map(|message| ("Files", message))
-            .or_else(|| self.model.failure_notice().map(|message| ("VCS", message)));
+        let stale = self.model.status_is_stale();
+        let notice = match (
+            self.filesystem_notice.as_deref(),
+            self.model.failure_notice(),
+            stale,
+        ) {
+            (Some(message), _, true) => Some(("Files / VCS stale", message)),
+            (Some(message), _, false) => Some(("Files", message)),
+            (None, Some(message), true) => Some(("VCS stale", message)),
+            (None, Some(message), false) => Some(("VCS", message)),
+            (None, None, true) => Some((
+                "VCS stale",
+                "passive mode; working copy was not snapshotted",
+            )),
+            (None, None, false) => None,
+        };
         FilesView::new(
             self.model.tree(),
             rows,
@@ -488,7 +590,7 @@ impl FilesRuntime {
     }
 
     fn request_vcs_refresh(&mut self, workers: &mut WorkerRuntime) -> bool {
-        if self.git.is_none() {
+        if self.vcs.is_none() {
             return false;
         }
         self.model.request_refresh();
@@ -507,16 +609,14 @@ impl FilesRuntime {
         let Some(generation) = self.model.begin_refresh() else {
             return;
         };
-        let Some(git) = self.git.clone() else {
+        let Some(vcs) = self.vcs.clone() else {
             self.model.cancel_refresh_start(generation);
             return;
         };
         let input = self.model.status_merge_input();
-        let key = JobKey::new(JobKind::Vcs, git.workspace.root());
+        let key = JobKey::new(JobKind::Vcs, vcs.workspace().root());
         let job = Job::new(key, generation, Priority::High, move |cancelled| {
-            let snapshot = git
-                .service
-                .refresh_status_cancellable(&git.workspace, cancelled);
+            let snapshot = vcs.refresh_status_cancellable(cancelled);
             Box::new(RuntimeMessage::Vcs(PreparedRefreshResult::prepare(
                 generation, input, snapshot,
             )))
@@ -629,6 +729,27 @@ impl FilesRuntime {
         self.background_active = true;
         self.request_vcs_refresh(workers);
         self.retry_pending(workers);
+    }
+
+    #[must_use]
+    pub fn jujutsu_mode(&self) -> Option<JujutsuMode> {
+        self.vcs.as_ref().and_then(VcsRefresh::jujutsu_mode)
+    }
+
+    pub fn set_jujutsu_mode(&mut self, mode: JujutsuMode, workers: &mut WorkerRuntime) -> bool {
+        let changed = self
+            .vcs
+            .as_mut()
+            .is_some_and(|vcs| vcs.set_jujutsu_mode(mode));
+        if !changed {
+            return false;
+        }
+        if mode == JujutsuMode::Passive {
+            self.model.mark_status_stale();
+        }
+        self.model.request_refresh();
+        self.start_next_vcs_refresh(workers);
+        true
     }
 
     pub(crate) const fn pause_background(&mut self) {
@@ -757,6 +878,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::io;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -767,8 +890,9 @@ mod tests {
     use ratatui::layout::Rect;
     use tempfile::TempDir;
 
-    use super::{FilesRuntime, RuntimeMessage};
+    use super::{FilesRuntime, RuntimeMessage, VcsRefresh};
     use crate::host::LaunchContext;
+    use crate::vcs::jj::{JjService, JujutsuMode};
     use crate::vcs::{VcsEntryStatus, VcsStatusKind, VcsStatusSnapshot};
     use crate::worker::WorkerRuntime;
 
@@ -799,6 +923,14 @@ mod tests {
             .downcast::<RuntimeMessage>()
             .map(|message| *message)
             .expect("Files runtime message")
+    }
+
+    #[cfg(unix)]
+    fn executable(path: &Path, contents: &str) {
+        fs::write(path, contents).expect("script");
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).expect("permissions");
     }
 
     #[test]
@@ -1257,5 +1389,161 @@ mod tests {
             panic!("unexpected worker result");
         };
         assert!(runtime.complete_filesystem(generation, expansions, result, &mut workers));
+    }
+    #[test]
+    fn changing_jujutsu_mode_supersedes_an_in_flight_status_result() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join(".jj/repo")).expect("repo marker");
+        fs::create_dir_all(temp.path().join(".jj/working_copy")).expect("working-copy marker");
+        let context = LaunchContext::from_vars([(
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            format!(
+                r#"{{"workspace_id":"workspace","tab_id":"tab","pane_id":"pane","cwd":"{}"}}"#,
+                temp.path().display()
+            ),
+        )])
+        .expect("context");
+        let mut runtime =
+            FilesRuntime::bootstrap_with_jujutsu_mode(&context, crate::vcs::jj::JujutsuMode::Fresh)
+                .expect("runtime");
+        let mut workers = workers();
+        runtime.model.request_refresh();
+        let generation = runtime.model.begin_refresh().expect("running generation");
+        let input = runtime.model.status_merge_input();
+
+        assert!(runtime.set_jujutsu_mode(crate::vcs::jj::JujutsuMode::Passive, &mut workers));
+        assert!(runtime.model.status_is_stale());
+        let old_result = crate::files::PreparedRefreshResult::prepare(
+            generation,
+            input,
+            Ok(VcsStatusSnapshot::new(Vec::new(), false)),
+        );
+
+        assert!(!runtime.model.complete_prepared_refresh(old_result));
+        assert_eq!(
+            runtime.jujutsu_mode(),
+            Some(crate::vcs::jj::JujutsuMode::Passive)
+        );
+        assert!(
+            runtime.model.begin_refresh().is_some(),
+            "mode change did not queue a replacement generation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jujutsu_refreshes_only_on_activation_and_explicit_refresh() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join(".jj/repo")).expect("repo marker");
+        fs::create_dir_all(temp.path().join(".jj/working_copy")).expect("working-copy marker");
+        fs::write(temp.path().join("tracked"), []).expect("tracked");
+        let calls = temp.path().join("calls");
+        let script = temp.path().join("fake-jj");
+        executable(
+            &script,
+            &format!(
+                "#!/bin/sh\nprintf 'call\\n' >> '{}'\nprintf 'M\\000tracked\\000tracked\\000false\\000false\\000file\\000file\\000'\n",
+                calls.display()
+            ),
+        );
+        let context = LaunchContext::from_vars([(
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            format!(
+                r#"{{"workspace_id":"workspace","tab_id":"tab","pane_id":"pane","cwd":"{}"}}"#,
+                temp.path().display()
+            ),
+        )])
+        .expect("context");
+        let mut runtime = FilesRuntime::bootstrap_with_jujutsu_mode(&context, JujutsuMode::Fresh)
+            .expect("runtime");
+        let Some(VcsRefresh::Jujutsu { service, .. }) = &mut runtime.vcs else {
+            panic!("Jujutsu backend");
+        };
+        *service = JjService::with_executable(script, JujutsuMode::Fresh, Duration::from_secs(1));
+        let mut workers = workers();
+
+        runtime.start_background(&mut workers);
+        assert!(runtime.complete_background(receive(&mut workers), &mut workers));
+        assert_eq!(
+            fs::read_to_string(&calls)
+                .expect("activation call")
+                .lines()
+                .count(),
+            1
+        );
+
+        runtime.request_reload(&mut workers);
+        for _ in 0..4 {
+            if !runtime.has_pending_work() && !workers.has_pending_work() {
+                break;
+            }
+            runtime.complete_background(receive(&mut workers), &mut workers);
+        }
+        let calls_after_refresh = fs::read_to_string(&calls)
+            .expect("refresh calls")
+            .lines()
+            .count();
+        assert!(
+            calls_after_refresh >= 2,
+            "manual refresh did not run Jujutsu"
+        );
+        assert!(!runtime.has_pending_work());
+        assert!(!workers.has_pending_work());
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            fs::read_to_string(&calls)
+                .expect("stable calls")
+                .lines()
+                .count(),
+            calls_after_refresh,
+            "unexpected periodic refresh"
+        );
+        assert!(workers.try_recv().is_none(), "unexpected periodic result");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_passive_jujutsu_refresh_preserves_files_and_stale_notice() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join(".jj/repo")).expect("repo marker");
+        fs::create_dir_all(temp.path().join(".jj/working_copy")).expect("working-copy marker");
+        fs::write(temp.path().join("visible"), []).expect("visible");
+        let script = temp.path().join("fake-jj");
+        executable(&script, "#!/bin/sh\nprintf 'failed' >&2\nexit 1\n");
+        let context = LaunchContext::from_vars([(
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            format!(
+                r#"{{"workspace_id":"workspace","tab_id":"tab","pane_id":"pane","cwd":"{}"}}"#,
+                temp.path().display()
+            ),
+        )])
+        .expect("context");
+        let mut runtime = FilesRuntime::bootstrap_with_jujutsu_mode(&context, JujutsuMode::Passive)
+            .expect("runtime");
+        let Some(VcsRefresh::Jujutsu { service, .. }) = &mut runtime.vcs else {
+            panic!("Jujutsu backend");
+        };
+        *service = JjService::with_executable(script, JujutsuMode::Passive, Duration::from_secs(1));
+        let mut workers = workers();
+
+        runtime.start_background(&mut workers);
+        runtime.complete_background(receive(&mut workers), &mut workers);
+
+        assert!(runtime.model.tree().node(Path::new("visible")).is_some());
+        assert!(
+            runtime
+                .model
+                .failure_notice()
+                .is_some_and(|notice| notice.contains("Jujutsu status failed"))
+        );
+        assert!(runtime.model.status_is_stale());
+        let area = Rect::new(0, 0, 64, 2);
+        let mut buffer = Buffer::empty(area);
+        runtime.render(area, &mut buffer);
+        let notice = (0..area.width)
+            .map(|x| buffer[(x, 1)].symbol())
+            .collect::<String>();
+        assert!(notice.starts_with("VCS stale: Jujutsu status failed"));
     }
 }
