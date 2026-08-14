@@ -1,19 +1,46 @@
 //! Conversation source boundary.
+mod claude_code;
+mod codex_cli;
 mod generic_jsonl;
+mod known_stores;
+mod pi;
 mod project_local;
 
+pub use claude_code::ClaudeCodeSource;
+pub use codex_cli::CodexCliSource;
 pub use generic_jsonl::GenericJsonlSource;
+pub use known_stores::KnownStoreRoots;
+pub use pi::PiSource;
 pub use project_local::{ProjectLocalLocation, ProjectLocalLocationError};
 
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
 
-use crate::conversations::Conversation;
 pub use crate::conversations::SourceId;
+use crate::conversations::{Conversation, SessionReference};
 use crate::project::{CanonicalPath, ProjectIdentity};
+impl KnownStoreRoots {
+    pub fn sources(
+        &self,
+        project: ProjectIdentity,
+    ) -> Result<Vec<Box<dyn ConversationSource>>, ConversationSourceError> {
+        Ok(vec![
+            Box::new(ClaudeCodeSource::new(
+                project.clone(),
+                self.claude_code().to_path_buf(),
+            )?),
+            Box::new(CodexCliSource::new(
+                project.clone(),
+                self.codex_cli().to_path_buf(),
+            )?),
+            Box::new(PiSource::new(project, self.pi().to_path_buf())?),
+        ])
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StorageProbe {
@@ -162,10 +189,38 @@ impl ConversationCandidate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConversationRemoval {
+    source_id: SourceId,
+    session_reference: SessionReference,
+}
+
+impl ConversationRemoval {
+    #[must_use]
+    pub const fn new(source_id: SourceId, session_reference: SessionReference) -> Self {
+        Self {
+            source_id,
+            session_reference,
+        }
+    }
+
+    #[must_use]
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    #[must_use]
+    pub const fn session_reference(&self) -> &SessionReference {
+        &self.session_reference
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveryBatch {
     candidates: Vec<ConversationCandidate>,
     next_watermark: Option<SourceWatermark>,
+    removals: Vec<ConversationRemoval>,
     errors: Vec<ConversationSourceError>,
+    has_more: bool,
 }
 
 impl DiscoveryBatch {
@@ -174,6 +229,8 @@ impl DiscoveryBatch {
         project: &ProjectIdentity,
         candidates: Vec<ConversationCandidate>,
         next_watermark: Option<SourceWatermark>,
+        removals: Vec<ConversationRemoval>,
+        has_more: bool,
         errors: Vec<ConversationSourceError>,
     ) -> Result<Self, ConversationSourceError> {
         let sources_match = candidates
@@ -182,6 +239,9 @@ impl DiscoveryBatch {
             && next_watermark
                 .as_ref()
                 .is_none_or(|watermark| watermark.source_id() == source_id)
+            && removals
+                .iter()
+                .all(|removal| removal.source_id() == source_id)
             && errors.iter().all(|error| error.source_id() == source_id);
         if !sources_match {
             return Err(ConversationSourceError::new(
@@ -203,7 +263,9 @@ impl DiscoveryBatch {
         Ok(Self {
             candidates,
             next_watermark,
+            removals,
             errors,
+            has_more,
         })
     }
 
@@ -216,11 +278,20 @@ impl DiscoveryBatch {
     pub const fn next_watermark(&self) -> Option<&SourceWatermark> {
         self.next_watermark.as_ref()
     }
+    #[must_use]
+    pub fn removals(&self) -> &[ConversationRemoval] {
+        &self.removals
+    }
 
     /// Per-entry errors are non-fatal and do not discard valid candidates.
     #[must_use]
     pub fn errors(&self) -> &[ConversationSourceError] {
         &self.errors
+    }
+
+    #[must_use]
+    pub const fn has_more(&self) -> bool {
+        self.has_more
     }
 }
 
@@ -283,6 +354,15 @@ pub trait ConversationSource: Send + Sync {
         after: Option<&SourceWatermark>,
         limit: DiscoveryLimit,
     ) -> Result<DiscoveryBatch, ConversationSourceError>;
+    fn discover_raw_cancellable(
+        &self,
+        project: &ProjectIdentity,
+        after: Option<&SourceWatermark>,
+        limit: DiscoveryLimit,
+        _cancelled: &AtomicBool,
+    ) -> Result<DiscoveryBatch, ConversationSourceError> {
+        self.discover_raw(project, after, limit)
+    }
 
     fn discover(
         &self,
@@ -290,13 +370,26 @@ pub trait ConversationSource: Send + Sync {
         after: Option<&SourceWatermark>,
         limit: DiscoveryLimit,
     ) -> Result<DiscoveryBatch, ConversationSourceError> {
+        let cancelled = AtomicBool::new(false);
+        self.discover_cancellable(project, after, limit, &cancelled)
+    }
+
+    fn discover_cancellable(
+        &self,
+        project: &ProjectIdentity,
+        after: Option<&SourceWatermark>,
+        limit: DiscoveryLimit,
+        cancelled: &AtomicBool,
+    ) -> Result<DiscoveryBatch, ConversationSourceError> {
         self.ensure_watermark(after)?;
-        let batch = self.discover_raw(project, after, limit)?;
+        let batch = self.discover_raw_cancellable(project, after, limit, cancelled)?;
         DiscoveryBatch::new(
             self.source_id(),
             project,
             batch.candidates,
             batch.next_watermark,
+            batch.removals,
+            batch.has_more,
             batch.errors,
         )
     }
@@ -421,6 +514,11 @@ impl ConversationSourceError {
     #[must_use]
     pub const fn kind(&self) -> ConversationSourceErrorKind {
         self.kind
+    }
+
+    #[must_use]
+    pub(crate) fn message(&self) -> &str {
+        &self.message
     }
 
     #[must_use]

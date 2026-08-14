@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use herdr_context::conversations::Conversation;
-use herdr_context::conversations::discovery::{discover_sources, probe_sources};
+use herdr_context::conversations::discovery::{
+    discover_conversations, discover_sources, probe_sources,
+};
 use herdr_context::conversations::sources::{
     ConversationCandidate, ConversationSource, ConversationSourceError,
     ConversationSourceErrorKind, DiscoveryBatch, DiscoveryLimit, MetadataBudget,
@@ -20,6 +22,7 @@ struct FakeSource {
     id: SourceId,
     behavior: Behavior,
     expected_watermark: Option<&'static str>,
+    has_more: bool,
 }
 
 impl FakeSource {
@@ -28,6 +31,7 @@ impl FakeSource {
             id: SourceId::new(id).expect("valid source id"),
             behavior: Behavior::Healthy,
             expected_watermark,
+            has_more: false,
         }
     }
 
@@ -36,7 +40,12 @@ impl FakeSource {
             id: SourceId::new(id).expect("valid source id"),
             behavior: Behavior::Failing,
             expected_watermark: None,
+            has_more: false,
         }
+    }
+    const fn with_more(mut self) -> Self {
+        self.has_more = true;
+        self
     }
 
     fn failure(&self, operation: &str) -> ConversationSourceError {
@@ -85,7 +94,15 @@ impl ConversationSource for FakeSource {
             None,
             None,
         )?;
-        DiscoveryBatch::new(&self.id, project, vec![candidate], None, Vec::new())
+        DiscoveryBatch::new(
+            &self.id,
+            project,
+            vec![candidate],
+            None,
+            Vec::new(),
+            self.has_more,
+            Vec::new(),
+        )
     }
 
     fn extract_metadata_raw(
@@ -179,4 +196,25 @@ fn probe_and_discovery_keep_each_source_outcome_independent()
         &SourceId::new("source-z")?
     );
     Ok(())
+}
+
+#[test]
+fn failed_candidate_extraction_does_not_request_the_same_page_again() {
+    let project_dir = TempDir::new().expect("project");
+    let project = ProjectIdentity::from_canonical_root(project_dir.path().to_path_buf())
+        .expect("canonical project");
+    let registry = SourceRegistry::new(vec![Box::new(
+        FakeSource::healthy("source-a", None).with_more(),
+    )])
+    .expect("registry");
+    let discovery = discover_conversations(
+        &registry,
+        &project,
+        &HashMap::new(),
+        DiscoveryLimit::new(1).expect("limit"),
+        MetadataBudget::new(1).expect("budget"),
+    );
+    assert!(!discovery.has_more());
+    assert!(discovery.conversations().is_empty());
+    assert_eq!(discovery.errors().len(), 1);
 }

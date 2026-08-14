@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
 use crate::intent::View;
-use crate::model::{AppModel, LoadingState, UiGeometry};
+use crate::model::{AppModel, ConversationsViewState, LoadingState, UiGeometry};
 
 pub mod conversations;
 pub mod files;
@@ -50,14 +50,18 @@ pub fn render_shell(model: &mut AppModel, area: Rect, buffer: &mut Buffer) {
             LoadingState::Ready => {}
             LoadingState::Error(error) => render_error(error, content, buffer),
         },
-        View::Conversations => match model.conversations().loading() {
-            LoadingState::Loading => render_message("Loading conversations…", content, buffer),
-            LoadingState::Ready if model.conversations().items().is_empty() => {
-                render_message("No conversations", content, buffer);
+        View::Conversations => {
+            let loading = model.conversations().loading().clone();
+            match loading {
+                LoadingState::Loading => {
+                    render_message("Loading conversations…", content, buffer);
+                }
+                LoadingState::Ready => {
+                    render_conversations_state(model.conversations_mut(), content, buffer);
+                }
+                LoadingState::Error(error) => render_error(&error, content, buffer),
             }
-            LoadingState::Ready => conversations::render(model.conversations(), content, buffer),
-            LoadingState::Error(error) => render_error(error, content, buffer),
-        },
+        }
     }
 }
 
@@ -79,6 +83,38 @@ fn render_error(error: &str, area: Rect, buffer: &mut Buffer) {
         Span::raw(sanitize_terminal_text(error)),
     ]))
     .render(area, buffer);
+}
+
+fn render_conversations_state(state: &mut ConversationsViewState, area: Rect, buffer: &mut Buffer) {
+    state.reconcile_viewport(area);
+    let content = state.source_errors().first().map_or(area, |error| {
+        let remaining = state.source_errors().len().saturating_sub(1);
+        let count = if remaining > 0 {
+            format!("(+{remaining} more) ")
+        } else {
+            String::new()
+        };
+        Paragraph::new(Line::from(vec![
+            Span::styled("Warning: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(count),
+            Span::raw(sanitize_terminal_text(error)),
+        ]))
+        .render(Rect::new(area.x, area.y, area.width, 1), buffer);
+        Rect::new(
+            area.x,
+            area.y.saturating_add(1),
+            area.width,
+            area.height.saturating_sub(1),
+        )
+    });
+    if content.is_empty() {
+        return;
+    }
+    if state.items().is_empty() {
+        render_message("No conversations", content, buffer);
+    } else {
+        conversations::render(state, content, buffer);
+    }
 }
 
 #[must_use]

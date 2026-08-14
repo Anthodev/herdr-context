@@ -123,7 +123,15 @@ impl ConversationSource for FakeSource {
             None,
             None,
         )?;
-        DiscoveryBatch::new(&self.id, project, vec![candidate], None, Vec::new())
+        DiscoveryBatch::new(
+            &self.id,
+            project,
+            vec![candidate],
+            None,
+            Vec::new(),
+            false,
+            Vec::new(),
+        )
     }
 
     fn extract_metadata_raw(
@@ -281,6 +289,8 @@ fn source_contract_rejects_foreign_candidate_and_watermark()
             &identity,
             vec![wrong_project_candidate],
             None,
+            Vec::new(),
+            false,
             Vec::new()
         )
         .expect_err("foreign project candidate must fail")

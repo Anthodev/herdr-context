@@ -24,21 +24,29 @@ const CLAUDE: FixtureCase = FixtureCase {
     allowed_strings: &[
         "/workspace/project",
         "11111111-1111-4111-8111-111111111111",
-        "2.1.143",
+        "2.1.232",
         "2026-01-02T03:04:05.000Z",
         "2026-01-02T03:04:06.000Z",
+        "2026-01-02T03:04:05.500Z",
+        "2026-01-02T03:04:07.000Z",
         "2026-01-03T03:04:05.000Z",
         "22222222-2222-4222-8222-222222222222",
         "33333333-3333-4333-8333-333333333333",
+        "55555555-5555-4555-8555-555555555555",
         "66666666-6666-4666-8666-666666666666",
         "77777777-7777-4777-8777-777777777777",
+        "44444444-4444-4444-8444-444444444444",
         "assistant",
+        "attachment",
         "cli",
         "end_turn",
+        "goal_status",
+        "high",
         "external",
         "main",
         "message",
         "sanitized assistant message",
+        "sanitized branch message",
         "sanitized user message",
         "standard",
         "synthetic",
@@ -46,6 +54,8 @@ const CLAUDE: FixtureCase = FixtureCase {
         "synthetic-model",
         "synthetic-prompt-1",
         "synthetic-prompt-2",
+        "synthetic-prompt-3",
+        "synthetic goal",
         "synthetic-request-1",
         "text",
         "user",
@@ -56,16 +66,17 @@ const CODEX: FixtureCase = FixtureCase {
     source: "codex-cli",
     valid: "codex-cli/2026/01/02/rollout-2026-01-02T03-04-05-019b7c3b-af88-7000-8001-000000000001.jsonl",
     partial: "codex-cli/2026/01/03/rollout-2026-01-03T04-05-06-019b8199-e850-7000-8002-000000000002.jsonl",
-    partial_tail: "{\"timestamp\":\"2026-01-03T02:06:14.000Z\",\"type\":\"response_item\",\"payload\":",
+    partial_tail: "{\"timestamp\":\"2026-01-03T02:06:14.000Z\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":",
     allowed_strings: &[
         "/workspace/project",
-        "0.136.0",
+        "0.147.0",
         "0000000000000000000000000000000000000000",
         "019b7c3b-af88-7000-8001-000000000001",
         "019b8199-e850-7000-8002-000000000002",
         "2026-01-02T01:04:05.000Z",
         "2026-01-02T01:05:12.000Z",
         "2026-01-02T01:05:13.000Z",
+        "2026-01-02T01:05:13.500Z",
         "2026-01-02T01:05:14.000Z",
         "2026-01-03T02:05:06.000Z",
         "2026-01-03T02:06:13.000Z",
@@ -74,15 +85,18 @@ const CODEX: FixtureCase = FixtureCase {
         "codex-tui",
         "event_msg",
         "https://example.invalid/sanitized.git",
+        "paginated",
         "message",
         "output_text",
         "response_item",
+        "sanitized",
         "sanitized assistant message",
         "sanitized instructions",
         "sanitized user message",
         "session_meta",
         "synthetic-provider",
         "user_message",
+        "world_state",
     ],
 };
 
@@ -97,19 +111,26 @@ const PI: FixtureCase = FixtureCase {
         "019b8207-c550-7000-8004-000000000004",
         "0a1b2c3d",
         "1a2b3c4d",
+        "1b2c3d4e",
+        "2b3c4d5e",
         "2026-01-02T03:04:05.000Z",
         "2026-01-02T03:04:06.000Z",
+        "2026-01-02T03:04:06.500Z",
         "2026-01-02T03:04:07.000Z",
+        "2026-01-02T03:04:08.000Z",
         "2026-01-03T04:05:06.000Z",
         "assistant",
         "message",
+        "model_change",
         "sanitized assistant message",
         "sanitized user message",
         "session",
+        "session_info",
         "stop",
         "synthetic-api",
         "synthetic-model",
         "synthetic-provider",
+        "synthetic session",
         "text",
         "user",
     ],
@@ -332,39 +353,56 @@ fn inventory_reproduces_exactly_the_three_observed_store_layouts()
 #[test]
 fn claude_fixture_matches_the_observed_jsonl_variant() {
     let records = parse_complete_records(&CLAUDE);
-    assert_eq!(records.len(), 2, "fixture must represent appended records");
+    assert_eq!(records.len(), 4, "fixture must represent current records");
     assert_eq!(field(&records[0], "/type"), "user");
-    assert_eq!(field(&records[1], "/type"), "assistant");
-    assert_eq!(field(&records[0], "/version"), "2.1.143");
-    assert_eq!(field(&records[1], "/version"), "2.1.143");
+    assert_eq!(field(&records[1], "/type"), "attachment");
+    assert_eq!(field(&records[1], "/attachment/type"), "goal_status");
+    assert_eq!(field(&records[2], "/type"), "assistant");
+    assert_eq!(field(&records[3], "/type"), "user");
+    assert_eq!(field(&records[0], "/version"), "2.1.232");
+    assert!(records[1].pointer("/version").is_none());
+    assert_eq!(field(&records[2], "/version"), "2.1.232");
+    assert_eq!(field(&records[3], "/version"), "2.1.232");
     assert_eq!(field(&records[0], "/cwd"), "/workspace/project");
     assert_eq!(
         field(&records[0], "/sessionId"),
-        field(&records[1], "/sessionId")
+        field(&records[3], "/sessionId")
     );
     assert_uuid_version(field(&records[0], "/sessionId"), '4');
     assert_uuid_version(field(&records[0], "/uuid"), '4');
     assert_eq!(
-        field(&records[1], "/parentUuid"),
+        field(&records[2], "/parentUuid"),
         field(&records[0], "/uuid")
     );
-    assert_rfc3339_timestamp(field(&records[0], "/timestamp"));
-    assert_rfc3339_timestamp(field(&records[1], "/timestamp"));
+    assert_eq!(
+        field(&records[3], "/parentUuid"),
+        field(&records[0], "/uuid")
+    );
+    for record in &records {
+        assert_rfc3339_timestamp(field(record, "/timestamp"));
+    }
 }
 
 #[test]
 fn codex_fixture_matches_the_observed_jsonl_variant() {
     let records = parse_complete_records(&CODEX);
-    assert_eq!(records.len(), 3, "fixture must represent appended records");
+    assert_eq!(records.len(), 4, "fixture must represent current records");
     assert_eq!(field(&records[0], "/type"), "session_meta");
     assert_eq!(field(&records[1], "/type"), "event_msg");
     assert_eq!(field(&records[1], "/payload/type"), "user_message");
-    assert_eq!(field(&records[2], "/type"), "response_item");
-    assert_eq!(field(&records[2], "/payload/type"), "message");
-    assert_eq!(field(&records[0], "/payload/cli_version"), "0.136.0");
+    assert_eq!(field(&records[2], "/type"), "world_state");
+    assert_eq!(field(&records[2], "/payload/full"), true);
+    assert_eq!(field(&records[3], "/type"), "response_item");
+    assert_eq!(field(&records[3], "/payload/type"), "message");
+    assert_eq!(field(&records[0], "/payload/cli_version"), "0.147.0");
     assert_eq!(field(&records[0], "/payload/cwd"), "/workspace/project");
+    assert_eq!(
+        field(&records[0], "/payload/session_id"),
+        field(&records[0], "/payload/id")
+    );
     assert_uuid_version(field(&records[0], "/payload/id"), '7');
-    for record in &records {
+    for (ordinal, record) in records.iter().enumerate() {
+        assert_eq!(field(record, "/ordinal"), ordinal);
         assert_rfc3339_timestamp(field(record, "/timestamp"));
     }
     let payload_timestamp = OffsetDateTime::parse(
@@ -390,20 +428,25 @@ fn codex_fixture_matches_the_observed_jsonl_variant() {
 #[test]
 fn pi_fixture_matches_the_observed_jsonl_variant() {
     let records = parse_complete_records(&PI);
-    assert_eq!(records.len(), 3, "fixture must represent appended records");
+    assert_eq!(records.len(), 5, "fixture must represent current entries");
     assert_eq!(field(&records[0], "/type"), "session");
     assert_eq!(field(&records[0], "/version"), 3);
     assert_eq!(field(&records[0], "/cwd"), "/workspace/project");
     assert_uuid_version(field(&records[0], "/id"), '7');
     assert_eq!(field(&records[1], "/type"), "message");
-    assert_eq!(field(&records[2], "/type"), "message");
+    assert_eq!(field(&records[2], "/type"), "model_change");
+    assert_eq!(field(&records[3], "/type"), "message");
+    assert_eq!(field(&records[4], "/type"), "session_info");
     assert_eq!(field(&records[2], "/parentId"), field(&records[1], "/id"));
-    assert_lower_hex_entry_id(field(&records[1], "/id"));
-    assert_lower_hex_entry_id(field(&records[2], "/id"));
+    assert_eq!(field(&records[3], "/parentId"), field(&records[2], "/id"));
+    assert_eq!(field(&records[4], "/parentId"), field(&records[1], "/id"));
+    for record in &records[1..] {
+        assert_lower_hex_entry_id(field(record, "/id"));
+    }
     for record in &records {
         assert_rfc3339_timestamp(field(record, "/timestamp"));
     }
-    for record in &records[1..] {
+    for record in [&records[1], &records[3]] {
         let timestamp = field(record, "/message/timestamp")
             .as_i64()
             .expect("Pi message timestamp must be integral epoch milliseconds");

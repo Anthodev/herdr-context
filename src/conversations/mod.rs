@@ -1,6 +1,7 @@
 //! Provider-neutral conversation model.
 
 pub mod discovery;
+pub mod index;
 pub mod sources;
 
 use std::error::Error;
