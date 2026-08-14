@@ -136,7 +136,58 @@ const PI: FixtureCase = FixtureCase {
     ],
 };
 
-const CASES: [&FixtureCase; 3] = [&CLAUDE, &CODEX, &PI];
+const OMP: FixtureCase = FixtureCase {
+    source: "omp",
+    valid: "omp/--workspace-project--/2026-01-04T05-06-07-000Z_019b8721-4a18-7000-8005-000000000005.jsonl",
+    partial: "omp/--workspace-project--/2026-01-05T06-07-08-000Z_019b8c49-5e80-7000-8006-000000000006.jsonl",
+    partial_tail: "{\"type\":\"message\",\"id\":\"2c3d4e5f\",\"parentId\":null,\"timestamp\":\"2026-01-05T06:07:09.000Z\",\"message\":",
+    allowed_strings: &[
+        "/workspace/project",
+        "019b8721-4a18-7000-8005-000000000005",
+        "019b8c49-5e80-7000-8006-000000000006",
+        "0c1d2e3f",
+        "1c2d3e4f",
+        "2026-01-04T05:06:07.000Z",
+        "2026-01-04T05:06:08.000Z",
+        "2026-01-04T05:06:08.500Z",
+        "2026-01-04T05:06:09.000Z",
+        "2026-01-04T05:06:09.500Z",
+        "2026-01-04T05:06:10.000Z",
+        "2026-01-04T05:06:11.000Z",
+        "2026-01-05T06:07:08.000Z",
+        "2c3d4e5f",
+        "3c4d5e6f",
+        "4c5d6e7f",
+        "5c6d7e8f",
+        "Synthetic OMP session",
+        "Synthetic initial OMP title",
+        "Synthetic partial OMP session",
+        "assistant",
+        "auto",
+        "default",
+        "high",
+        "manual",
+        "message",
+        "model_change",
+        "priority",
+        "sanitized OMP assistant message",
+        "sanitized OMP user message",
+        "service_tier_change",
+        "session",
+        "stop",
+        "synthetic-api",
+        "synthetic-model",
+        "synthetic-provider",
+        "synthetic-provider/synthetic-model",
+        "text",
+        "thinking_level_change",
+        "title",
+        "title_change",
+        "user",
+    ],
+};
+
+const CASES: [&FixtureCase; 4] = [&CLAUDE, &CODEX, &PI, &OMP];
 
 fn fixture(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -159,9 +210,20 @@ fn parse_complete_records(case: &FixtureCase) -> Vec<Value> {
         .collect()
 }
 
+fn partial_complete_records(case: &FixtureCase) -> Vec<Value> {
+    let lines = fixture_lines(case.partial);
+    lines[..lines.len() - 1]
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("complete partial-fixture line must be JSON"))
+        .collect()
+}
+
+fn header_index(case: &FixtureCase) -> usize {
+    usize::from(case.source == "omp")
+}
+
 fn parse_partial_header(case: &FixtureCase) -> Value {
-    serde_json::from_str(&fixture_lines(case.partial)[0])
-        .expect("partial fixture must start with a complete header")
+    partial_complete_records(case).remove(header_index(case))
 }
 
 fn field<'a>(value: &'a Value, pointer: &str) -> &'a Value {
@@ -227,8 +289,10 @@ fn collect_strings(value: &Value, output: &mut BTreeSet<String>) {
             }
         }
         Value::Object(fields) => {
-            for value in fields.values() {
-                collect_strings(value, output);
+            for (name, value) in fields {
+                if name != "pad" {
+                    collect_strings(value, output);
+                }
             }
         }
         Value::String(value) => {
@@ -311,12 +375,28 @@ fn assert_filename_contains_header_identity(case: &FixtureCase, relative: &str, 
             assert!(file_name.ends_with(&format!("_{id}.jsonl")));
             assert!(file_name.contains(&timestamp.replace([':', '.'], "-")));
         }
+        "omp" => {
+            let id = field(header, "/id");
+            assert_uuid_version(id, '7');
+            let id = id.as_str().expect("OMP ID");
+            let timestamp = field(header, "/timestamp").as_str().expect("OMP timestamp");
+            assert_eq!(
+                path.parent()
+                    .and_then(Path::file_name)
+                    .and_then(|name| name.to_str()),
+                Some("--workspace-project--")
+            );
+            assert_eq!(
+                file_name,
+                format!("{}_{id}.jsonl", timestamp.replace([':', '.'], "-"))
+            );
+        }
         source => panic!("unexpected fixture source {source}"),
     }
 }
 
 #[test]
-fn inventory_reproduces_exactly_the_three_observed_store_layouts()
+fn inventory_reproduces_exactly_the_four_observed_store_layouts()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_ROOT);
     let source_names: BTreeSet<_> = fs::read_dir(&root)?
@@ -342,7 +422,7 @@ fn inventory_reproduces_exactly_the_three_observed_store_layouts()
             .collect();
         assert_eq!(paths, expected);
 
-        let valid_header = parse_complete_records(case).remove(0);
+        let valid_header = parse_complete_records(case).remove(header_index(case));
         assert_filename_contains_header_identity(case, case.valid, &valid_header);
         let partial_header = parse_partial_header(case);
         assert_filename_contains_header_identity(case, case.partial, &partial_header);
@@ -455,14 +535,70 @@ fn pi_fixture_matches_the_observed_jsonl_variant() {
 }
 
 #[test]
+fn omp_fixture_matches_the_observed_title_slot_and_schema_v3_variant() {
+    for relative in [OMP.valid, OMP.partial] {
+        let first_line_bytes = fs::read(fixture(relative))
+            .expect("OMP fixture")
+            .split_inclusive(|byte| *byte == b'\n')
+            .next()
+            .expect("OMP title slot")
+            .len();
+        assert_eq!(first_line_bytes, 256, "OMP title slot width");
+    }
+
+    let records = parse_complete_records(&OMP);
+    assert_eq!(
+        records.len(),
+        8,
+        "fixture must represent current OMP entries"
+    );
+    assert_eq!(field(&records[0], "/type"), "title");
+    assert_eq!(field(&records[0], "/v"), 1);
+    assert!(
+        field(&records[0], "/pad")
+            .as_str()
+            .expect("title padding")
+            .bytes()
+            .all(|byte| byte == b' ')
+    );
+    assert_eq!(field(&records[1], "/type"), "session");
+    assert_eq!(field(&records[1], "/version"), 3);
+    assert_eq!(field(&records[1], "/cwd"), "/workspace/project");
+    assert_uuid_version(field(&records[1], "/id"), '7');
+    assert_eq!(field(&records[2], "/type"), "thinking_level_change");
+    assert_eq!(field(&records[3], "/type"), "service_tier_change");
+    assert_eq!(field(&records[4], "/type"), "message");
+    assert_eq!(field(&records[5], "/type"), "model_change");
+    assert_eq!(field(&records[6], "/type"), "message");
+    assert_eq!(field(&records[7], "/type"), "title_change");
+    assert_eq!(field(&records[7], "/title"), field(&records[0], "/title"));
+    assert_eq!(
+        field(&records[7], "/timestamp"),
+        field(&records[0], "/updatedAt")
+    );
+    for record in &records[2..] {
+        assert_lower_hex_entry_id(field(record, "/id"));
+        assert_rfc3339_timestamp(field(record, "/timestamp"));
+    }
+}
+
+#[test]
 fn partial_fixtures_end_with_the_expected_malformed_append()
 -> Result<(), Box<dyn std::error::Error>> {
     for case in CASES {
         let lines = fixture_lines(case.partial);
-        assert_eq!(lines.len(), 2, "{} partial fixture shape", case.source);
-        serde_json::from_str::<Value>(&lines[0])?;
-        assert_eq!(lines[1], case.partial_tail);
-        assert!(serde_json::from_str::<Value>(&lines[1]).is_err());
+        let complete_records = if case.source == "omp" { 2 } else { 1 };
+        assert_eq!(
+            lines.len(),
+            complete_records + 1,
+            "{} partial fixture shape",
+            case.source
+        );
+        for line in &lines[..complete_records] {
+            serde_json::from_str::<Value>(line)?;
+        }
+        assert_eq!(lines[complete_records], case.partial_tail);
+        assert!(serde_json::from_str::<Value>(&lines[complete_records]).is_err());
     }
     Ok(())
 }
@@ -488,7 +624,9 @@ fn every_fixture_string_is_explicitly_synthetic() -> Result<(), Box<dyn std::err
         for record in parse_complete_records(case) {
             collect_strings(&record, &mut actual);
         }
-        collect_strings(&parse_partial_header(case), &mut actual);
+        for record in partial_complete_records(case) {
+            collect_strings(&record, &mut actual);
+        }
         let expected: BTreeSet<_> = case
             .allowed_strings
             .iter()

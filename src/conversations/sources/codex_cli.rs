@@ -325,8 +325,10 @@ impl KnownFormat for CodexCliFormat {
         }
         Ok(ParsedMetadata {
             session_id: id,
+            title: None,
             created_at,
             updated_at,
+            chain_updated_at: updated_at,
             cwd,
             chain_tail: Some(history.watermark()),
             record_count,

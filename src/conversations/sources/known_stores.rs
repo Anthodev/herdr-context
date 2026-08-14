@@ -35,12 +35,14 @@ const PREFIX_GUARD_BYTES: u64 = 4 * 1024;
 const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
 const MAX_RECORDS: usize = 32_768;
 const MAX_WATERMARK_BYTES: usize = 4 * 1024 * 1024;
+const MAX_METADATA_TITLE_BYTES: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KnownStoreRoots {
     claude_code: PathBuf,
     codex_cli: PathBuf,
     pi: PathBuf,
+    omp: PathBuf,
 }
 
 impl KnownStoreRoots {
@@ -51,6 +53,7 @@ impl KnownStoreRoots {
             claude_code: home.join(".claude/projects"),
             codex_cli: home.join(".codex/sessions"),
             pi: home.join(".pi/agent/sessions"),
+            omp: home.join(".omp/agent/sessions"),
         }
     }
 
@@ -59,11 +62,13 @@ impl KnownStoreRoots {
         claude_code: impl Into<PathBuf>,
         codex_cli: impl Into<PathBuf>,
         pi: impl Into<PathBuf>,
+        omp: impl Into<PathBuf>,
     ) -> Self {
         Self {
             claude_code: claude_code.into(),
             codex_cli: codex_cli.into(),
             pi: pi.into(),
+            omp: omp.into(),
         }
     }
 
@@ -75,6 +80,11 @@ impl KnownStoreRoots {
     #[must_use]
     pub fn codex_cli(&self) -> &Path {
         &self.codex_cli
+    }
+
+    #[must_use]
+    pub fn omp(&self) -> &Path {
+        &self.omp
     }
 
     #[must_use]
@@ -735,6 +745,36 @@ impl<F: KnownFormat> ConversationSource for KnownJsonlSource<F> {
                 file.watermark.duplicate = false;
             }
             if !file.changed {
+                if file.watermark.complete {
+                    let fingerprint = file
+                        .watermark
+                        .fingerprint
+                        .clone()
+                        .expect("unchanged complete metadata has a fingerprint");
+                    let metadata = file
+                        .watermark
+                        .summary
+                        .as_ref()
+                        .and_then(|summary| summary.to_parsed(project))
+                        .expect("validated watermark has metadata");
+                    self.snapshots
+                        .lock()
+                        .map_err(|_| {
+                            self.error(
+                                ConversationSourceErrorKind::Io,
+                                "known conversation snapshot state is unavailable",
+                                &file.relative,
+                            )
+                        })?
+                        .insert(
+                            file.relative.clone(),
+                            ValidatedSnapshot {
+                                metadata,
+                                state: file.state.clone(),
+                                fingerprint,
+                            },
+                        );
+                }
                 next.insert(file.key, file.watermark);
                 continue;
             }
@@ -889,7 +929,7 @@ impl<F: KnownFormat> ConversationSource for KnownJsonlSource<F> {
             tool,
             session,
             candidate.project_identity().clone(),
-            None,
+            metadata.title.clone(),
             Some(metadata.created_at),
             metadata.updated_at,
             ConversationState::Unknown,
@@ -956,8 +996,10 @@ struct ValidatedSnapshot {
 #[derive(Clone, Debug)]
 pub(super) struct ParsedMetadata {
     pub(super) session_id: String,
+    pub(super) title: Option<String>,
     pub(super) created_at: SystemTime,
     pub(super) updated_at: SystemTime,
+    pub(super) chain_updated_at: SystemTime,
     pub(super) cwd: CanonicalPath,
     pub(super) chain_tail: Option<String>,
     pub(super) record_count: u64,
@@ -1052,8 +1094,12 @@ impl StoredRejection {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct StoredMetadata {
     session_id: String,
+    #[serde(default)]
+    title: Option<String>,
     created_at: (bool, u64, u32),
     updated_at: (bool, u64, u32),
+    #[serde(default)]
+    chain_updated_at: Option<(bool, u64, u32)>,
     chain_tail: Option<String>,
     record_count: u64,
 }
@@ -1062,21 +1108,33 @@ impl StoredMetadata {
     fn from_parsed(metadata: &ParsedMetadata) -> Self {
         Self {
             session_id: metadata.session_id.clone(),
+            title: metadata.title.clone(),
             created_at: system_time_parts(metadata.created_at),
             updated_at: system_time_parts(metadata.updated_at),
+            chain_updated_at: Some(system_time_parts(metadata.chain_updated_at)),
             chain_tail: metadata.chain_tail.clone(),
             record_count: metadata.record_count,
         }
     }
 
     fn to_parsed(&self, project: &ProjectIdentity) -> Option<ParsedMetadata> {
-        if self.created_at.2 >= 1_000_000_000 || self.updated_at.2 >= 1_000_000_000 {
+        let chain_updated_at = self.chain_updated_at.unwrap_or(self.updated_at);
+        if self.created_at.2 >= 1_000_000_000
+            || self.updated_at.2 >= 1_000_000_000
+            || chain_updated_at.2 >= 1_000_000_000
+            || self
+                .title
+                .as_ref()
+                .is_some_and(|title| title.len() > MAX_METADATA_TITLE_BYTES)
+        {
             return None;
         }
         Some(ParsedMetadata {
             session_id: self.session_id.clone(),
+            title: self.title.clone(),
             created_at: system_time_from_parts(self.created_at)?,
             updated_at: system_time_from_parts(self.updated_at)?,
+            chain_updated_at: system_time_from_parts(chain_updated_at)?,
             cwd: CanonicalPath::new(project.root().to_path_buf()).ok()?,
             chain_tail: self.chain_tail.clone(),
             record_count: self.record_count,
@@ -1480,8 +1538,14 @@ fn snapshot_fingerprint(metadata: &ParsedMetadata, state: &FileState, content_ha
 
 fn metadata_hash(metadata: &ParsedMetadata, seed: u64) -> u64 {
     let hash = fnv1a(metadata.session_id.as_bytes(), seed);
+    let hash = fnv1a(&[u8::from(metadata.title.is_some())], hash);
+    let hash = metadata
+        .title
+        .as_ref()
+        .map_or(hash, |title| fnv1a(title.as_bytes(), hash));
     let hash = hash_system_time(metadata.created_at, hash);
-    hash_system_time(metadata.updated_at, hash)
+    let hash = hash_system_time(metadata.updated_at, hash);
+    hash_system_time(metadata.chain_updated_at, hash)
 }
 
 fn hash_system_time(value: SystemTime, seed: u64) -> u64 {

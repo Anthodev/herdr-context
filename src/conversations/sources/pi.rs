@@ -249,8 +249,10 @@ impl KnownFormat for PiFormat {
         }
         Ok(ParsedMetadata {
             session_id,
+            title: None,
             created_at,
             updated_at,
+            chain_updated_at: updated_at,
             cwd,
             chain_tail: previous_id,
             record_count,

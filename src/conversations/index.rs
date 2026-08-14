@@ -24,6 +24,8 @@ const SCHEMA_VERSION: u32 = 3;
 const MAX_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_INDEX_ENTRIES: usize = 4_096;
 const MAX_WATERMARK_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SOURCE_WATERMARKS: usize = 5;
+const MAX_TITLE_BYTES: usize = 256;
 const MAX_SESSION_ID_BYTES: usize = 256;
 const MAX_PATH_BYTES: usize = 4_096;
 const MAX_CACHE_DIRECTORY_ENTRIES: usize = 64;
@@ -134,7 +136,7 @@ impl ConversationIndex {
         if disk.schema_version != SCHEMA_VERSION || disk_root != project.root() {
             return Err(LoadFailure::Incompatible);
         }
-        if disk.entries.len() > MAX_INDEX_ENTRIES || disk.watermarks.len() > 4 {
+        if disk.entries.len() > MAX_INDEX_ENTRIES || disk.watermarks.len() > MAX_SOURCE_WATERMARKS {
             return Err(LoadFailure::Corrupt);
         }
         let mut watermarks = HashMap::new();
@@ -528,6 +530,8 @@ struct CachedConversation {
     tool: String,
     namespace: String,
     session_id: String,
+    #[serde(default)]
+    title: Option<String>,
     created_at: Option<TimeParts>,
     updated_at: TimeParts,
     state: String,
@@ -553,6 +557,14 @@ impl CachedConversation {
         }
         let session_id = conversation.session_reference().id();
         validate_identifier(session_id)?;
+        if conversation
+            .title()
+            .is_some_and(|title| title.len() > MAX_TITLE_BYTES)
+        {
+            return Err(ConversationIndexError::InvalidCache(
+                "metadata title is outside the allowlist",
+            ));
+        }
         let source_path = provenance.path().map(StoredPath::from_path).transpose()?;
         let state = match conversation.state() {
             ConversationState::Live => "live",
@@ -576,6 +588,7 @@ impl CachedConversation {
             tool: conversation.tool().as_str().to_owned(),
             namespace: conversation.session_reference().namespace().to_owned(),
             session_id: session_id.to_owned(),
+            title: conversation.title().map(str::to_owned),
             created_at: conversation.created_at().map(TimeParts::from_system_time),
             updated_at: TimeParts::from_system_time(conversation.updated_at()),
             state: state.to_owned(),
@@ -591,6 +604,13 @@ impl CachedConversation {
             return Err(LoadFailure::Corrupt);
         }
         validate_identifier_load(&self.session_id)?;
+        if self
+            .title
+            .as_ref()
+            .is_some_and(|title| title.is_empty() || title.len() > MAX_TITLE_BYTES)
+        {
+            return Err(LoadFailure::Corrupt);
+        }
         let source_path = self
             .source_path
             .as_ref()
@@ -676,7 +696,7 @@ impl CachedConversation {
             tool,
             session,
             project.clone(),
-            None,
+            self.title.clone(),
             self.created_at
                 .map(TimeParts::to_system_time)
                 .transpose()
@@ -748,6 +768,7 @@ fn validate_source(source: &str, tool: Option<&str>) -> Result<(), LoadFailure> 
         "project-local-generic-jsonl" => "generic-jsonl",
         "claude-code" => "claude-code",
         "codex-cli" => "codex-cli",
+        "omp" => "omp",
         "pi" => "pi",
         _ => return Err(LoadFailure::Incompatible),
     };
