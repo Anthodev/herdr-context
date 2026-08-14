@@ -24,14 +24,23 @@ pub fn render_shell(model: &mut AppModel, area: Rect, buffer: &mut Buffer) {
         area.width.saturating_sub(files_width),
         header_height,
     );
-    let content = Rect::new(
+    let warning_height = u16::from(!model.config_warnings().is_empty())
+        .min(area.height.saturating_sub(header_height));
+    let warning = Rect::new(
         area.x,
         area.y.saturating_add(header_height),
         area.width,
-        area.height.saturating_sub(header_height),
+        warning_height,
+    );
+    let content = Rect::new(
+        area.x,
+        warning.y.saturating_add(warning_height),
+        area.width,
+        area.height
+            .saturating_sub(header_height)
+            .saturating_sub(warning_height),
     );
     model.set_geometry(UiGeometry::new(files_tab, conversations_tab, content));
-
     if header_height != 0 {
         let active = model.active_view();
         Line::from(vec![
@@ -39,6 +48,22 @@ pub fn render_shell(model: &mut AppModel, area: Rect, buffer: &mut Buffer) {
             Span::styled(" Conversations ", tab_style(active == View::Conversations)),
         ])
         .render(Rect::new(area.x, area.y, area.width, 1), buffer);
+    }
+    if warning_height != 0 {
+        let warnings = model.config_warnings();
+        let remaining = warnings.len().saturating_sub(1);
+        let count = if remaining > 0 {
+            format!("(+{remaining} more) ")
+        } else {
+            String::new()
+        };
+        let warning_text = warnings[0].strip_prefix("Config: ").unwrap_or(&warnings[0]);
+        Paragraph::new(Line::from(vec![
+            Span::styled("Config: ", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(count),
+            Span::raw(sanitize_terminal_text(warning_text)),
+        ]))
+        .render(warning, buffer);
     }
     if content.is_empty() {
         return;

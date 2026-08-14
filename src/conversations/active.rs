@@ -123,6 +123,29 @@ impl FilesystemConversationSnapshot {
     }
 }
 
+pub(crate) fn merge_filesystem_snapshots(
+    previous: &FilesystemConversationSnapshot,
+    fresh: FilesystemConversationSnapshot,
+) -> FilesystemConversationSnapshot {
+    let mut merged = previous.conversations.clone();
+    let mut indexes = merged
+        .iter()
+        .enumerate()
+        .map(|(index, conversation)| (conversation.session_reference().clone(), index))
+        .collect::<HashMap<_, _>>();
+    for conversation in fresh.conversations {
+        match indexes.get(conversation.session_reference()).copied() {
+            Some(index) => merged[index] = conversation,
+            None => {
+                indexes.insert(conversation.session_reference().clone(), merged.len());
+                merged.push(conversation);
+            }
+        }
+    }
+    sort_recent_first(&mut merged);
+    prepare_filesystem_conversations(merged)
+}
+
 #[derive(Clone)]
 pub(crate) struct LiveConversationSnapshot(Vec<NormalizedLiveSession>);
 

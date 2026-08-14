@@ -36,6 +36,20 @@ impl CodexCliSource {
             inner: KnownJsonlSource::new(project, store_root, CodexCliFormat)?,
         })
     }
+    pub(crate) fn new_with_source_id(
+        project: ProjectIdentity,
+        store_root: PathBuf,
+        source_id: SourceId,
+    ) -> Result<Self, ConversationSourceError> {
+        Ok(Self {
+            inner: KnownJsonlSource::new_with_source_id(
+                project,
+                store_root,
+                CodexCliFormat,
+                source_id,
+            )?,
+        })
+    }
 }
 
 impl ConversationSource for CodexCliSource {

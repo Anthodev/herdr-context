@@ -133,6 +133,63 @@ Platforms where owner-only cache permissions cannot be enforced fail closed
 instead of persisting external metadata.
 
 
+## Configuration
+
+The plugin reads `config.toml` from `HERDR_PLUGIN_CONFIG_DIR`. Loading is
+read-only, byte-bounded, and performed on a worker after the first frame.
+Missing or malformed files use safe defaults. Invalid fields fall back
+independently and produce a sanitized warning in the dock.
+
+```toml
+[dock]
+initial_width = 40       # 24..60
+
+[files]
+show_hidden = false
+exclusions = ["target", "generated/cache"] # project-relative paths
+
+[conversations]
+enabled_sources = [
+  "claude-code",
+  "codex-cli",
+  "omp",
+  "opencode",
+  "pi",
+  "project-local-generic-jsonl",
+]
+project_roots = [".agents/history"] # additional shallow project-local roots
+page_size = 128                     # 1..512 records per source and pass
+cache_entries = 4096                # 16..4096 metadata rows
+
+[conversations.external_roots]
+claude-code = ["/home/me/.claude/projects"]
+pi = ["/home/me/.pi/agent/sessions"]
+
+[vcs]
+backend = "auto"            # auto, git, or jj
+jujutsu_mode = "fresh"      # fresh or passive
+git_cadence = "manual"      # manual or adaptive
+git_min_interval_ms = 2000  # adaptive only; 250..300000
+git_max_interval_ms = 30000
+passive_jujutsu_interval_ms = 0 # 0 disables; otherwise 1000..300000
+
+[keybindings]
+refresh = ["r"]
+quit = ["q", "esc", "ctrl+c"]
+```
+
+Configured history roots remain subject to each adapter's version, layout,
+canonical-project, and metadata bounds. Extra project roots are
+project-relative; extra external roots are absolute. Unsupported or unreadable
+roots are isolated so healthy sources and cached metadata remain visible.
+
+Files and VCS refresh immediately when the Files view is activated or `refresh`
+is invoked. Adaptive Git polling starts at the configured minimum, doubles
+while status is unchanged up to the maximum, and resets when status changes.
+It is suspended outside the Files view. Fresh Jujutsu never polls; passive
+Jujutsu polls only when `passive_jujutsu_interval_ms` is non-zero and always
+renders status as potentially stale.
+
 ## Design principles
 
 - **Public Herdr integration**: manifest, injected context, CLI, and socket API.

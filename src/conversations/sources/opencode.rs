@@ -140,7 +140,14 @@ impl OpenCodeSource {
         project: ProjectIdentity,
         database_path: PathBuf,
     ) -> Result<Self, ConversationSourceError> {
-        let id = source_id();
+        Self::new_with_source_id(project, database_path, source_id())
+    }
+
+    pub(crate) fn new_with_source_id(
+        project: ProjectIdentity,
+        database_path: PathBuf,
+        id: SourceId,
+    ) -> Result<Self, ConversationSourceError> {
         if !cfg!(unix) {
             return Err(ConversationSourceError::new(
                 id,

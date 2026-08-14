@@ -672,6 +672,7 @@ pub struct AppModel {
     geometry: UiGeometry,
     files: FilesViewState,
     conversations: ConversationsViewState,
+    config_warnings: Vec<String>,
 }
 
 impl AppModel {
@@ -683,6 +684,7 @@ impl AppModel {
             geometry: UiGeometry::default(),
             files: FilesViewState::default(),
             conversations: ConversationsViewState::default(),
+            config_warnings: Vec::new(),
         }
     }
 
@@ -707,6 +709,15 @@ impl AppModel {
 
     pub(crate) const fn set_geometry(&mut self, geometry: UiGeometry) {
         self.geometry = geometry;
+    }
+
+    #[must_use]
+    pub fn config_warnings(&self) -> &[String] {
+        &self.config_warnings
+    }
+
+    pub(crate) fn set_config_warnings(&mut self, warnings: Vec<String>) {
+        self.config_warnings = warnings;
     }
 
     #[must_use]

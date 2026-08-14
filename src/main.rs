@@ -6,9 +6,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use herdr_context::app::App;
-use herdr_context::host::LaunchContext;
+use herdr_context::config::PluginConfig;
 use herdr_context::host::client::{CommandHostClient, DOCK_TITLE};
 use herdr_context::host::launch::DockLauncher;
+use herdr_context::host::{DockWidth, LaunchContext};
 
 fn main() -> ExitCode {
     match run(env::args_os().nth(1)) {
@@ -37,7 +38,10 @@ fn toggle() -> Result<(), Box<dyn Error>> {
         .map(PathBuf::from)
         .ok_or("missing required variable HERDR_PLUGIN_STATE_DIR")?;
     let mut host = CommandHostClient::from_env()?;
-    DockLauncher::new(state_dir).toggle(&context, &mut host)?;
+    let config = PluginConfig::load_from_env().into_config();
+    DockLauncher::new(state_dir)
+        .with_width(DockWidth::clamped(config.dock().initial_width()))
+        .toggle(&context, &mut host)?;
     Ok(())
 }
 

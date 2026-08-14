@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -11,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::conversations::discovery::discover_conversations_cancellable;
 use crate::conversations::sources::{
-    ConversationSourceError, DiscoveryLimit, MetadataBudget, SourceId, SourceRegistry,
-    SourceWatermark,
+    ConversationSourceError, ConversationSourceErrorKind, DiscoveryLimit, MetadataBudget, SourceId,
+    SourceRegistry, SourceWatermark,
 };
 use crate::conversations::{
     Conversation, ConversationProvenance, ConversationState, ProvenanceKind, ResumeCapability,
@@ -24,7 +25,8 @@ const SCHEMA_VERSION: u32 = 3;
 const MAX_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_INDEX_ENTRIES: usize = 4_096;
 const MAX_WATERMARK_BYTES: usize = 4 * 1024 * 1024;
-const MAX_SOURCE_WATERMARKS: usize = 5;
+const MAX_TOTAL_WATERMARK_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SOURCE_WATERMARKS: usize = 32;
 const MAX_TITLE_BYTES: usize = 256;
 const MAX_SESSION_ID_BYTES: usize = 256;
 const MAX_PATH_BYTES: usize = 4_096;
@@ -48,6 +50,7 @@ pub struct ConversationIndex {
     entries: BTreeMap<String, CachedConversation>,
     status: IndexStatus,
     scan_has_more: bool,
+    max_entries: NonZeroUsize,
 }
 
 impl ConversationIndex {
@@ -55,9 +58,23 @@ impl ConversationIndex {
         state_dir: impl AsRef<Path>,
         project: ProjectIdentity,
     ) -> Result<Self, ConversationIndexError> {
+        Self::open_with_max_entries(
+            state_dir,
+            project,
+            NonZeroUsize::new(MAX_INDEX_ENTRIES).expect("non-zero index limit"),
+        )
+    }
+
+    pub fn open_with_max_entries(
+        state_dir: impl AsRef<Path>,
+        project: ProjectIdentity,
+        max_entries: NonZeroUsize,
+    ) -> Result<Self, ConversationIndexError> {
         if !cfg!(unix) {
             return Err(ConversationIndexError::PrivatePermissionsUnsupported);
         }
+        let max_entries = NonZeroUsize::new(max_entries.get().min(MAX_INDEX_ENTRIES))
+            .expect("bounded index limit is non-zero");
         let state_dir = state_dir.as_ref();
         ensure_private_directory(state_dir)?;
         let conversations_dir = state_dir.join("conversations");
@@ -71,6 +88,7 @@ impl ConversationIndex {
                 project_dir,
                 0,
                 IndexStatus::RebuiltMissing,
+                max_entries,
             ));
         };
         let bytes = read_private_cache(&cache_path)?;
@@ -82,6 +100,7 @@ impl ConversationIndex {
                     project_dir,
                     cached_generation,
                     IndexStatus::RebuiltCorrupt,
+                    max_entries,
                 ));
             }
         };
@@ -91,21 +110,24 @@ impl ConversationIndex {
                 project_dir,
                 cached_generation,
                 IndexStatus::RebuiltCorrupt,
+                max_entries,
             ));
         }
-        match Self::from_disk(project.clone(), project_dir.clone(), disk) {
+        match Self::from_disk(project.clone(), project_dir.clone(), disk, max_entries) {
             Ok(index) => Ok(index),
             Err(LoadFailure::Corrupt) => Ok(Self::empty(
                 project,
                 project_dir,
                 cached_generation,
                 IndexStatus::RebuiltCorrupt,
+                max_entries,
             )),
             Err(LoadFailure::Incompatible) => Ok(Self::empty(
                 project,
                 project_dir,
                 cached_generation,
                 IndexStatus::RebuiltIncompatible,
+                max_entries,
             )),
         }
     }
@@ -115,6 +137,7 @@ impl ConversationIndex {
         project_dir: PathBuf,
         generation: u64,
         status: IndexStatus,
+        max_entries: NonZeroUsize,
     ) -> Self {
         Self {
             project,
@@ -123,6 +146,7 @@ impl ConversationIndex {
             watermarks: HashMap::new(),
             entries: BTreeMap::new(),
             status,
+            max_entries,
             scan_has_more: false,
         }
     }
@@ -131,7 +155,12 @@ impl ConversationIndex {
         project: ProjectIdentity,
         project_dir: PathBuf,
         disk: DiskIndex,
+        max_entries: NonZeroUsize,
     ) -> Result<Self, LoadFailure> {
+        if !(1..=MAX_INDEX_ENTRIES).contains(&disk.max_entries) {
+            return Err(LoadFailure::Corrupt);
+        }
+        let cache_limit_increased = max_entries.get() > disk.max_entries;
         let disk_root = disk.project_root.to_path()?;
         if disk.schema_version != SCHEMA_VERSION || disk_root != project.root() {
             return Err(LoadFailure::Incompatible);
@@ -164,9 +193,14 @@ impl ConversationIndex {
             project,
             project_dir,
             generation: disk.generation,
-            watermarks,
+            watermarks: if cache_limit_increased {
+                HashMap::new()
+            } else {
+                watermarks
+            },
             entries,
             status: IndexStatus::Loaded,
+            max_entries,
             scan_has_more: false,
         })
     }
@@ -206,8 +240,16 @@ impl ConversationIndex {
         if cancelled.load(Ordering::Relaxed) {
             return cancelled_result();
         }
+        let mut refresh_errors = discovery.errors().to_vec();
 
         let mut staged = self.clone();
+        let desired_source_ids = registry
+            .desired_source_ids()
+            .map(SourceId::as_str)
+            .collect::<HashSet<_>>();
+        staged
+            .entries
+            .retain(|_, entry| desired_source_ids.contains(entry.source_id.as_str()));
         for source_id in discovery.purged_sources() {
             if cancelled.load(Ordering::Relaxed) {
                 return cancelled_result();
@@ -221,7 +263,8 @@ impl ConversationIndex {
                 return cancelled_result();
             }
             let key = format!(
-                "{}\0{}",
+                "{}\0{}\0{}",
+                removal.source_id().as_str(),
                 removal.session_reference().namespace(),
                 removal.session_reference().id()
             );
@@ -245,11 +288,33 @@ impl ConversationIndex {
                 added_or_updated += 1;
             }
         }
-        if staged.entries.len() > MAX_INDEX_ENTRIES {
+        if staged.entries.len() > staged.max_entries.get() {
             staged.trim_oldest()?;
         }
-        staged.watermarks = discovery.watermarks().clone();
-        staged.scan_has_more = discovery.has_more();
+        let mut ordered_watermarks = discovery.watermarks().values().cloned().collect::<Vec<_>>();
+        ordered_watermarks.sort_unstable_by(|left, right| {
+            left.source_id().as_str().cmp(right.source_id().as_str())
+        });
+        let mut watermark_bytes = 0_usize;
+        let mut bounded_watermarks = HashMap::new();
+        let mut dropped_continuation = false;
+        for watermark in ordered_watermarks {
+            let token_bytes = watermark.token().len();
+            let next_bytes = watermark_bytes.saturating_add(token_bytes);
+            if token_bytes > MAX_WATERMARK_BYTES || next_bytes > MAX_TOTAL_WATERMARK_BYTES {
+                refresh_errors.push(ConversationSourceError::new(
+                    watermark.source_id().clone(),
+                    ConversationSourceErrorKind::InvalidData,
+                    "source watermark exceeds the metadata cache budget",
+                ));
+                dropped_continuation = true;
+                continue;
+            }
+            watermark_bytes = next_bytes;
+            bounded_watermarks.insert(watermark.source_id().clone(), watermark);
+        }
+        staged.watermarks = bounded_watermarks;
+        staged.scan_has_more = discovery.has_more() && !dropped_continuation;
         if cancelled.load(Ordering::Relaxed) {
             return cancelled_result();
         }
@@ -264,7 +329,7 @@ impl ConversationIndex {
             added_or_updated,
             has_more,
             cancelled: false,
-            errors: discovery.errors().to_vec(),
+            errors: refresh_errors,
         })
     }
 
@@ -279,7 +344,7 @@ impl ConversationIndex {
         });
         let keep = ordered
             .into_iter()
-            .take(MAX_INDEX_ENTRIES)
+            .take(self.max_entries.get())
             .map(|(_, key)| key)
             .collect::<HashSet<_>>();
         self.entries.retain(|key, _| keep.contains(key));
@@ -291,6 +356,7 @@ impl ConversationIndex {
             schema_version: SCHEMA_VERSION,
             project_root: StoredPath::from_path(self.project.root())?,
             generation: self.generation,
+            max_entries: self.max_entries.get(),
             watermarks: self
                 .watermarks
                 .values()
@@ -384,6 +450,19 @@ impl ConversationIndex {
                         .id()
                         .cmp(right.session_reference().id())
                 })
+                .then_with(|| {
+                    left.provenance()[0]
+                        .source_id()
+                        .as_str()
+                        .cmp(right.provenance()[0].source_id().as_str())
+                })
+        });
+        let mut seen = HashSet::new();
+        conversations.retain(|conversation| {
+            seen.insert((
+                conversation.session_reference().namespace().to_owned(),
+                conversation.session_reference().id().to_owned(),
+            ))
         });
         let total = conversations.len();
         let conversations = conversations
@@ -469,8 +548,14 @@ struct DiskIndex {
     schema_version: u32,
     project_root: StoredPath,
     generation: u64,
+    #[serde(default = "default_disk_max_entries")]
+    max_entries: usize,
     watermarks: Vec<DiskWatermark>,
     entries: Vec<CachedConversation>,
+}
+
+const fn default_disk_max_entries() -> usize {
+    MAX_INDEX_ENTRIES
 }
 
 #[derive(Serialize, Deserialize)]
@@ -642,7 +727,10 @@ impl CachedConversation {
     }
 
     fn key(&self) -> String {
-        format!("{}\0{}", self.namespace, self.session_id)
+        format!(
+            "{}\0{}\0{}",
+            self.source_id, self.namespace, self.session_id
+        )
     }
 
     fn updated_at(&self) -> Result<SystemTime, ConversationIndexError> {
@@ -774,14 +862,24 @@ enum LoadFailure {
 }
 
 fn validate_source(source: &str, tool: Option<&str>) -> Result<(), LoadFailure> {
-    let expected_tool = match source {
-        "project-local-generic-jsonl" => "generic-jsonl",
-        "claude-code" => "claude-code",
-        "codex-cli" => "codex-cli",
-        "opencode" => "opencode",
-        "omp" => "omp",
-        "pi" => "pi",
-        _ => return Err(LoadFailure::Incompatible),
+    let expected_tool = if source == "project-local-generic-jsonl" {
+        "generic-jsonl"
+    } else {
+        ["claude-code", "codex-cli", "opencode", "omp", "pi"]
+            .into_iter()
+            .find(|candidate| {
+                source == *candidate
+                    || source
+                        .strip_prefix(*candidate)
+                        .and_then(|suffix| suffix.strip_prefix(":extra:"))
+                        .is_some_and(|fingerprint| {
+                            fingerprint.len() == 16
+                                && fingerprint.bytes().all(|byte| {
+                                    byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+                                })
+                        })
+            })
+            .ok_or(LoadFailure::Incompatible)?
     };
     if tool.is_some_and(|tool| tool != expected_tool) {
         return Err(LoadFailure::Corrupt);

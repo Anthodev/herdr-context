@@ -17,6 +17,7 @@ pub use opencode::OpenCodeSource;
 pub use pi::PiSource;
 pub use project_local::{ProjectLocalLocation, ProjectLocalLocationError};
 
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -556,10 +557,18 @@ impl Error for ConversationSourceError {}
 /// two sources claim the same ID.
 pub struct SourceRegistry {
     sources: Vec<Box<dyn ConversationSource>>,
+    desired_source_ids: HashSet<SourceId>,
 }
 
 impl SourceRegistry {
-    pub fn new(mut sources: Vec<Box<dyn ConversationSource>>) -> Result<Self, SourceRegistryError> {
+    pub fn new(sources: Vec<Box<dyn ConversationSource>>) -> Result<Self, SourceRegistryError> {
+        Self::new_with_desired_source_ids(sources, Vec::new())
+    }
+
+    pub(crate) fn new_with_desired_source_ids(
+        mut sources: Vec<Box<dyn ConversationSource>>,
+        desired_source_ids: Vec<SourceId>,
+    ) -> Result<Self, SourceRegistryError> {
         sources.sort_unstable_by(|left, right| {
             left.source_id().as_str().cmp(right.source_id().as_str())
         });
@@ -568,7 +577,12 @@ impl SourceRegistry {
         }) {
             return Err(SourceRegistryError { source_id });
         }
-        Ok(Self { sources })
+        let mut desired_source_ids = desired_source_ids.into_iter().collect::<HashSet<_>>();
+        desired_source_ids.extend(sources.iter().map(|source| source.source_id().clone()));
+        Ok(Self {
+            sources,
+            desired_source_ids,
+        })
     }
 
     #[must_use]
@@ -576,6 +590,15 @@ impl SourceRegistry {
         &self,
     ) -> impl ExactSizeIterator<Item = &dyn ConversationSource> + DoubleEndedIterator {
         self.sources.iter().map(Box::as_ref)
+    }
+
+    #[must_use]
+    pub(crate) fn retains(&self, source_id: &SourceId) -> bool {
+        self.desired_source_ids.contains(source_id)
+    }
+
+    pub(crate) fn desired_source_ids(&self) -> impl Iterator<Item = &SourceId> {
+        self.desired_source_ids.iter()
     }
 
     #[must_use]

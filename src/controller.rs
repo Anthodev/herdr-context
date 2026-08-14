@@ -1,34 +1,37 @@
 //! Intent transitions and orchestration between state and bounded workers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
+use crate::config::{ConfigLoad, ExternalHistoryRoot, KeyBindings, PluginConfig};
 use crate::conversations::Conversation;
 use crate::conversations::active::{
-    FilesystemConversationSnapshot, LiveConversationSnapshot, merge_prepared_live_sessions,
-    prepare_filesystem_conversations, prepare_live_conversations,
+    FilesystemConversationSnapshot, LiveConversationSnapshot, merge_filesystem_snapshots,
+    merge_prepared_live_sessions, prepare_filesystem_conversations, prepare_live_conversations,
 };
 use crate::conversations::discovery::discover_conversations_cancellable;
-use crate::conversations::index::ConversationIndex;
+use crate::conversations::index::{ConversationIndex, IndexStatus};
 use crate::conversations::sources::{
-    ConversationSourceError, DiscoveryLimit, GenericJsonlSource, KnownStoreRoots, MetadataBudget,
-    SourceRegistry,
+    ClaudeCodeSource, CodexCliSource, ConversationSource, ConversationSourceError, DiscoveryLimit,
+    GenericJsonlSource, KnownStoreRoots, MetadataBudget, OmpSource, OpenCodeSource, PiSource,
+    ProjectLocalLocation, SourceId, SourceRegistry,
 };
 use crate::host::client::CommandHostClient;
 use crate::host::{HostClient, LaunchContext};
 use crate::intent::{Intent, View};
 use crate::model::{AppModel, LoadingState};
-use crate::project::{ProjectIdentity, resolve_project_context};
+use crate::project::{ProjectIdentity, resolve_project_context_with_backend};
 use crate::runtime::{FilesRuntime, RuntimeMessage};
 use crate::ui::render_shell;
 use crate::worker::{CompletedJob, Job, JobKey, JobKind, Priority, SubmitStatus, WorkerRuntime};
 
+struct ConfigResult(ConfigLoad);
 struct BootstrapResult(Result<FilesRuntime, crate::runtime::FilesRuntimeError>);
 struct ConversationsResult(ConversationJobResult);
 struct LiveConversationsResult(LiveConversationJobResult);
@@ -57,22 +60,22 @@ struct LiveSnapshot {
     sessions: LiveConversationSnapshot,
     observed_at: SystemTime,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct ConversationPaths {
-    state_dir: PathBuf,
-    home: PathBuf,
+    state_dir: Option<PathBuf>,
+    home: Option<PathBuf>,
 }
 
 impl ConversationPaths {
-    fn from_env() -> Option<Self> {
+    fn from_env() -> Self {
         let state_dir = env::var_os("HERDR_PLUGIN_STATE_DIR")
             .filter(|value| !value.is_empty())
-            .map(PathBuf::from)?;
+            .map(PathBuf::from);
         let home = env::var_os("HOME")
             .or_else(|| env::var_os("USERPROFILE"))
             .filter(|value| !value.is_empty())
-            .map(PathBuf::from)?;
-        Some(Self { state_dir, home })
+            .map(PathBuf::from);
+        Self { state_dir, home }
     }
 }
 
@@ -85,11 +88,13 @@ pub struct Transition {
 pub struct Controller {
     model: AppModel,
     files: Option<FilesRuntime>,
-    conversation_paths: Option<ConversationPaths>,
+    conversation_paths: ConversationPaths,
     host_binary: Option<PathBuf>,
     filesystem_conversations: Option<FilesystemConversationSnapshot>,
     conversation_project: Option<ProjectIdentity>,
     live_snapshot: Option<LiveSnapshot>,
+    config: PluginConfig,
+    subsystems_started: bool,
 }
 
 impl Controller {
@@ -104,6 +109,8 @@ impl Controller {
             filesystem_conversations: None,
             conversation_project: None,
             live_snapshot: None,
+            config: PluginConfig::default(),
+            subsystems_started: false,
         }
     }
     #[cfg(test)]
@@ -115,28 +122,59 @@ impl Controller {
         Self {
             model: AppModel::new(context),
             files: None,
-            conversation_paths: Some(ConversationPaths { state_dir, home }),
+            conversation_paths: ConversationPaths {
+                state_dir: Some(state_dir),
+                home: Some(home),
+            },
             host_binary: None,
             filesystem_conversations: None,
             conversation_project: None,
             live_snapshot: None,
+            config: PluginConfig::default(),
+            subsystems_started: false,
         }
     }
 
     pub(super) fn start(&mut self, workers: &mut WorkerRuntime) {
+        let config_root = env::var_os("HERDR_PLUGIN_CONFIG_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("<defaults>"));
+        let job = Job::new(
+            JobKey::new(JobKind::Config, config_root),
+            1,
+            Priority::High,
+            |_| Box::new(ConfigResult(PluginConfig::load_from_env())),
+        );
+        if !accepted(workers.submit(job)) {
+            self.apply_config_load(
+                ConfigLoad::with_runtime_warning(
+                    "Config: background configuration queue is unavailable; using defaults",
+                ),
+                workers,
+            );
+        }
+    }
+
+    fn start_subsystems(&mut self, workers: &mut WorkerRuntime) {
+        if self.subsystems_started {
+            return;
+        }
+        self.subsystems_started = true;
         let context = self.model.launch_context().clone();
         let root = context
             .foreground_cwd()
             .unwrap_or_else(|| context.cwd())
             .to_path_buf();
+        let config = self.config.clone();
         let bootstrap = Job::new(
             JobKey::new(JobKind::Bootstrap, root),
             1,
             Priority::High,
             move |cancelled| {
-                Box::new(BootstrapResult(FilesRuntime::bootstrap_cancellable(
-                    &context, cancelled,
-                )))
+                Box::new(BootstrapResult(
+                    FilesRuntime::bootstrap_with_config_cancellable(&context, &config, cancelled),
+                ))
             },
         );
         if !accepted(workers.submit(bootstrap)) {
@@ -145,6 +183,13 @@ impl Controller {
             ));
         }
         self.schedule_conversations(workers);
+    }
+
+    fn apply_config_load(&mut self, load: ConfigLoad, workers: &mut WorkerRuntime) {
+        let (config, warnings) = load.into_parts();
+        self.config = config;
+        self.model.set_config_warnings(warnings);
+        self.start_subsystems(workers);
     }
 
     fn schedule_conversations(&mut self, workers: &mut WorkerRuntime) {
@@ -170,6 +215,7 @@ impl Controller {
             .unwrap_or_else(|| self.model.launch_context().cwd())
             .to_path_buf();
         let paths = self.conversation_paths.clone();
+        let config = self.config.clone();
         let job = Job::new(
             JobKey::new(JobKind::ConversationDiscovery, &root),
             generation,
@@ -177,7 +223,8 @@ impl Controller {
             move |cancelled| {
                 Box::new(ConversationsResult(load_conversations(
                     &root,
-                    paths.as_ref(),
+                    &paths,
+                    &config,
                     cancelled,
                     show_loading,
                 )))
@@ -209,13 +256,14 @@ impl Controller {
             .foreground_cwd()
             .unwrap_or_else(|| self.model.launch_context().cwd())
             .to_path_buf();
+        let backend = self.config.vcs().backend();
         let job = Job::new(
             JobKey::new(JobKind::ConversationLive, &root),
             generation,
             Priority::Low,
             move |cancelled| {
                 Box::new(LiveConversationsResult(load_live_conversations(
-                    &root, binary, cancelled,
+                    &root, binary, backend, cancelled,
                 )))
             },
         );
@@ -300,6 +348,15 @@ impl Controller {
         if result.panicked() {
             let kind = result.key().kind();
             let generation = result.generation();
+            if kind == JobKind::Config {
+                self.apply_config_load(
+                    ConfigLoad::with_runtime_warning(
+                        "Config: background configuration worker stopped; using defaults",
+                    ),
+                    workers,
+                );
+                return true;
+            }
             if matches!(kind, JobKind::Filesystem | JobKind::Vcs)
                 && let Some(files) = &mut self.files
             {
@@ -324,6 +381,19 @@ impl Controller {
             return true;
         }
         match result.key().kind() {
+            JobKind::Config => {
+                let Ok(result) = result.downcast::<ConfigResult>() else {
+                    self.apply_config_load(
+                        ConfigLoad::with_runtime_warning(
+                            "Config: invalid configuration worker result; using defaults",
+                        ),
+                        workers,
+                    );
+                    return true;
+                };
+                self.apply_config_load(result.0, workers);
+                true
+            }
             JobKind::Bootstrap => {
                 let Ok(result) = result.downcast::<BootstrapResult>() else {
                     self.model.files_mut().set_loading(LoadingState::Error(
@@ -370,6 +440,18 @@ impl Controller {
                         reset_source_errors,
                     } => {
                         self.conversation_project = Some(project);
+                        let degraded_cache = source_errors
+                            .iter()
+                            .any(|error| error.starts_with("Cache: metadata index is unavailable"));
+                        let conversations = if degraded_cache {
+                            if let Some(previous) = self.filesystem_conversations.as_ref() {
+                                merge_filesystem_snapshots(previous, conversations)
+                            } else {
+                                conversations
+                            }
+                        } else {
+                            conversations
+                        };
                         self.filesystem_conversations = Some(conversations);
                         let visible = self.merged_conversations();
                         let changed = self
@@ -476,6 +558,11 @@ impl Controller {
     fn set_worker_error(&mut self, kind: JobKind) {
         let state = LoadingState::Error("background worker stopped unexpectedly".to_owned());
         match kind {
+            JobKind::Config => {
+                self.model.set_config_warnings(vec![
+                    "Config: background configuration worker stopped; using defaults".to_owned(),
+                ]);
+            }
             JobKind::ConversationDiscovery => self.model.conversations_mut().set_loading(state),
             JobKind::ConversationLive => {
                 self.model.conversations_mut().set_live_error(Some(
@@ -535,6 +622,10 @@ impl Controller {
         }
     }
 
+    pub(super) const fn keybindings(&self) -> &KeyBindings {
+        self.config.keybindings()
+    }
+
     pub(super) const fn model(&self) -> &AppModel {
         &self.model
     }
@@ -548,19 +639,41 @@ impl Controller {
             .as_ref()
             .is_some_and(FilesRuntime::has_pending_work)
     }
+
+    pub(super) fn next_refresh_in(&self, now: Instant) -> Option<Duration> {
+        if self.model.active_view() != View::Files {
+            return None;
+        }
+        self.files
+            .as_ref()
+            .and_then(|files| files.next_refresh_in(now))
+    }
+
+    pub(super) fn tick(&mut self, now: Instant, workers: &mut WorkerRuntime) -> bool {
+        self.model.active_view() == View::Files
+            && self
+                .files
+                .as_mut()
+                .is_some_and(|files| files.tick(now, workers))
+    }
 }
 
 fn load_conversations(
     root: &Path,
-    paths: Option<&ConversationPaths>,
+    paths: &ConversationPaths,
+    config: &PluginConfig,
     cancelled: &AtomicBool,
     reset_source_errors: bool,
 ) -> ConversationJobResult {
     if cancelled.load(Ordering::Relaxed) {
         return ConversationJobResult::Cancelled;
     }
-    let paths = paths.filter(|_| cfg!(unix));
-    let project = match resolve_project_context(root) {
+    let state_dir = if cfg!(unix) {
+        paths.state_dir.as_ref()
+    } else {
+        None
+    };
+    let project = match resolve_project_context_with_backend(root, config.vcs().backend()) {
         Ok(context) => context.conversation_identity().clone(),
         Err(_) => {
             return ConversationJobResult::Error("project identity is unavailable".to_owned());
@@ -569,60 +682,153 @@ fn load_conversations(
     if cancelled.load(Ordering::Relaxed) {
         return ConversationJobResult::Cancelled;
     }
-    let generic = match GenericJsonlSource::for_project(project.clone()) {
-        Ok(source) => source,
-        Err(_) => {
-            return ConversationJobResult::Error(
-                "project-local conversation source is unavailable".to_owned(),
-            );
-        }
-    };
-    let mut sources: Vec<Box<dyn crate::conversations::sources::ConversationSource>> =
-        vec![Box::new(generic)];
-    if let Some(paths) = paths {
-        let roots = KnownStoreRoots::under_home(&paths.home);
-        match roots.sources(project.clone()) {
-            Ok(external) => sources.extend(external),
-            Err(error) => return ConversationJobResult::Error(error.to_string()),
+
+    let config = config.conversations();
+    let mut sources: Vec<Box<dyn ConversationSource>> = Vec::new();
+    let mut setup_errors = Vec::new();
+    let mut desired_source_ids = Vec::new();
+    if config.source_enabled("project-local-generic-jsonl") {
+        desired_source_ids.push(
+            SourceId::new("project-local-generic-jsonl")
+                .expect("static conversation source ID is valid"),
+        );
+        let locations = [
+            PathBuf::from(".herdr/conversations"),
+            PathBuf::from(".herdr/conversations.jsonl"),
+            PathBuf::from(".herdr/conversations.json"),
+        ]
+        .into_iter()
+        .chain(config.project_roots().iter().cloned())
+        .map(ProjectLocalLocation::new)
+        .collect::<Result<Vec<_>, _>>();
+        match locations
+            .map_err(|error| error.to_string())
+            .and_then(|locations| {
+                GenericJsonlSource::new(project.clone(), locations)
+                    .map_err(|error| error.to_string())
+            }) {
+            Ok(source) => sources.push(Box::new(source)),
+            Err(error) => setup_errors.push(error),
         }
     }
-    let registry = match SourceRegistry::new(sources) {
+    for source in ["claude-code", "codex-cli", "omp", "opencode", "pi"] {
+        if config.source_enabled(source) {
+            desired_source_ids
+                .push(SourceId::new(source).expect("static conversation source ID is valid"));
+        }
+    }
+    if let Some(home) = &paths.home {
+        let roots = KnownStoreRoots::under_home(home);
+        match roots.sources(project.clone()) {
+            Ok(external) => sources.extend(
+                external
+                    .into_iter()
+                    .filter(|source| config.source_enabled(source.source_id().as_str())),
+            ),
+            Err(error) => setup_errors.push(error.to_string()),
+        }
+    } else {
+        for source in ["claude-code", "codex-cli", "omp", "opencode", "pi"] {
+            if config.source_enabled(source) {
+                setup_errors.push(format!(
+                    "{source}: user home directory is unavailable; retaining cached metadata"
+                ));
+            }
+        }
+    }
+    for root in config.external_roots() {
+        if !config.source_enabled(root.source()) {
+            continue;
+        }
+        let id = configured_external_source_id(root);
+        desired_source_ids.push(id.clone());
+        match configured_external_source(project.clone(), root, id) {
+            Ok(source) => sources.push(source),
+            Err(error) => setup_errors.push(error),
+        }
+    }
+    let registry = match SourceRegistry::new_with_desired_source_ids(sources, desired_source_ids) {
         Ok(registry) => registry,
         Err(error) => return ConversationJobResult::Error(error.to_string()),
     };
-    let limit = DiscoveryLimit::new(if paths.is_some() { 128 } else { 256 })
-        .expect("non-zero conversation discovery limit");
+    let limit = DiscoveryLimit::new(config.page_size().get())
+        .expect("validated conversation discovery limit is non-zero");
     let budget = MetadataBudget::new(512 * 1024).expect("non-zero conversation metadata budget");
-    let (conversations, has_more, source_errors) = if let Some(paths) = paths {
-        let mut index = match ConversationIndex::open(&paths.state_dir, project.clone()) {
-            Ok(index) => index,
-            Err(error) => return ConversationJobResult::Error(error.to_string()),
-        };
-        let refresh = match index.refresh_page_cancellable(&registry, limit, budget, cancelled) {
-            Ok(refresh) => refresh,
-            Err(error) => return ConversationJobResult::Error(error.to_string()),
-        };
-        if refresh.is_cancelled() {
-            return ConversationJobResult::Cancelled;
+    let (mut conversations, has_more, mut source_errors) = if let Some(state_dir) = state_dir {
+        match ConversationIndex::open_with_max_entries(
+            state_dir,
+            project.clone(),
+            config.cache_entries(),
+        ) {
+            Ok(mut index) => {
+                let cache_status = index.status();
+                match index.refresh_page_cancellable(&registry, limit, budget, cancelled) {
+                    Ok(refresh) if refresh.is_cancelled() => {
+                        return ConversationJobResult::Cancelled;
+                    }
+                    Ok(refresh) => {
+                        let mut source_errors = source_error_messages(refresh.errors());
+                        match cache_status {
+                            IndexStatus::RebuiltCorrupt => source_errors
+                                .push("Cache: corrupt metadata index was rebuilt".to_owned()),
+                            IndexStatus::RebuiltIncompatible => source_errors
+                                .push("Cache: incompatible metadata index was rebuilt".to_owned()),
+                            IndexStatus::Loaded | IndexStatus::RebuiltMissing => {}
+                        }
+                        (
+                            index
+                                .page(0, config.cache_entries().get())
+                                .into_conversations(),
+                            refresh.has_more(),
+                            source_errors,
+                        )
+                    }
+                    Err(_) => {
+                        let (conversations, mut errors) = discover_without_index(
+                            &registry,
+                            &project,
+                            limit,
+                            budget,
+                            config.cache_entries().get(),
+                            cancelled,
+                        );
+                        errors.push(
+                            "Cache: metadata index is unavailable; using nonpersistent discovery"
+                                .to_owned(),
+                        );
+                        (conversations, false, errors)
+                    }
+                }
+            }
+            Err(_) => {
+                let (conversations, mut errors) = discover_without_index(
+                    &registry,
+                    &project,
+                    limit,
+                    budget,
+                    config.cache_entries().get(),
+                    cancelled,
+                );
+                errors.push(
+                    "Cache: metadata index is unavailable; using nonpersistent discovery"
+                        .to_owned(),
+                );
+                (conversations, false, errors)
+            }
         }
-        let source_errors = source_error_messages(refresh.errors());
-        (
-            index.page(0, 4_096).into_conversations(),
-            refresh.has_more(),
-            source_errors,
-        )
     } else {
-        let discovery = discover_conversations_cancellable(
+        let (conversations, errors) = discover_without_index(
             &registry,
             &project,
-            &HashMap::new(),
             limit,
             budget,
+            config.cache_entries().get(),
             cancelled,
         );
-        let source_errors = source_error_messages(discovery.errors());
-        (discovery.into_conversations(), false, source_errors)
+        (conversations, false, errors)
     };
+    conversations.truncate(config.cache_entries().get());
+    source_errors.extend(setup_errors);
     if cancelled.load(Ordering::Relaxed) {
         return ConversationJobResult::Cancelled;
     }
@@ -640,15 +846,100 @@ fn load_conversations(
     }
 }
 
+fn discover_without_index(
+    registry: &SourceRegistry,
+    project: &ProjectIdentity,
+    limit: DiscoveryLimit,
+    budget: MetadataBudget,
+    max_entries: usize,
+    cancelled: &AtomicBool,
+) -> (Vec<Conversation>, Vec<String>) {
+    let mut watermarks = HashMap::new();
+    let mut conversations = Vec::new();
+    let mut seen = HashSet::new();
+    let mut errors = Vec::new();
+    let max_pages = max_entries.div_ceil(limit.get()).saturating_add(1);
+    for _ in 0..max_pages {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        let discovery = discover_conversations_cancellable(
+            registry,
+            project,
+            &watermarks,
+            limit,
+            budget,
+            cancelled,
+        );
+        errors.extend(source_error_messages(discovery.errors()));
+        let has_more = discovery.has_more();
+        let next_watermarks = discovery.watermarks().clone();
+        for conversation in discovery.into_conversations() {
+            let key = (
+                conversation.session_reference().namespace().to_owned(),
+                conversation.session_reference().id().to_owned(),
+            );
+            if seen.insert(key) {
+                conversations.push(conversation);
+            }
+        }
+        if !has_more || conversations.len() >= max_entries || next_watermarks == watermarks {
+            break;
+        }
+        watermarks = next_watermarks;
+    }
+    (conversations, errors)
+}
+
+fn configured_external_source_id(root: &ExternalHistoryRoot) -> SourceId {
+    let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in root
+        .source()
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain([0])
+        .chain(root.path().as_os_str().as_encoded_bytes().iter().copied())
+    {
+        fingerprint ^= u64::from(byte);
+        fingerprint = fingerprint.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    SourceId::new(format!("{}:extra:{fingerprint:016x}", root.source()))
+        .expect("configured source ID has a non-empty static prefix")
+}
+
+fn configured_external_source(
+    project: ProjectIdentity,
+    root: &ExternalHistoryRoot,
+    id: SourceId,
+) -> Result<Box<dyn ConversationSource>, String> {
+    match root.source() {
+        "claude-code" => {
+            ClaudeCodeSource::new_with_source_id(project, root.path().to_path_buf(), id)
+                .map(|source| Box::new(source) as Box<dyn ConversationSource>)
+        }
+        "codex-cli" => CodexCliSource::new_with_source_id(project, root.path().to_path_buf(), id)
+            .map(|source| Box::new(source) as Box<dyn ConversationSource>),
+        "omp" => OmpSource::new_with_source_id(project, root.path().to_path_buf(), id)
+            .map(|source| Box::new(source) as Box<dyn ConversationSource>),
+        "opencode" => OpenCodeSource::new_with_source_id(project, root.path().to_path_buf(), id)
+            .map(|source| Box::new(source) as Box<dyn ConversationSource>),
+        "pi" => PiSource::new_with_source_id(project, root.path().to_path_buf(), id)
+            .map(|source| Box::new(source) as Box<dyn ConversationSource>),
+        _ => return Err("configured conversation source is unsupported".to_owned()),
+    }
+    .map_err(|error| error.to_string())
+}
 fn load_live_conversations(
     root: &Path,
     binary: PathBuf,
+    backend: crate::project::VcsBackendSelection,
     cancelled: &AtomicBool,
 ) -> LiveConversationJobResult {
     if cancelled.load(Ordering::Relaxed) {
         return LiveConversationJobResult::Cancelled;
     }
-    let project = match resolve_project_context(root) {
+    let project = match resolve_project_context_with_backend(root, backend) {
         Ok(context) => context.conversation_identity().clone(),
         Err(_) => {
             return LiveConversationJobResult::Error("project identity is unavailable".to_owned());
@@ -690,10 +981,18 @@ mod tests {
     use ratatui::layout::Rect;
     use std::fs;
     use std::path::Path;
+    use std::sync::atomic::AtomicBool;
     use std::time::{Duration, UNIX_EPOCH};
     use tempfile::TempDir;
 
-    use super::Controller;
+    use super::{
+        Controller, ConversationJobResult, ConversationPaths, configured_external_source_id,
+        load_conversations,
+    };
+    use crate::config::PluginConfig;
+    use crate::conversations::active::{
+        merge_filesystem_snapshots, prepare_filesystem_conversations,
+    };
     use crate::conversations::{
         Conversation, ConversationProvenance, ConversationState, ProvenanceKind, ResumeCapability,
         SessionReference, SourceId, ToolIdentity,
@@ -739,6 +1038,39 @@ mod tests {
             ResumeCapability::Unsupported,
         )
         .expect("conversation")
+    }
+
+    #[test]
+    fn degraded_cache_refresh_merges_fresh_rows_into_the_retained_snapshot() {
+        let project_dir = TempDir::new().expect("project");
+        let project = ProjectIdentity::from_canonical_root(project_dir.path().to_path_buf())
+            .expect("project");
+        let previous = prepare_filesystem_conversations(vec![
+            conversation(&project, "pi", "updated", 1),
+            conversation(&project, "codex-cli", "retained", 2),
+        ]);
+        let fresh = prepare_filesystem_conversations(vec![
+            conversation(&project, "pi", "updated", 3),
+            conversation(&project, "omp", "added", 4),
+        ]);
+
+        let merged = merge_filesystem_snapshots(&previous, fresh);
+
+        assert_eq!(merged.conversations().len(), 3);
+        assert_eq!(
+            merged
+                .conversations()
+                .iter()
+                .find(|conversation| conversation.session_reference().id() == "updated")
+                .map(Conversation::updated_at),
+            Some(UNIX_EPOCH + Duration::from_secs(3))
+        );
+        assert!(
+            merged
+                .conversations()
+                .iter()
+                .any(|conversation| { conversation.session_reference().id() == "retained" })
+        );
     }
 
     fn rendered_line(buffer: &Buffer, row: u16) -> String {
@@ -1097,6 +1429,296 @@ mod tests {
         );
         workers.shutdown();
     }
+    #[test]
+    fn configured_project_history_root_is_discovered_without_recursive_scanning() {
+        let temp = TempDir::new().expect("tempdir");
+        let history = temp.path().join(".agents/history");
+        fs::create_dir_all(&history).expect("history");
+        fs::write(
+            history.join("configured.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "session_id": "configured-project-root",
+                    "cwd": temp.path(),
+                    "timestamp": "2026-01-02T03:04:05Z",
+                    "role": "user",
+                    "message": "private fixture",
+                })
+            ),
+        )
+        .expect("conversation");
+        fs::write(
+            history.join("second.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "session_id": "configured-project-root-second",
+                    "cwd": temp.path(),
+                    "timestamp": "2026-01-02T03:04:06Z",
+                    "role": "user",
+                    "message": "second private fixture",
+                })
+            ),
+        )
+        .expect("second conversation");
+        fs::write(
+            temp.path().join("config.toml"),
+            concat!(
+                "[conversations]\n",
+                "enabled_sources = [\"project-local-generic-jsonl\"]\n",
+                "project_roots = [\".agents/history\"]\n",
+                "page_size = 1\n",
+            ),
+        )
+        .expect("config");
+        let config = PluginConfig::load_from_dir(temp.path()).into_config();
+        let cancelled = AtomicBool::new(false);
+
+        let ConversationJobResult::Ready { conversations, .. } = load_conversations(
+            temp.path(),
+            &ConversationPaths::default(),
+            &config,
+            &cancelled,
+            true,
+        ) else {
+            panic!("configured conversation discovery");
+        };
+
+        assert_eq!(conversations.conversations().len(), 2);
+        assert!(conversations.conversations().iter().any(|conversation| {
+            conversation.session_reference().id() == "configured-project-root"
+        }));
+        assert!(conversations.conversations().iter().any(|conversation| {
+            conversation.session_reference().id() == "configured-project-root-second"
+        }));
+
+        let blocked_state = temp.path().join("blocked-state");
+        fs::write(&blocked_state, b"not a directory").expect("blocked state fixture");
+        let paths = ConversationPaths {
+            state_dir: Some(blocked_state),
+            home: None,
+        };
+        let ConversationJobResult::Ready {
+            conversations,
+            source_errors,
+            ..
+        } = load_conversations(temp.path(), &paths, &config, &AtomicBool::new(false), true)
+        else {
+            panic!("nonpersistent cache fallback");
+        };
+        assert_eq!(conversations.conversations().len(), 2);
+        assert!(source_errors.iter().any(|error| {
+            error.contains("metadata index is unavailable; using nonpersistent discovery")
+        }));
+    }
+
+    #[test]
+    fn configured_external_root_loads_without_home_or_cache_state() {
+        let project = TempDir::new().expect("project");
+        let project_identity = ProjectIdentity::from_canonical_root(project.path().to_path_buf())
+            .expect("project identity");
+        let store = TempDir::new().expect("Pi store");
+        let encoded_project = format!(
+            "--{}--",
+            project_identity
+                .root()
+                .to_string_lossy()
+                .trim_start_matches('/')
+                .replace('/', "-")
+        );
+        let session = store
+            .path()
+            .join(&encoded_project)
+            .join("2026-01-02T03-04-05-000Z_019b7ca9-8c88-7000-8003-000000000003.jsonl");
+        fs::create_dir_all(session.parent().expect("session parent")).expect("session directory");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/conversations/pi/--workspace-project--")
+            .join("2026-01-02T03-04-05-000Z_019b7ca9-8c88-7000-8003-000000000003.jsonl");
+        let fixture = fs::read_to_string(fixture).expect("Pi fixture").replace(
+            "/workspace/project",
+            project_identity.root().to_str().expect("UTF-8 root"),
+        );
+        fs::write(&session, &fixture).expect("installed Pi fixture");
+        let home = TempDir::new().expect("home");
+        let default_session = home
+            .path()
+            .join(".pi/agent/sessions")
+            .join(&encoded_project)
+            .join("2026-01-02T03-04-05-000Z_019b7ca9-8c88-7000-8003-000000000003.jsonl");
+        fs::create_dir_all(default_session.parent().expect("default session parent"))
+            .expect("default session directory");
+        fs::write(default_session, &fixture).expect("installed default Pi fixture");
+        let config_dir = TempDir::new().expect("config");
+        fs::write(
+            config_dir.path().join("config.toml"),
+            format!(
+                concat!(
+                    "[conversations]\n",
+                    "enabled_sources = [\"pi\"]\n",
+                    "[conversations.external_roots]\n",
+                    "pi = [\"{}\"]\n",
+                ),
+                store.path().display()
+            ),
+        )
+        .expect("config");
+        let config = PluginConfig::load_from_dir(config_dir.path()).into_config();
+
+        let ConversationJobResult::Ready {
+            conversations,
+            source_errors,
+            ..
+        } = load_conversations(
+            project.path(),
+            &ConversationPaths::default(),
+            &config,
+            &AtomicBool::new(false),
+            true,
+        )
+        else {
+            panic!("configured external conversation discovery");
+        };
+
+        assert_eq!(conversations.conversations().len(), 1);
+        assert_eq!(
+            conversations.conversations()[0].session_reference().id(),
+            "019b7ca9-8c88-7000-8003-000000000003"
+        );
+        assert!(
+            source_errors
+                .iter()
+                .any(|error| { error.contains("pi: user home directory is unavailable") })
+        );
+
+        let state = TempDir::new().expect("state");
+        let cached_paths = ConversationPaths {
+            state_dir: Some(state.path().join("plugin-state")),
+            home: Some(home.path().to_path_buf()),
+        };
+        let ConversationJobResult::Ready {
+            conversations: cached,
+            ..
+        } = load_conversations(
+            project.path(),
+            &cached_paths,
+            &config,
+            &AtomicBool::new(false),
+            true,
+        )
+        else {
+            panic!("configured external cached conversation discovery");
+        };
+        assert_eq!(cached.conversations().len(), 1);
+        let ConversationJobResult::Ready {
+            conversations: reloaded,
+            source_errors,
+            ..
+        } = load_conversations(
+            project.path(),
+            &cached_paths,
+            &config,
+            &AtomicBool::new(false),
+            true,
+        )
+        else {
+            panic!("reloaded configured external cache");
+        };
+        assert_eq!(reloaded.conversations().len(), 1);
+        assert!(
+            source_errors
+                .iter()
+                .all(|error| !error.contains("incompatible metadata index"))
+        );
+
+        let base_config_dir = TempDir::new().expect("base config");
+        fs::write(
+            base_config_dir.path().join("config.toml"),
+            "[conversations]\nenabled_sources = [\"pi\"]\n",
+        )
+        .expect("base config");
+        let base_config = PluginConfig::load_from_dir(base_config_dir.path()).into_config();
+        let ConversationJobResult::Ready {
+            conversations: surviving,
+            ..
+        } = load_conversations(
+            project.path(),
+            &cached_paths,
+            &base_config,
+            &AtomicBool::new(false),
+            true,
+        )
+        else {
+            panic!("surviving default source");
+        };
+        assert_eq!(surviving.conversations().len(), 1);
+    }
+
+    #[test]
+    fn configured_external_root_identity_does_not_depend_on_sibling_roots() {
+        let roots = TempDir::new().expect("roots");
+        let first = roots.path().join("first");
+        let second = roots.path().join("second");
+        let both_config = TempDir::new().expect("both config");
+        fs::write(
+            both_config.path().join("config.toml"),
+            format!(
+                concat!(
+                    "[conversations.external_roots]\n",
+                    "pi = [\"{}\", \"{}\"]\n",
+                ),
+                first.display(),
+                second.display()
+            ),
+        )
+        .expect("both config");
+        let both = PluginConfig::load_from_dir(both_config.path());
+        let second_with_sibling = both
+            .config()
+            .conversations()
+            .external_roots()
+            .iter()
+            .find(|root| root.path() == second)
+            .map(configured_external_source_id)
+            .expect("second root");
+        let single_config = TempDir::new().expect("single config");
+        fs::write(
+            single_config.path().join("config.toml"),
+            format!(
+                "[conversations.external_roots]\npi = [\"{}\"]\n",
+                second.display()
+            ),
+        )
+        .expect("single config");
+        let single = PluginConfig::load_from_dir(single_config.path());
+        let second_alone =
+            configured_external_source_id(&single.config().conversations().external_roots()[0]);
+
+        assert_eq!(second_with_sibling, second_alone);
+    }
+
+    #[test]
+    fn malformed_configuration_warns_without_blocking_subsystem_startup() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("config.toml"), "[dock").expect("config");
+        let load = PluginConfig::load_from_dir(temp.path());
+        let mut controller = controller(&temp);
+        let mut workers = WorkerRuntime::with_capacities(2, 1);
+
+        controller.apply_config_load(load, &mut workers);
+        let area = Rect::new(0, 0, 80, 5);
+        let mut buffer = Buffer::empty(area);
+        controller.render(area, &mut buffer);
+        let rendered = (0..area.height)
+            .map(|row| rendered_line(&buffer, row))
+            .collect::<String>();
+
+        assert!(rendered.contains("Config: config.toml is malformed; using defaults"));
+        assert!(!rendered.contains("Config: Config:"));
+        assert!(workers.has_pending_work());
+        workers.shutdown();
+    }
+
     #[test]
     fn paged_index_publishes_recent_results_and_schedules_older_pages() {
         let project = TempDir::new().expect("project");

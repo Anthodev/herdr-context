@@ -158,6 +158,24 @@ fn absent_dock_opens_from_captured_origin_then_places_sizes_and_focuses()
     );
     Ok(())
 }
+#[test]
+fn configured_width_is_used_for_open_and_resize() -> Result<(), Box<dyn std::error::Error>> {
+    let state = TempDir::new()?;
+    let mut host = FakeHost::new(vec![pane("origin", true)]);
+
+    let outcome = launcher(state.path())
+        .with_width(DockWidth::clamped(52))
+        .toggle(&context()?, &mut host)?;
+
+    assert_eq!(outcome, ToggleOutcome::Opened);
+    assert_eq!(host.operations[0], "open:origin:/project/foreground:52");
+    assert!(
+        host.operations
+            .iter()
+            .any(|operation| operation == "resize:dock:52")
+    );
+    Ok(())
+}
 
 #[test]
 fn moved_origin_falls_back_to_a_pane_still_in_the_locked_tab()

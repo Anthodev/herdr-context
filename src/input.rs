@@ -4,6 +4,7 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 
+use crate::config::KeyBindings;
 use crate::intent::{Intent, PointerAction, View};
 use crate::model::UiGeometry;
 
@@ -15,9 +16,19 @@ pub enum InputMode {
 
 #[must_use]
 pub fn map_event(event: Event, mode: InputMode, geometry: &UiGeometry) -> Option<Intent> {
+    map_event_with_keybindings(event, mode, geometry, None)
+}
+
+#[must_use]
+pub fn map_event_with_keybindings(
+    event: Event,
+    mode: InputMode,
+    geometry: &UiGeometry,
+    keybindings: Option<&KeyBindings>,
+) -> Option<Intent> {
     match event {
         Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-            map_key(key, mode)
+            keybindings.map_or_else(|| map_key(key, mode), |bindings| bindings.map_key(key))
         }
         Event::Mouse(mouse) => {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
