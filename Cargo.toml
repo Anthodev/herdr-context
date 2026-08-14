@@ -3,8 +3,12 @@ name = "herdr-context"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.97.1"
+autobenches = false
 description = "Project context dock for Herdr"
 license = "MIT"
+
+[features]
+perf-harness = []
 
 [dependencies]
 cap-std = "4.0.2"
@@ -24,6 +28,11 @@ toml = "0.9"
 
 [dev-dependencies]
 tempfile = "3.12.0"
+
+[[bench]]
+name = "performance"
+harness = false
+required-features = ["perf-harness"]
 
 [lints.rust]
 unsafe_code = "forbid"

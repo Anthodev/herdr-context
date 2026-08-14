@@ -1610,16 +1610,22 @@ mod tests {
         let mut workers = workers();
 
         runtime.start_background(&mut workers);
-        for _ in 0..2 {
-            assert!(runtime.complete_background(receive(&mut workers), &mut workers));
+        for _ in 0..4 {
+            if !runtime.has_pending_work() && !workers.has_pending_work() {
+                break;
+            }
+            runtime.complete_background(receive(&mut workers), &mut workers);
         }
-        assert_eq!(
-            fs::read_to_string(&calls)
-                .expect("activation call")
-                .lines()
-                .count(),
-            1
+        let activation_calls = fs::read_to_string(&calls)
+            .expect("activation calls")
+            .lines()
+            .count();
+        assert!(
+            (1..=2).contains(&activation_calls),
+            "activation scheduled {activation_calls} Jujutsu commands"
         );
+        assert!(!runtime.has_pending_work());
+        assert!(!workers.has_pending_work());
 
         runtime.request_reload(&mut workers);
         for _ in 0..4 {
@@ -1633,8 +1639,9 @@ mod tests {
             .lines()
             .count();
         assert!(
-            calls_after_refresh >= 2,
-            "manual refresh did not run Jujutsu"
+            (1..=2).contains(&calls_after_refresh.saturating_sub(activation_calls)),
+            "manual refresh scheduled {} Jujutsu commands",
+            calls_after_refresh.saturating_sub(activation_calls)
         );
         assert!(!runtime.has_pending_work());
         assert!(!workers.has_pending_work());

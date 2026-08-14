@@ -1,0 +1,572 @@
+{
+  "schema_version": 1,
+  "generated_at_unix_seconds": 1786720128,
+  "ticket": "HDC-15",
+  "profile": "Cargo bench profile (optimized release code)",
+  "machine": {
+    "os": "Fedora Linux 44 (KDE Plasma Desktop Edition)",
+    "kernel": "Linux 7.1.7-cachyos1.fc44.x86_64 x86_64 GNU/Linux",
+    "cpu": "AMD Ryzen 7 7800X3D 8-Core Processor",
+    "logical_cpus": 8,
+    "cpu_governor": "powersave",
+    "load_average": "2.20 1.79 1.43 2/2583 1219846",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+    "git": "git version 2.55.0",
+    "jj": "jj 0.44.0"
+  },
+  "method": {
+    "warmup_samples": 20,
+    "measured_samples": 200,
+    "idle_duration_ms": 5000,
+    "percentile": "nearest-rank p50/p95 over wall-clock samples",
+    "first_frame_boundary": "LaunchContext ready through fresh TestBackend draw; background start excluded",
+    "sample_policy": "Each metric records its effective warmup/measured count; UI uses requested defaults (navigation enforces at least 100 measured), tree/merge cap at 2/10, VCS uses 1/5, and destructive or aggregate observations use 0/1.",
+    "rss_boundary": "Linux /proc/self/status VmRSS/VmHWM for each isolated case process",
+    "noise_controls": [
+      "Optimized bench profile; harness overhead excluded from child case metrics.",
+      "Each workload class runs in a fresh process; fixture generation runs in the supervisor.",
+      "Cases run sequentially with LC_ALL=C and no network or real user data.",
+      "Warmups precede sampled timings; status, archive, concurrency, and cleanup work is fully awaited.",
+      "Run on an otherwise idle host; record governor and load average with the result."
+    ],
+    "reproduction_command": "scripts/measure-performance.sh docs"
+  },
+  "datasets": {
+    "no_vcs_files": 64,
+    "small_git_files": 128,
+    "jj_files_each": 64,
+    "monorepo_visible_files": 1024,
+    "monorepo_ignored_files": 4096,
+    "local_sessions": 64,
+    "external_sessions": 2048,
+    "total_payload_mib": 2.444430351257324
+  },
+  "cases": [
+    {
+      "case": "ui",
+      "metrics": [
+        {
+          "name": "first_frame_p95_ms",
+          "workload": "no-vcs first shell frame",
+          "observed": 0.093,
+          "unit": "ms",
+          "warmup_samples": 20,
+          "samples": 200,
+          "p50": 0.072,
+          "p95": 0.093,
+          "note": "Includes App construction and a fresh 80x24 TestBackend draw; no background start."
+        },
+        {
+          "name": "navigation_p95_ms",
+          "workload": "selection change plus 80x24 Files render",
+          "observed": 0.016,
+          "unit": "ms",
+          "warmup_samples": 20,
+          "samples": 200,
+          "p50": 0.015,
+          "p95": 0.016,
+          "note": "Alternates next/previous so every measured sample changes visible selection."
+        },
+        {
+          "name": "idle_cpu_percent",
+          "workload": "settled no-vcs Files view",
+          "observed": 0.0,
+          "unit": "%",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Process CPU ticks over wall time; 50 ms scheduler tick simulation."
+        },
+        {
+          "name": "idle_redraws",
+          "workload": "settled no-vcs Files view",
+          "observed": 0.0,
+          "unit": "count",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Dirty-driven redraw count during the idle interval."
+        },
+        {
+          "name": "steady_rss_mib",
+          "workload": "settled UI process",
+          "observed": 5.3828125,
+          "unit": "MiB",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "VmRSS from /proc/self/status; child memory is excluded by kernel accounting."
+        },
+        {
+          "name": "peak_rss_mib",
+          "workload": "isolated UI case process",
+          "observed": 5.3828125,
+          "unit": "MiB",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "VmHWM from /proc/self/status in a fresh case process."
+        },
+        {
+          "name": "surviving_workers",
+          "workload": "post-workload cleanup",
+          "observed": 0.0,
+          "unit": "count",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Observed after explicit worker shutdown and subprocess wait."
+        },
+        {
+          "name": "surviving_children",
+          "workload": "post-workload cleanup",
+          "observed": 0.0,
+          "unit": "count",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Observed after explicit worker shutdown and subprocess wait."
+        }
+      ],
+      "risks": [
+        "TestBackend excludes terminal driver and multiplexer transport latency.",
+        "Idle sampling uses Linux scheduler ticks, whose resolution is CLK_TCK-bound."
+      ]
+    },
+    {
+      "case": "filesystem",
+      "metrics": [
+        {
+          "name": "ignore_heavy_tree_p95_ms",
+          "workload": "1,024 visible and 4,096 ignored monorepo files",
+          "observed": 16.629,
+          "unit": "ms",
+          "warmup_samples": 2,
+          "samples": 10,
+          "p50": 16.403,
+          "p95": 16.629,
+          "note": "Loads every visible directory; ignored target trees must never enter the model."
+        },
+        {
+          "name": "status_merge_p95_ms",
+          "workload": "5,000 virtual Git status entries",
+          "observed": 41.664,
+          "unit": "ms",
+          "warmup_samples": 2,
+          "samples": 10,
+          "p50": 41.343,
+          "p95": 41.664,
+          "note": "Measures FilesTree merge and display-parent construction."
+        },
+        {
+          "name": "small_git_status_p95_ms",
+          "workload": "small Git workspace",
+          "observed": 20.404,
+          "unit": "ms",
+          "warmup_samples": 1,
+          "samples": 5,
+          "p50": 20.393,
+          "p95": 20.404,
+          "note": "Includes hardened config inspection and porcelain-v2 status child processes."
+        },
+        {
+          "name": "native_jj_status_p95_ms",
+          "workload": "non-colocated Jujutsu workspace",
+          "observed": 20.425,
+          "unit": "ms",
+          "warmup_samples": 1,
+          "samples": 5,
+          "p50": 20.379,
+          "p95": 20.425,
+          "note": "Fresh mode snapshots and parses the working-copy diff."
+        },
+        {
+          "name": "colocated_jj_status_p95_ms",
+          "workload": "colocated Jujutsu workspace",
+          "observed": 20.42,
+          "unit": "ms",
+          "warmup_samples": 1,
+          "samples": 5,
+          "p50": 20.389,
+          "p95": 20.42,
+          "note": "Passive mode avoids mutation and reports stale status."
+        },
+        {
+          "name": "steady_rss_mib",
+          "workload": "isolated filesystem case process",
+          "observed": 6.83203125,
+          "unit": "MiB",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Process-only VmRSS after tree, merge, Git, and Jujutsu workloads."
+        },
+        {
+          "name": "peak_rss_mib",
+          "workload": "isolated filesystem case process",
+          "observed": 7.0390625,
+          "unit": "MiB",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Process-only VmHWM across tree, merge, Git, and Jujutsu workloads."
+        },
+        {
+          "name": "filesystem_surviving_children",
+          "workload": "post-workload cleanup",
+          "observed": 0.0,
+          "unit": "count",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Every status subprocess has completed before observation."
+        }
+      ],
+      "risks": [
+        "Synthetic repositories do not model slow disks, network filesystems, or huge Git indexes."
+      ]
+    },
+    {
+      "case": "conversations",
+      "metrics": [
+        {
+          "name": "local_history_total_ms",
+          "workload": "64 project-local generic JSONL sessions",
+          "observed": 2.741533,
+          "unit": "ms",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Complete bounded local-history indexing."
+        },
+        {
+          "name": "local_history_session_count",
+          "workload": "complete project-local archive",
+          "observed": 64.0,
+          "unit": "sessions",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Validated after bounded paging completes."
+        },
+        {
+          "name": "recent_metadata_ms",
+          "workload": "2,048 external sessions plus multiple adapters",
+          "observed": 64.936643,
+          "unit": "ms",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Time until the first bounded metadata page is available."
+        },
+        {
+          "name": "recent_metadata_count",
+          "workload": "first external page",
+          "observed": 67.0,
+          "unit": "sessions",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Count available before total archive discovery completes."
+        },
+        {
+          "name": "archive_discovery_total_ms",
+          "workload": "complete external archive",
+          "observed": 2440.09404,
+          "unit": "ms",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "32 bounded pages; recent availability measured separately."
+        },
+        {
+          "name": "archive_session_count",
+          "workload": "complete external archive",
+          "observed": 2051.0,
+          "unit": "sessions",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Metadata-only indexed sessions after all bounded pages."
+        },
+        {
+          "name": "append_incremental_ms",
+          "workload": "concurrently appendable generic JSONL transcript",
+          "observed": 0.045259999999999995,
+          "unit": "ms",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Discovers and extracts only the safe appended suffix after a watermark."
+        },
+        {
+          "name": "conversation_tool_count",
+          "workload": "known external stores",
+          "observed": 4.0,
+          "unit": "tools",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "5 registered sources; discovered tools: claude-code, codex-cli, omp, pi"
+        },
+        {
+          "name": "steady_rss_mib",
+          "workload": "isolated conversation case process",
+          "observed": 21.16015625,
+          "unit": "MiB",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Process-only RSS after complete archive indexing."
+        },
+        {
+          "name": "peak_rss_mib",
+          "workload": "isolated conversation case process",
+          "observed": 27.4296875,
+          "unit": "MiB",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Process-only VmHWM across recent and complete archive discovery."
+        }
+      ],
+      "risks": [
+        "External fixtures model validated metadata formats but not arbitrary provider version drift.",
+        "Filesystem cache warmth materially affects archive inventory time."
+      ]
+    },
+    {
+      "case": "concurrency",
+      "metrics": [
+        {
+          "name": "status_max_concurrent",
+          "workload": "32 rapid refreshes in one Git workspace",
+          "observed": 1.0,
+          "unit": "commands",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "3 total git status commands; 0 overlap observations."
+        },
+        {
+          "name": "status_command_count",
+          "workload": "32 rapid refreshes in one Git workspace",
+          "observed": 3.0,
+          "unit": "commands",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Coalescing may schedule a final latest-generation command after the active one."
+        },
+        {
+          "name": "status_surviving_children",
+          "workload": "post-refresh cleanup",
+          "observed": 0.0,
+          "unit": "count",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Every PID observed by the synthetic git executable is checked in /proc."
+        },
+        {
+          "name": "status_worker_completions",
+          "workload": "coalesced refresh scheduler",
+          "observed": 5.0,
+          "unit": "count",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "4 redraws while applying completed generations."
+        },
+        {
+          "name": "surviving_workers",
+          "workload": "post-workload cleanup",
+          "observed": 0.0,
+          "unit": "count",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Observed after explicit worker shutdown and subprocess wait."
+        },
+        {
+          "name": "surviving_children",
+          "workload": "post-workload cleanup",
+          "observed": 0.0,
+          "unit": "count",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Observed after explicit worker shutdown and subprocess wait."
+        }
+      ],
+      "risks": [
+        "The synthetic git executable isolates scheduler concurrency from real Git latency."
+      ]
+    },
+    {
+      "case": "rss-exclusion",
+      "metrics": [
+        {
+          "name": "rss_exclusion_parent_delta_mib",
+          "workload": "64 MiB direct child allocation",
+          "observed": 0.3359375,
+          "unit": "MiB",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Parent VmRSS delta while the child has faulted 64 MiB of private pages."
+        },
+        {
+          "name": "rss_exclusion_surviving_children",
+          "workload": "post-helper cleanup",
+          "observed": 0.0,
+          "unit": "count",
+          "warmup_samples": 0,
+          "samples": 1,
+          "p50": null,
+          "p95": null,
+          "note": "Helper is killed and waited before the cleanup snapshot."
+        }
+      ],
+      "risks": []
+    }
+  ],
+  "verdicts": [
+    {
+      "metric": "first_frame_p95_ms",
+      "observed": 0.093,
+      "limit": 100.0,
+      "unit": "ms",
+      "comparator": "<=",
+      "passed": true
+    },
+    {
+      "metric": "navigation_p95_ms",
+      "observed": 0.016,
+      "limit": 50.0,
+      "unit": "ms",
+      "comparator": "<=",
+      "passed": true
+    },
+    {
+      "metric": "idle_cpu_percent",
+      "observed": 0.0,
+      "limit": 1.0,
+      "unit": "%",
+      "comparator": "<=",
+      "passed": true
+    },
+    {
+      "metric": "peak_rss_mib",
+      "observed": 27.4296875,
+      "limit": 50.0,
+      "unit": "MiB",
+      "comparator": "<=",
+      "passed": true
+    },
+    {
+      "metric": "steady_rss_mib",
+      "observed": 21.16015625,
+      "limit": 50.0,
+      "unit": "MiB",
+      "comparator": "<=",
+      "passed": true
+    },
+    {
+      "metric": "status_max_concurrent",
+      "observed": 1.0,
+      "limit": 1.0,
+      "unit": "commands",
+      "comparator": "<=",
+      "passed": true
+    },
+    {
+      "metric": "status_surviving_children",
+      "observed": 0.0,
+      "limit": 0.0,
+      "unit": "count",
+      "comparator": "<=",
+      "passed": true
+    },
+    {
+      "metric": "surviving_workers",
+      "observed": 0.0,
+      "limit": 0.0,
+      "unit": "count",
+      "comparator": "<=",
+      "passed": true
+    },
+    {
+      "metric": "surviving_children",
+      "observed": 0.0,
+      "limit": 0.0,
+      "unit": "count",
+      "comparator": "<=",
+      "passed": true
+    },
+    {
+      "metric": "filesystem_surviving_children",
+      "observed": 0.0,
+      "limit": 0.0,
+      "unit": "count",
+      "comparator": "<=",
+      "passed": true
+    },
+    {
+      "metric": "rss_exclusion_parent_delta_mib",
+      "observed": 0.3359375,
+      "limit": 8.0,
+      "unit": "MiB",
+      "comparator": "<=",
+      "passed": true
+    },
+    {
+      "metric": "rss_exclusion_surviving_children",
+      "observed": 0.0,
+      "limit": 0.0,
+      "unit": "count",
+      "comparator": "<=",
+      "passed": true
+    }
+  ],
+  "failures": [],
+  "overall_pass": true,
+  "residual_risks": [
+    "TestBackend excludes terminal driver and multiplexer transport latency.",
+    "Idle sampling uses Linux scheduler ticks, whose resolution is CLK_TCK-bound.",
+    "Synthetic repositories do not model slow disks, network filesystems, or huge Git indexes.",
+    "External fixtures model validated metadata formats but not arbitrary provider version drift.",
+    "Filesystem cache warmth materially affects archive inventory time.",
+    "The synthetic git executable isolates scheduler concurrency from real Git latency.",
+    "Single-machine synthetic baselines do not characterize all user hardware.",
+    "OS page cache, CPU frequency scaling, and unrelated host load remain measurable noise.",
+    "No real transcript content is used; only fixture-validated synthetic metadata shapes are covered."
+  ]
+}

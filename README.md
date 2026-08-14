@@ -218,6 +218,8 @@ is not an implementation backlog.
 
 - [Herdr plugins](https://herdr.dev/docs/plugins/)
 - [Herdr socket API](https://herdr.dev/docs/socket-api/)
+- [V1 performance measurement](docs/performance.md) for reproducible budgets,
+  synthetic workloads, retained baselines, and residual risks.
 - [herdr-beads](https://github.com/miiraheart/herdr-beads) for the docked-pane
   integration pattern
 - [Jujutsu CLI reference](https://docs.jj-vcs.dev/latest/cli-reference/)
