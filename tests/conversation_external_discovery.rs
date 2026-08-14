@@ -7,10 +7,12 @@ use std::sync::atomic::AtomicBool;
 use herdr_context::conversations::discovery::discover_conversations;
 use herdr_context::conversations::sources::{
     ClaudeCodeSource, CodexCliSource, ConversationSource, ConversationSourceErrorKind,
-    DiscoveryLimit, KnownStoreRoots, MetadataBudget, OmpSource, PiSource, SourceRegistry,
+    DiscoveryLimit, KnownStoreRoots, MetadataBudget, OmpSource, OpenCodeSource, PiSource,
+    SourceRegistry,
 };
 use herdr_context::conversations::{ProvenanceKind, ResumeCapability};
 use herdr_context::project::ProjectIdentity;
+use rusqlite::Connection;
 use tempfile::TempDir;
 
 const FIXTURE_ROOT: &str = "tests/fixtures/conversations";
@@ -33,6 +35,25 @@ fn fixture_text(relative: &str, project: &ProjectIdentity) -> String {
     fs::read_to_string(fixture(relative))
         .expect("fixture")
         .replace("/workspace/project", root)
+}
+fn install_opencode_fixture(home: &Path, project: &ProjectIdentity) {
+    let destination = home.join(".local/share/opencode/opencode.db");
+    fs::create_dir_all(destination.parent().expect("fixture parent")).expect("store");
+    fs::copy(fixture("opencode/opencode.db"), &destination).expect("installed OpenCode fixture");
+    let root = project.root().to_str().expect("UTF-8 test project path");
+    let connection = Connection::open(&destination).expect("OpenCode fixture");
+    connection
+        .execute("UPDATE project SET worktree = ?1", [root])
+        .expect("OpenCode worktree");
+    connection
+        .execute("UPDATE project_directory SET directory = ?1", [root])
+        .expect("OpenCode project directory");
+    connection
+        .execute("UPDATE session SET directory = ?1", [root])
+        .expect("OpenCode session directory");
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("OpenCode fixture checkpoint");
 }
 
 fn claude_directory(project: &ProjectIdentity) -> String {
@@ -156,6 +177,7 @@ fn install_valid_fixtures(home: &Path, project: &ProjectIdentity) {
         fs::create_dir_all(destination.parent().expect("fixture parent")).expect("store");
         fs::write(destination, fixture_text(relative, project)).expect("installed fixture");
     }
+    install_opencode_fixture(home, project);
 }
 
 fn discover_one(
@@ -189,7 +211,7 @@ fn discover_one(
 }
 
 #[test]
-fn registers_exactly_the_four_fixture_backed_external_adapters() {
+fn registers_exactly_the_five_fixture_backed_external_adapters() {
     let (_project_dir, project) = project();
     let home = TempDir::new().expect("home");
     install_valid_fixtures(home.path(), &project);
@@ -201,7 +223,7 @@ fn registers_exactly_the_four_fixture_backed_external_adapters() {
         .iter()
         .map(|source| source.source_id().as_str())
         .collect::<Vec<_>>();
-    assert_eq!(ids, ["claude-code", "codex-cli", "omp", "pi"]);
+    assert_eq!(ids, ["claude-code", "codex-cli", "omp", "opencode", "pi"]);
 
     let discovery = discover_conversations(
         &registry,
@@ -211,20 +233,22 @@ fn registers_exactly_the_four_fixture_backed_external_adapters() {
         MetadataBudget::new(512 * 1024).expect("non-zero budget"),
     );
     assert!(discovery.errors().is_empty(), "{:?}", discovery.errors());
-    assert_eq!(discovery.conversations().len(), 4);
+    assert_eq!(discovery.conversations().len(), 5);
     assert_eq!(
         discovery
             .conversations()
             .iter()
             .map(|conversation| conversation.tool().as_str())
             .collect::<Vec<_>>(),
-        ["omp", "pi", "claude-code", "codex-cli"]
+        ["omp", "opencode", "pi", "claude-code", "codex-cli"]
     );
     for conversation in discovery.conversations() {
-        if conversation.tool().as_str() == "omp" {
-            assert_eq!(conversation.title(), Some("Synthetic OMP session"));
-        } else {
-            assert!(conversation.title().is_none());
+        match conversation.tool().as_str() {
+            "omp" => assert_eq!(conversation.title(), Some("Synthetic OMP session")),
+            "opencode" => {
+                assert_eq!(conversation.title(), Some("Sanitized OpenCode fixture"));
+            }
+            _ => assert!(conversation.title().is_none()),
         }
         assert!(matches!(
             conversation.resume_capability(),
@@ -528,6 +552,14 @@ fn adapters_extract_native_identity_time_and_canonical_cwd_evidence() {
             "omp",
         ),
         (
+            Box::new(
+                OpenCodeSource::new(project.clone(), roots.opencode().to_path_buf())
+                    .expect("OpenCode source"),
+            ),
+            "ses_ffffffffffffffffffffffffff",
+            "opencode",
+        ),
+        (
             Box::new(PiSource::new(project.clone(), roots.pi().to_path_buf()).expect("Pi source")),
             "019b7ca9-8c88-7000-8003-000000000003",
             "pi",
@@ -550,6 +582,7 @@ fn adapters_extract_native_identity_time_and_canonical_cwd_evidence() {
 fn partial_final_records_are_ignored_but_complete_prefixes_are_indexed() {
     let (_project_dir, project) = project();
     let home = TempDir::new().expect("home");
+    install_opencode_fixture(home.path(), &project);
     let roots = KnownStoreRoots::under_home(home.path());
     let cases = [
         (
@@ -632,8 +665,8 @@ fn conflicting_cwd_and_unverified_versions_are_adapter_scoped_errors() {
 
     assert_eq!(
         discovery.conversations().len(),
-        2,
-        "OMP and Pi remain healthy"
+        3,
+        "OMP, OpenCode, and Pi remain healthy"
     );
     assert_eq!(
         discovery
@@ -641,7 +674,7 @@ fn conflicting_cwd_and_unverified_versions_are_adapter_scoped_errors() {
             .iter()
             .map(|conversation| conversation.tool().as_str())
             .collect::<Vec<_>>(),
-        ["omp", "pi"]
+        ["omp", "opencode", "pi"]
     );
     assert!(discovery.errors().iter().any(|error| {
         error.source_id().as_str() == "claude-code"
@@ -695,7 +728,11 @@ fn native_filename_hints_must_match_the_verified_exact_grammar() {
         DiscoveryLimit::new(8).expect("limit"),
         MetadataBudget::new(512 * 1024).expect("budget"),
     );
-    assert_eq!(discovery.conversations().len(), 1, "Claude remains healthy");
+    assert_eq!(
+        discovery.conversations().len(),
+        2,
+        "Claude and OpenCode remain healthy"
+    );
     for source_id in ["codex-cli", "omp", "pi"] {
         assert!(discovery.errors().iter().any(|error| {
             error.source_id().as_str() == source_id

@@ -151,6 +151,7 @@ pub struct Conversation {
     project_identity: ProjectIdentity,
     title: Option<String>,
     created_at: Option<SystemTime>,
+    archived_at: Option<SystemTime>,
     updated_at: SystemTime,
     state: ConversationState,
     provenance: Vec<ConversationProvenance>,
@@ -165,6 +166,7 @@ impl Conversation {
         project_identity: ProjectIdentity,
         title: Option<String>,
         created_at: Option<SystemTime>,
+        archived_at: Option<SystemTime>,
         updated_at: SystemTime,
         state: ConversationState,
         provenance: Vec<ConversationProvenance>,
@@ -180,6 +182,7 @@ impl Conversation {
             project_identity,
             title,
             created_at,
+            archived_at,
             updated_at,
             state,
             provenance,
@@ -210,6 +213,10 @@ impl Conversation {
     #[must_use]
     pub const fn created_at(&self) -> Option<SystemTime> {
         self.created_at
+    }
+    #[must_use]
+    pub const fn archived_at(&self) -> Option<SystemTime> {
+        self.archived_at
     }
 
     #[must_use]

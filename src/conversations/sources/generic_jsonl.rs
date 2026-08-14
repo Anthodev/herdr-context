@@ -583,6 +583,7 @@ impl ConversationSource for GenericJsonlSource {
             candidate.project_identity().clone(),
             None,
             Some(summary.created_at),
+            None,
             summary.updated_at,
             ConversationState::Unknown,
             vec![provenance],

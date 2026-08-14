@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
@@ -396,16 +397,18 @@ fn assert_filename_contains_header_identity(case: &FixtureCase, relative: &str, 
 }
 
 #[test]
-fn inventory_reproduces_exactly_the_four_observed_store_layouts()
+fn inventory_reproduces_exactly_the_five_observed_store_layouts()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_ROOT);
     let source_names: BTreeSet<_> = fs::read_dir(&root)?
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
         .collect::<Result<_, _>>()?;
-    assert_eq!(
-        source_names,
-        CASES.iter().map(|case| case.source.to_owned()).collect()
-    );
+    let mut expected_sources = CASES
+        .iter()
+        .map(|case| case.source.to_owned())
+        .collect::<BTreeSet<_>>();
+    expected_sources.insert("opencode".to_owned());
+    assert_eq!(source_names, expected_sources);
 
     for case in CASES {
         let source_root = root.join(case.source);
@@ -427,6 +430,10 @@ fn inventory_reproduces_exactly_the_four_observed_store_layouts()
         let partial_header = parse_partial_header(case);
         assert_filename_contains_header_identity(case, case.partial, &partial_header);
     }
+    let opencode_root = root.join("opencode");
+    let mut opencode_paths = BTreeSet::new();
+    collect_files(&opencode_root, &opencode_root, &mut opencode_paths);
+    assert_eq!(opencode_paths, [PathBuf::from("opencode.db")].into());
     Ok(())
 }
 
@@ -580,6 +587,68 @@ fn omp_fixture_matches_the_observed_title_slot_and_schema_v3_variant() {
         assert_lower_hex_entry_id(field(record, "/id"));
         assert_rfc3339_timestamp(field(record, "/timestamp"));
     }
+}
+#[test]
+fn opencode_fixture_is_schema_bounded_and_contains_only_synthetic_metadata()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = fixture("opencode/opencode.db");
+    let bytes = fs::read(&path)?;
+    assert_eq!(&bytes[..16], b"SQLite format 3\0");
+    assert_eq!((bytes[18], bytes[19]), (2, 2));
+    let uri = format!("file:{}?immutable=1&mode=ro", path.display());
+    let connection = Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )?;
+
+    let tables = connection
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    assert_eq!(
+        tables,
+        ["migration", "project", "project_directory", "session"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
+    let migrations: i64 =
+        connection.query_row("SELECT count(*) FROM migration", [], |row| row.get(0))?;
+    assert_eq!(migrations, 38);
+    let session: (String, String, String, String) = connection.query_row(
+        "SELECT id, directory, title, version FROM session",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    assert_eq!(
+        session,
+        (
+            "ses_ffffffffffffffffffffffffff".to_owned(),
+            "/workspace/project".to_owned(),
+            "Sanitized OpenCode fixture".to_owned(),
+            "1.18.18".to_owned(),
+        )
+    );
+    let lowercase = fs::read(&path)?
+        .into_iter()
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    for forbidden in [
+        b"/home/".as_slice(),
+        b"anthodev".as_slice(),
+        b"authorization:".as_slice(),
+        b"bearer ".as_slice(),
+        b"api_key".as_slice(),
+        b"begin private key".as_slice(),
+    ] {
+        assert!(
+            !lowercase
+                .windows(forbidden.len())
+                .any(|window| window == forbidden),
+            "OpenCode fixture contains forbidden private material marker"
+        );
+    }
+    Ok(())
 }
 
 #[test]

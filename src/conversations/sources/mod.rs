@@ -4,6 +4,7 @@ mod codex_cli;
 mod generic_jsonl;
 mod known_stores;
 mod omp;
+mod opencode;
 mod pi;
 mod project_local;
 
@@ -12,6 +13,7 @@ pub use codex_cli::CodexCliSource;
 pub use generic_jsonl::GenericJsonlSource;
 pub use known_stores::KnownStoreRoots;
 pub use omp::OmpSource;
+pub use opencode::OpenCodeSource;
 pub use pi::PiSource;
 pub use project_local::{ProjectLocalLocation, ProjectLocalLocationError};
 
@@ -38,6 +40,10 @@ impl KnownStoreRoots {
             Box::new(CodexCliSource::new(
                 project.clone(),
                 self.codex_cli().to_path_buf(),
+            )?),
+            Box::new(OpenCodeSource::new(
+                project.clone(),
+                self.opencode().to_path_buf(),
             )?),
             Box::new(OmpSource::new(project.clone(), self.omp().to_path_buf())?),
             Box::new(PiSource::new(project, self.pi().to_path_buf())?),

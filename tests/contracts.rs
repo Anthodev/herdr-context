@@ -147,6 +147,7 @@ impl ConversationSource for FakeSource {
             candidate.project_identity().clone(),
             Some("Contract test".to_owned()),
             None,
+            None,
             SystemTime::UNIX_EPOCH,
             ConversationState::Archived,
             vec![provenance],

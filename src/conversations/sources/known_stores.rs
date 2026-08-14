@@ -43,6 +43,7 @@ pub struct KnownStoreRoots {
     codex_cli: PathBuf,
     pi: PathBuf,
     omp: PathBuf,
+    opencode: PathBuf,
 }
 
 impl KnownStoreRoots {
@@ -54,6 +55,7 @@ impl KnownStoreRoots {
             codex_cli: home.join(".codex/sessions"),
             pi: home.join(".pi/agent/sessions"),
             omp: home.join(".omp/agent/sessions"),
+            opencode: home.join(".local/share/opencode/opencode.db"),
         }
     }
 
@@ -63,12 +65,14 @@ impl KnownStoreRoots {
         codex_cli: impl Into<PathBuf>,
         pi: impl Into<PathBuf>,
         omp: impl Into<PathBuf>,
+        opencode: impl Into<PathBuf>,
     ) -> Self {
         Self {
             claude_code: claude_code.into(),
             codex_cli: codex_cli.into(),
             pi: pi.into(),
             omp: omp.into(),
+            opencode: opencode.into(),
         }
     }
 
@@ -85,6 +89,10 @@ impl KnownStoreRoots {
     #[must_use]
     pub fn omp(&self) -> &Path {
         &self.omp
+    }
+    #[must_use]
+    pub fn opencode(&self) -> &Path {
+        &self.opencode
     }
 
     #[must_use]
@@ -931,6 +939,7 @@ impl<F: KnownFormat> ConversationSource for KnownJsonlSource<F> {
             candidate.project_identity().clone(),
             metadata.title.clone(),
             Some(metadata.created_at),
+            None,
             metadata.updated_at,
             ConversationState::Unknown,
             vec![ConversationProvenance::new(
@@ -1217,11 +1226,10 @@ pub(super) struct KnownStore {
 }
 
 impl KnownStore {
-    const fn new(root: PathBuf) -> Self {
+    pub(super) const fn new(root: PathBuf) -> Self {
         Self { root }
     }
-
-    fn probe(&self) -> io::Result<bool> {
+    pub(super) fn probe(&self) -> io::Result<bool> {
         match std::fs::symlink_metadata(&self.root) {
             Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
             Ok(_) => Err(io::Error::new(
@@ -1231,6 +1239,21 @@ impl KnownStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error),
         }
+    }
+    pub(super) fn open_root_directory(&self) -> io::Result<Dir> {
+        self.open_directory(Path::new(""))
+    }
+
+    pub(super) fn open_file_in(directory: &Dir, name: &OsStr) -> io::Result<(File, Metadata)> {
+        let file = open_file_nofollow(directory, name)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "known conversation candidate is not a regular file",
+            ));
+        }
+        Ok((file, metadata))
     }
 
     pub(super) fn list_directory(&self, relative: &Path) -> io::Result<Vec<(OsString, EntryKind)>> {
@@ -1265,22 +1288,13 @@ impl KnownStore {
         let (_, metadata) = self.open_file(relative)?;
         FileState::from_metadata(&metadata)
     }
-
-    fn open_file(&self, relative: &Path) -> io::Result<(File, Metadata)> {
+    pub(super) fn open_file(&self, relative: &Path) -> io::Result<(File, Metadata)> {
         let parent = relative.parent().unwrap_or_else(|| Path::new(""));
         let name = relative
             .file_name()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing file name"))?;
         let directory = self.open_directory(parent)?;
-        let file = open_file_nofollow(&directory, name)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "known conversation candidate is not a regular file",
-            ));
-        }
-        Ok((file, metadata))
+        Self::open_file_in(&directory, name)
     }
 
     fn open_directory(&self, relative: &Path) -> io::Result<Dir> {
