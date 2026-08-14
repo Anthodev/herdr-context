@@ -25,6 +25,8 @@ pub mod host;
 pub mod input;
 pub mod intent;
 pub mod model;
+#[cfg(feature = "perf-harness")]
+pub mod perf;
 pub mod project;
 pub mod runtime;
 pub mod ui;
