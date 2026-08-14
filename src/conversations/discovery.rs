@@ -1,6 +1,7 @@
 //! Deterministic orchestration across registered conversation sources.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::conversations::Conversation;
 use crate::conversations::sources::{
@@ -73,7 +74,10 @@ pub fn discover_sources(
 pub struct ConversationDiscovery {
     conversations: Vec<Conversation>,
     watermarks: HashMap<SourceId, SourceWatermark>,
+    removals: Vec<crate::conversations::sources::ConversationRemoval>,
+    purged_sources: Vec<SourceId>,
     errors: Vec<ConversationSourceError>,
+    has_more: bool,
 }
 
 impl ConversationDiscovery {
@@ -86,10 +90,22 @@ impl ConversationDiscovery {
     pub const fn watermarks(&self) -> &HashMap<SourceId, SourceWatermark> {
         &self.watermarks
     }
+    #[must_use]
+    pub fn removals(&self) -> &[crate::conversations::sources::ConversationRemoval] {
+        &self.removals
+    }
+    #[must_use]
+    pub fn purged_sources(&self) -> &[SourceId] {
+        &self.purged_sources
+    }
 
     #[must_use]
     pub fn errors(&self) -> &[ConversationSourceError] {
         &self.errors
+    }
+    #[must_use]
+    pub const fn has_more(&self) -> bool {
+        self.has_more
     }
 
     pub fn into_conversations(self) -> Vec<Conversation> {
@@ -109,15 +125,41 @@ pub fn discover_conversations(
     limit: DiscoveryLimit,
     metadata_budget: MetadataBudget,
 ) -> ConversationDiscovery {
+    discover_conversations_cancellable(
+        registry,
+        project,
+        watermarks,
+        limit,
+        metadata_budget,
+        &AtomicBool::new(false),
+    )
+}
+
+#[must_use]
+pub fn discover_conversations_cancellable(
+    registry: &SourceRegistry,
+    project: &ProjectIdentity,
+    watermarks: &HashMap<SourceId, SourceWatermark>,
+    limit: DiscoveryLimit,
+    metadata_budget: MetadataBudget,
+    cancelled: &AtomicBool,
+) -> ConversationDiscovery {
     let mut conversations = Vec::new();
     let mut next_watermarks = watermarks.clone();
     let mut errors = Vec::new();
+    let mut removals = Vec::new();
+    let mut purged_sources = Vec::new();
+    let mut has_more = false;
 
     for source in registry.iter() {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
         match source.probe() {
             Ok(StorageProbe::Available) => {}
             Ok(StorageProbe::Unavailable { .. }) => {
                 next_watermarks.remove(source.source_id());
+                purged_sources.push(source.source_id().clone());
                 continue;
             }
             Err(error) => {
@@ -126,9 +168,21 @@ pub fn discover_conversations(
             }
         }
 
-        let batch = match source.discover(project, watermarks.get(source.source_id()), limit) {
+        let batch = match source.discover_cancellable(
+            project,
+            watermarks.get(source.source_id()),
+            limit,
+            cancelled,
+        ) {
             Ok(batch) => batch,
             Err(error) => {
+                if error.kind() == ConversationSourceErrorKind::InvalidData
+                    && watermarks.contains_key(source.source_id())
+                {
+                    next_watermarks.remove(source.source_id());
+                    purged_sources.push(source.source_id().clone());
+                    has_more = true;
+                }
                 errors.push(error);
                 continue;
             }
@@ -136,6 +190,10 @@ pub fn discover_conversations(
         errors.extend(batch.errors().iter().cloned());
         let mut candidate_failed = false;
         for candidate in batch.candidates() {
+            if cancelled.load(Ordering::Relaxed) {
+                candidate_failed = true;
+                break;
+            }
             let conversation = match source.extract_metadata(candidate, metadata_budget) {
                 Ok(conversation) => conversation,
                 Err(error) => {
@@ -167,6 +225,8 @@ pub fn discover_conversations(
             }
         }
         if !candidate_failed {
+            removals.extend(batch.removals().iter().cloned());
+            has_more |= batch.has_more();
             if let Some(watermark) = batch.next_watermark() {
                 next_watermarks.insert(source.source_id().clone(), watermark.clone());
             } else {
@@ -192,6 +252,9 @@ pub fn discover_conversations(
     ConversationDiscovery {
         conversations,
         watermarks: next_watermarks,
+        removals,
+        purged_sources,
         errors,
+        has_more,
     }
 }

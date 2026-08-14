@@ -61,17 +61,21 @@ require a dedicated adapter and cannot be inferred safely.
 - at most one dock instance is open per tab;
 - one shortcut toggles between open, focus, and close;
 - each view preserves its selection and scroll position across tab switches;
+  Conversations also preserves collapsed provider groups across refreshes;
 - the project context is captured from the originating terminal before the
   plugin receives focus.
 
 ### Controls
 
 - `Tab` / `Shift+Tab` or `1` / `2`: switch views without restarting the dock;
-- arrow keys or `h` / `j` / `k` / `l`: navigate the Files tree;
+- arrow keys or `h` / `j` / `k` / `l`: navigate the Files tree or Conversation
+  provider groups;
 - `Home` / `End`: select the first or last visible row;
-- `Enter` / `Space`: expand or collapse the selected directory;
+- `Enter` / `Space`: expand or collapse the selected directory or provider;
 - `r`: refresh the active view;
-- left click selects, right click toggles a Files row, and the mouse wheel navigates;
+- left click selects and right click toggles a Files row or Conversation
+  provider; clicking a Conversation disclosure marker also toggles its group,
+  and the mouse wheel navigates;
 - `q`, `Esc`, or `Ctrl+C`: close the TUI and restore the terminal.
 
 ### Project-local generic conversations
@@ -85,6 +89,32 @@ RFC 3339 `timestamp`, a `role` (`user`, `assistant`, `system`, or `tool`), and a
 string `message`. A `.json` file contains one record with the same schema.
 Discovery is read-only and bounded; message bodies are validated but never
 returned to the UI or diagnostics.
+Conversations are grouped alphabetically by provider, with sessions ordered
+most-recent-first inside each expanded group. Provider groups can be collapsed
+without loading or exposing transcript content.
+
+### Verified external conversations
+
+When Herdr provides `HERDR_PLUGIN_STATE_DIR`, the Conversations worker also
+checks exactly the fixture-backed Claude Code `2.1.232`, Codex CLI `0.147.0`,
+and Pi `0.84.1` stores described in
+[`docs/conversation-source-formats.md`](docs/conversation-source-formats.md).
+Encoded directories, date paths, and filenames are only hints: native session
+IDs, timestamps, and canonical `cwd` evidence must agree before metadata is
+accepted.
+
+Discovery runs in bounded recent-first pages on the low-priority worker. Its
+disposable cache below `HERDR_PLUGIN_STATE_DIR/conversations/` uses private
+permissions and atomic generation replacement. It contains only display,
+provenance, resume, fingerprint, and source-watermark metadata—never transcript
+content or opaque provider payloads.
+Large JSONL sessions advance through complete-record cursors instead of being
+loaded or rejected as one file; deleted or replaced sessions are removed after
+a conclusive source refresh. Incomplete bounded inventories preserve prior
+metadata, and source-scoped warnings remain visible beside healthy adapters.
+Platforms where owner-only cache permissions cannot be enforced fail closed
+instead of persisting external metadata.
+
 
 ## Design principles
 

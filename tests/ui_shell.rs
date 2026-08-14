@@ -1,13 +1,21 @@
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use std::time::{Duration, UNIX_EPOCH};
+
+use herdr_context::conversations::{
+    Conversation, ConversationProvenance, ConversationState, ProvenanceKind, ResumeCapability,
+    SessionReference, SourceId, ToolIdentity,
+};
 use herdr_context::host::LaunchContext;
 use herdr_context::input::{InputMode, map_event};
 use herdr_context::intent::{Intent, View};
 use herdr_context::model::{AppModel, LoadingState};
+use herdr_context::project::ProjectIdentity;
 use herdr_context::ui::{render_shell, sanitize_terminal_text};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use tempfile::TempDir;
 
 fn context() -> LaunchContext {
     LaunchContext::from_vars([(
@@ -21,6 +29,57 @@ fn line(buffer: &Buffer, y: u16) -> String {
     (buffer.area.x..buffer.area.right())
         .map(|x| buffer[(x, y)].symbol())
         .collect::<String>()
+}
+
+fn conversation(
+    project: &ProjectIdentity,
+    tool: &str,
+    session_id: &str,
+    updated_seconds: u64,
+) -> Conversation {
+    Conversation::new(
+        ToolIdentity::new(tool).expect("tool"),
+        SessionReference::new(tool, session_id).expect("session"),
+        project.clone(),
+        None,
+        Some(UNIX_EPOCH + Duration::from_secs(updated_seconds)),
+        UNIX_EPOCH + Duration::from_secs(updated_seconds),
+        ConversationState::Unknown,
+        vec![ConversationProvenance::new(
+            SourceId::new(tool).expect("source"),
+            ProvenanceKind::ExternalLocal,
+            None,
+        )],
+        ResumeCapability::Unsupported,
+    )
+    .expect("conversation")
+}
+
+#[test]
+fn conversations_are_grouped_by_provider_with_expandable_headers() {
+    let project_dir = TempDir::new().expect("project");
+    let project = ProjectIdentity::from_canonical_root(project_dir.path().to_path_buf())
+        .expect("project identity");
+    let mut model = AppModel::new(context());
+    model.set_active_view(View::Conversations);
+    model.conversations_mut().replace_items(
+        vec![
+            conversation(&project, "pi", "pi-session", 30),
+            conversation(&project, "codex-cli", "codex-new", 20),
+            conversation(&project, "codex-cli", "codex-old", 10),
+        ],
+        1,
+    );
+    let area = Rect::new(0, 0, 50, 7);
+    let mut buffer = Buffer::empty(area);
+
+    render_shell(&mut model, area, &mut buffer);
+
+    assert!(line(&buffer, 1).starts_with("▾ codex-cli (2)"));
+    assert!(line(&buffer, 2).starts_with("  codex-new"));
+    assert!(line(&buffer, 3).starts_with("  codex-old"));
+    assert!(line(&buffer, 4).starts_with("▾ pi (1)"));
+    assert!(line(&buffer, 5).starts_with("  pi-session"));
 }
 
 #[test]
@@ -40,6 +99,15 @@ fn tabs_and_compact_states_render_in_wide_and_narrow_areas() {
     let mut narrow_buffer = Buffer::empty(narrow);
     render_shell(&mut model, narrow, &mut narrow_buffer);
     assert!(line(&narrow_buffer, 1).contains("No conv"));
+
+    model.conversations_mut().set_source_errors(vec![
+        "UnsupportedFormat: conversation source codex-cli: malformed record".to_owned(),
+        "PermissionDenied: conversation source pi: unreadable store".to_owned(),
+    ]);
+    let mut warning_buffer = Buffer::empty(wide);
+    render_shell(&mut model, wide, &mut warning_buffer);
+    assert!(line(&warning_buffer, 1).contains("Warning"));
+    assert!(line(&warning_buffer, 1).contains("(+1 more)"));
 }
 
 #[test]

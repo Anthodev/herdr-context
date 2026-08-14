@@ -2,19 +2,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 #[cfg(unix)]
 use cap_std::fs::MetadataExt;
 use cap_std::fs::{File, Metadata};
-use serde::Deserialize;
 use serde::de::{self, Visitor};
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::project_local::{ProjectLocalFile, ProjectLocalFiles};
 use super::{
-    ConversationCandidate, ConversationSource, ConversationSourceError,
+    ConversationCandidate, ConversationRemoval, ConversationSource, ConversationSourceError,
     ConversationSourceErrorKind, DiscoveryBatch, DiscoveryLimit, MetadataBudget,
     ProjectAssociationEvidence, ProjectEvidenceKind, ProjectLocalLocation, SourceId,
     SourceWatermark, StorageProbe,
@@ -31,6 +32,7 @@ const MAX_FILE_BYTES: u64 = 256 * 1024;
 const MAX_RECORD_BYTES: usize = 64 * 1024;
 const MAX_RECORDS: usize = 256;
 const MAX_SESSION_ID_BYTES: usize = 256;
+const MAX_WATERMARK_ENTRIES: usize = 256;
 const MAX_WATERMARK_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -313,6 +315,16 @@ impl ConversationSource for GenericJsonlSource {
         after: Option<&SourceWatermark>,
         limit: DiscoveryLimit,
     ) -> Result<DiscoveryBatch, ConversationSourceError> {
+        self.discover_raw_cancellable(project, after, limit, &AtomicBool::new(false))
+    }
+
+    fn discover_raw_cancellable(
+        &self,
+        project: &ProjectIdentity,
+        after: Option<&SourceWatermark>,
+        limit: DiscoveryLimit,
+        cancelled: &AtomicBool,
+    ) -> Result<DiscoveryBatch, ConversationSourceError> {
         if project != &self.project {
             return Err(ConversationSourceError::new(
                 self.id.clone(),
@@ -322,13 +334,34 @@ impl ConversationSource for GenericJsonlSource {
         }
         let previous = decode_watermark(self, after)?;
         let listing = self.files.list_files(&self.id, is_json_file);
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(ConversationSourceError::new(
+                self.id.clone(),
+                ConversationSourceErrorKind::Io,
+                "generic conversation discovery was cancelled",
+            ));
+        }
         let mut errors = listing.errors;
+        let mut inventory_incomplete = errors.iter().any(|error| {
+            matches!(
+                error.kind(),
+                ConversationSourceErrorKind::Io | ConversationSourceErrorKind::PermissionDenied
+            )
+        });
         let mut candidate_slots = Vec::new();
         let mut sessions = BTreeMap::<String, SessionOccurrence>::new();
         let mut next = BTreeMap::new();
         let mut current_keys = BTreeSet::new();
+        let mut has_more = false;
 
         for file in listing.files {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(ConversationSourceError::new(
+                    self.id.clone(),
+                    ConversationSourceErrorKind::Io,
+                    "generic conversation discovery was cancelled",
+                ));
+            }
             let key = watermark_key(file.relative_path());
             if !current_keys.insert(key.clone()) {
                 errors.push(self.error(
@@ -372,12 +405,19 @@ impl ConversationSource for GenericJsonlSource {
                     );
 
                     let fingerprint = snapshot_fingerprint(&summary, &state);
-                    let changed = previous.get(&key) != Some(&fingerprint);
+                    let watermark_entry = GenericWatermarkEntry {
+                        fingerprint: fingerprint.clone(),
+                        session_id: session_id.clone(),
+                    };
+                    let changed = previous
+                        .get(&key)
+                        .is_none_or(|entry| entry.fingerprint != fingerprint);
                     if !changed {
-                        next.insert(key, fingerprint);
+                        next.insert(key, watermark_entry);
                         continue;
                     }
                     if candidate_slots.iter().flatten().count() >= limit.get() {
+                        has_more = true;
                         if let Some(previous) = previous.get(&key) {
                             next.insert(key, previous.clone());
                         }
@@ -390,14 +430,14 @@ impl ConversationSource for GenericJsonlSource {
                         Some(file.absolute_path().to_path_buf()),
                         Some(state.len),
                         Some(state.modified),
-                        Some(fingerprint.clone()),
+                        Some(fingerprint),
                     ) {
                         Ok(candidate) => {
                             if let Some(occurrence) = sessions.get_mut(&session_id) {
                                 let index = candidate_slots.len();
                                 candidate_slots.push(Some(candidate));
                                 occurrence.candidate_slot = Some(index);
-                                next.insert(key, fingerprint);
+                                next.insert(key, watermark_entry);
                             } else {
                                 errors.push(self.error(
                                     ConversationSourceErrorKind::InvalidData,
@@ -410,6 +450,11 @@ impl ConversationSource for GenericJsonlSource {
                     }
                 }
                 Err(error) => {
+                    inventory_incomplete |= matches!(
+                        error.kind(),
+                        ConversationSourceErrorKind::Io
+                            | ConversationSourceErrorKind::PermissionDenied
+                    );
                     if let Some(previous) = previous.get(&key) {
                         next.insert(key, previous.clone());
                     }
@@ -417,7 +462,37 @@ impl ConversationSource for GenericJsonlSource {
                 }
             }
         }
-        next.retain(|key, _| current_keys.contains(key));
+        if inventory_incomplete {
+            for (key, entry) in &previous {
+                next.entry(key.clone()).or_insert_with(|| entry.clone());
+            }
+        }
+        if !inventory_incomplete {
+            next.retain(|key, _| current_keys.contains(key));
+        }
+        let mut removed_session_ids = BTreeSet::new();
+        for (key, previous_entry) in &previous {
+            if next
+                .get(key)
+                .is_none_or(|entry| entry.session_id != previous_entry.session_id)
+            {
+                removed_session_ids.insert(previous_entry.session_id.clone());
+            }
+        }
+        let removals = removed_session_ids
+            .into_iter()
+            .map(|session_id| {
+                SessionReference::new(TOOL_ID, session_id)
+                    .map(|reference| ConversationRemoval::new(self.id.clone(), reference))
+                    .map_err(|_| {
+                        ConversationSourceError::new(
+                            self.id.clone(),
+                            ConversationSourceErrorKind::InvalidData,
+                            "generic watermark contains an invalid session identifier",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let token = serde_json::to_string(&next).map_err(|_| {
             ConversationSourceError::new(
                 self.id.clone(),
@@ -434,7 +509,15 @@ impl ConversationSource for GenericJsonlSource {
         }
         let watermark = SourceWatermark::new(self.id.clone(), token)?;
         let candidates = candidate_slots.into_iter().flatten().collect();
-        DiscoveryBatch::new(&self.id, project, candidates, Some(watermark), errors)
+        DiscoveryBatch::new(
+            &self.id,
+            project,
+            candidates,
+            Some(watermark),
+            removals,
+            has_more,
+            errors,
+        )
     }
 
     fn extract_metadata_raw(
@@ -594,6 +677,12 @@ impl Visitor<'_> for MessageVisitor {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct GenericWatermarkEntry {
+    fingerprint: String,
+    session_id: String,
+}
+
 struct SessionOccurrence {
     key: String,
     path: PathBuf,
@@ -742,9 +831,16 @@ fn fnv1a(bytes: &[u8], seed: u64) -> u64 {
 fn decode_watermark(
     source: &GenericJsonlSource,
     after: Option<&SourceWatermark>,
-) -> Result<BTreeMap<String, String>, ConversationSourceError> {
+) -> Result<BTreeMap<String, GenericWatermarkEntry>, ConversationSourceError> {
     let Some(after) = after else {
         return Ok(BTreeMap::new());
+    };
+    let invalid = || {
+        ConversationSourceError::new(
+            source.id.clone(),
+            ConversationSourceErrorKind::InvalidData,
+            "generic source watermark is malformed",
+        )
     };
     if after.token().len() > MAX_WATERMARK_BYTES {
         return Err(ConversationSourceError::new(
@@ -753,11 +849,18 @@ fn decode_watermark(
             "generic source watermark exceeds the byte limit",
         ));
     }
-    serde_json::from_str(after.token()).map_err(|_| {
-        ConversationSourceError::new(
-            source.id.clone(),
-            ConversationSourceErrorKind::InvalidData,
-            "generic source watermark is malformed",
-        )
-    })
+    let entries = serde_json::from_str::<BTreeMap<String, GenericWatermarkEntry>>(after.token())
+        .map_err(|_| invalid())?;
+    if entries.len() > MAX_WATERMARK_ENTRIES
+        || entries.iter().any(|(key, entry)| {
+            key.len() != 32
+                || !key.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || entry.fingerprint.is_empty()
+                || entry.fingerprint.len() > 512
+                || validate_session_id(&entry.session_id).is_err()
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(entries)
 }

@@ -70,7 +70,15 @@ impl ConversationSource for FixtureSource {
                 Some("fixture-fingerprint".to_owned()),
             )?]
         };
-        DiscoveryBatch::new(&self.id, project, candidates, Some(watermark), Vec::new())
+        DiscoveryBatch::new(
+            &self.id,
+            project,
+            candidates,
+            Some(watermark),
+            Vec::new(),
+            false,
+            Vec::new(),
+        )
     }
 
     fn extract_metadata_raw(
