@@ -87,8 +87,9 @@ fn render_error(error: &str, area: Rect, buffer: &mut Buffer) {
 
 fn render_conversations_state(state: &mut ConversationsViewState, area: Rect, buffer: &mut Buffer) {
     state.reconcile_viewport(area);
-    let content = state.source_errors().first().map_or(area, |error| {
-        let remaining = state.source_errors().len().saturating_sub(1);
+    let errors = state.visible_errors();
+    let content = if let Some(error) = errors.first() {
+        let remaining = errors.len().saturating_sub(1);
         let count = if remaining > 0 {
             format!("(+{remaining} more) ")
         } else {
@@ -106,7 +107,21 @@ fn render_conversations_state(state: &mut ConversationsViewState, area: Rect, bu
             area.width,
             area.height.saturating_sub(1),
         )
-    });
+    } else if state.live_loading() {
+        render_message(
+            "Loading live sessions…",
+            Rect::new(area.x, area.y, area.width, 1),
+            buffer,
+        );
+        Rect::new(
+            area.x,
+            area.y.saturating_add(1),
+            area.width,
+            area.height.saturating_sub(1),
+        )
+    } else {
+        area
+    };
     if content.is_empty() {
         return;
     }

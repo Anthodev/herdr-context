@@ -140,6 +140,14 @@ impl FilesViewState {
     }
 }
 
+enum ConversationRowTarget {
+    Provider(String),
+    Session {
+        provider: String,
+        reference: SessionReference,
+    },
+}
+
 #[derive(Debug)]
 pub struct ConversationsViewState {
     items: Vec<Conversation>,
@@ -151,8 +159,13 @@ pub struct ConversationsViewState {
     filter: String,
     loading: LoadingState,
     source_errors: Vec<String>,
+    live_error: Option<String>,
+    visible_errors: Vec<String>,
+    live_loading: bool,
     requested_generation: u64,
     applied_generation: u64,
+    live_requested_generation: u64,
+    live_applied_generation: u64,
 }
 
 impl Default for ConversationsViewState {
@@ -167,8 +180,13 @@ impl Default for ConversationsViewState {
             filter: String::new(),
             loading: LoadingState::Loading,
             source_errors: Vec::new(),
+            live_error: None,
+            visible_errors: Vec::new(),
+            live_loading: false,
             requested_generation: 0,
             applied_generation: 0,
+            live_requested_generation: 0,
+            live_applied_generation: 0,
         }
     }
 }
@@ -183,6 +201,45 @@ impl ConversationsViewState {
         if generation < self.requested_generation {
             return false;
         }
+        self.applied_generation = generation;
+        self.loading = LoadingState::Ready;
+        self.replace_visible_items(items)
+    }
+
+    pub fn replace_live_items(&mut self, items: Vec<Conversation>, generation: u64) -> bool {
+        if generation < self.live_requested_generation {
+            return false;
+        }
+        self.live_applied_generation = generation;
+        self.live_loading = false;
+        self.replace_visible_items(items)
+    }
+
+    fn replace_visible_items(&mut self, items: Vec<Conversation>) -> bool {
+        let migrated_selection = self.selection.as_ref().and_then(|selection| {
+            if items
+                .iter()
+                .any(|item| item.session_reference() == selection)
+            {
+                return None;
+            }
+            let selected = self
+                .items
+                .iter()
+                .find(|item| item.session_reference() == selection)?;
+            let mut candidates = items.iter().filter(|candidate| {
+                selected
+                    .provenance()
+                    .iter()
+                    .filter(|provenance| provenance.path().is_some())
+                    .any(|provenance| candidate.provenance().contains(provenance))
+            });
+            let candidate = candidates.next()?;
+            candidates
+                .next()
+                .is_none()
+                .then(|| candidate.session_reference().clone())
+        });
         let providers = items
             .iter()
             .map(|conversation| conversation.tool().as_str().to_owned())
@@ -191,22 +248,26 @@ impl ConversationsViewState {
             .collect::<Vec<_>>();
         self.items = items;
         self.providers = providers;
-        if self
-            .selected_provider
-            .as_ref()
-            .is_none_or(|selected| !self.providers.contains(selected))
-        {
-            self.selected_provider = self.providers.first().cloned();
-        }
-        self.applied_generation = generation;
-        self.loading = LoadingState::Ready;
         if self.selection.as_ref().is_some_and(|selection| {
             !self
                 .items
                 .iter()
                 .any(|item| item.session_reference() == selection)
         }) {
-            self.selection = None;
+            self.selection = migrated_selection;
+        }
+        if let Some(selected) = self.selection.as_ref().and_then(|selection| {
+            self.items
+                .iter()
+                .find(|item| item.session_reference() == selection)
+        }) {
+            self.selected_provider = Some(selected.tool().as_str().to_owned());
+        } else if self
+            .selected_provider
+            .as_ref()
+            .is_none_or(|selected| !self.providers.contains(selected))
+        {
+            self.selected_provider = self.providers.first().cloned();
         }
         true
     }
@@ -216,8 +277,28 @@ impl ConversationsViewState {
         &self.source_errors
     }
 
+    #[must_use]
+    pub fn visible_errors(&self) -> &[String] {
+        &self.visible_errors
+    }
+
     pub fn set_source_errors(&mut self, source_errors: Vec<String>) {
         self.source_errors = source_errors;
+        self.rebuild_visible_errors();
+    }
+
+    pub fn set_live_error(&mut self, live_error: Option<String>) {
+        self.live_error = live_error;
+        self.rebuild_visible_errors();
+    }
+
+    fn rebuild_visible_errors(&mut self) {
+        self.visible_errors.clone_from(&self.source_errors);
+        if let Some(error) = &self.live_error
+            && !self.visible_errors.contains(error)
+        {
+            self.visible_errors.push(error.clone());
+        }
     }
 
     #[must_use]
@@ -236,7 +317,10 @@ impl ConversationsViewState {
 
     #[must_use]
     pub(crate) fn selected_provider(&self) -> Option<&str> {
-        self.selected_provider.as_deref()
+        self.selection
+            .is_none()
+            .then_some(self.selected_provider.as_deref())
+            .flatten()
     }
 
     #[must_use]
@@ -274,15 +358,15 @@ impl ConversationsViewState {
     }
 
     pub(crate) fn handle_intent(&mut self, intent: &Intent, area: Rect) -> bool {
-        let warning_height = u16::from(!self.source_errors.is_empty()).min(area.height);
+        let warning_height =
+            u16::from(!self.visible_errors.is_empty() || self.live_loading).min(area.height);
         let viewport_height = usize::from(area.height.saturating_sub(warning_height));
         match intent {
-            Intent::SelectPrevious => self.move_provider_selection(-1, viewport_height),
-            Intent::SelectNext => self.move_provider_selection(1, viewport_height),
-            Intent::SelectFirst => self.select_provider_index(0, viewport_height),
+            Intent::SelectPrevious => self.move_row_selection(-1, viewport_height),
+            Intent::SelectNext => self.move_row_selection(1, viewport_height),
+            Intent::SelectFirst => self.select_row(0, viewport_height),
             Intent::SelectLast => {
-                let last = self.visible_provider_indices().len().saturating_sub(1);
-                self.select_provider_index(last, viewport_height)
+                self.select_row(self.visible_row_count().saturating_sub(1), viewport_height)
             }
             Intent::ExpandOrDescend => self.set_selected_provider_collapsed(false, viewport_height),
             Intent::CollapseOrAscend => self.set_selected_provider_collapsed(true, viewport_height),
@@ -292,9 +376,7 @@ impl ConversationsViewState {
                 row,
                 action,
             } => self.handle_pointer(*column, *row, *action, area, warning_height),
-            Intent::Scroll(delta) => {
-                self.move_provider_selection(isize::from(*delta), viewport_height)
-            }
+            Intent::Scroll(delta) => self.move_row_selection(isize::from(*delta), viewport_height),
             Intent::Quit
             | Intent::SwitchView(_)
             | Intent::NextView
@@ -305,10 +387,9 @@ impl ConversationsViewState {
     }
 
     pub(crate) fn reconcile_viewport(&mut self, area: Rect) {
-        let warning_height = u16::from(!self.source_errors.is_empty()).min(area.height);
-        self.ensure_selected_provider_visible(usize::from(
-            area.height.saturating_sub(warning_height),
-        ));
+        let warning_height =
+            u16::from(!self.visible_errors.is_empty() || self.live_loading).min(area.height);
+        self.ensure_selected_row_visible(usize::from(area.height.saturating_sub(warning_height)));
     }
 
     fn provider_is_visible(&self, provider: &str) -> bool {
@@ -331,80 +412,106 @@ impl ConversationsViewState {
             .count()
     }
 
-    fn visible_provider_indices(&self) -> Vec<usize> {
-        self.providers
-            .iter()
-            .enumerate()
-            .filter_map(|(index, provider)| self.provider_is_visible(provider).then_some(index))
-            .collect()
+    fn move_row_selection(&mut self, delta: isize, viewport_height: usize) -> bool {
+        let count = self.visible_row_count();
+        if count == 0 {
+            return false;
+        }
+        let next = self.selected_row().map_or_else(
+            || {
+                if delta.is_negative() {
+                    count.saturating_sub(1)
+                } else {
+                    0
+                }
+            },
+            |current| {
+                if delta.is_negative() {
+                    current.saturating_sub(delta.unsigned_abs())
+                } else {
+                    current
+                        .saturating_add(delta as usize)
+                        .min(count.saturating_sub(1))
+                }
+            },
+        );
+        self.select_row(next, viewport_height)
     }
 
-    fn move_provider_selection(&mut self, delta: isize, viewport_height: usize) -> bool {
-        let visible = self.visible_provider_indices();
-        let Some(first) = visible.first().copied() else {
+    fn select_row(&mut self, row: usize, viewport_height: usize) -> bool {
+        let Some(target) = self.target_at_row(row) else {
             return false;
         };
-        let current = self
-            .selected_provider
-            .as_ref()
-            .and_then(|selected| {
-                visible
-                    .iter()
-                    .position(|index| self.providers[*index] == *selected)
-            })
-            .unwrap_or(0);
-        let next = if delta.is_negative() {
-            current.saturating_sub(delta.unsigned_abs())
-        } else {
-            current
-                .saturating_add(delta as usize)
-                .min(visible.len().saturating_sub(1))
+        let (provider, selection) = match target {
+            ConversationRowTarget::Provider(provider) => (provider, None),
+            ConversationRowTarget::Session {
+                provider,
+                reference,
+            } => (provider, Some(reference)),
         };
-        self.select_provider(visible.get(next).copied().unwrap_or(first), viewport_height)
-    }
-
-    fn select_provider_index(&mut self, index: usize, viewport_height: usize) -> bool {
-        let visible = self.visible_provider_indices();
-        let Some(provider_index) = visible.get(index).copied() else {
-            return false;
-        };
-        self.select_provider(provider_index, viewport_height)
-    }
-
-    fn select_provider(&mut self, provider_index: usize, viewport_height: usize) -> bool {
-        let provider = self.providers[provider_index].clone();
         let changed = self.selected_provider.as_deref() != Some(provider.as_str())
-            || self.selection.is_some();
+            || self.selection != selection;
         self.selected_provider = Some(provider);
-        self.selection = None;
-        self.ensure_selected_provider_visible(viewport_height);
+        self.selection = selection;
+        self.ensure_selected_row_visible(viewport_height);
         changed
+    }
+
+    fn target_at_row(&self, target: usize) -> Option<ConversationRowTarget> {
+        let mut row = 0_usize;
+        for provider in &self.providers {
+            if !self.provider_is_visible(provider) {
+                continue;
+            }
+            if row == target {
+                return Some(ConversationRowTarget::Provider(provider.clone()));
+            }
+            row = row.saturating_add(1);
+            if self.provider_is_collapsed(provider) {
+                continue;
+            }
+            let provider_matches = self.provider_matches_filter(provider);
+            for conversation in self.items.iter().filter(|conversation| {
+                conversation.tool().as_str() == provider
+                    && self.conversation_matches_filter(conversation, provider_matches)
+            }) {
+                if row == target {
+                    return Some(ConversationRowTarget::Session {
+                        provider: provider.clone(),
+                        reference: conversation.session_reference().clone(),
+                    });
+                }
+                row = row.saturating_add(1);
+            }
+        }
+        None
     }
 
     fn set_selected_provider_collapsed(&mut self, collapsed: bool, viewport_height: usize) -> bool {
         let Some(provider) = self.selected_provider.clone() else {
             return false;
         };
+        if self.selection.is_some() {
+            if !collapsed {
+                return false;
+            }
+            self.selection = None;
+            self.ensure_selected_row_visible(viewport_height);
+            return true;
+        }
         let changed = if collapsed {
-            self.collapsed_providers.insert(provider.clone())
+            self.collapsed_providers.insert(provider)
         } else {
             self.collapsed_providers.remove(&provider)
         };
-        if collapsed
-            && self.selection.as_ref().is_some_and(|selection| {
-                self.items.iter().any(|conversation| {
-                    conversation.tool().as_str() == provider
-                        && conversation.session_reference() == selection
-                })
-            })
-        {
-            self.selection = None;
-        }
-        self.ensure_selected_provider_visible(viewport_height);
+        self.ensure_selected_row_visible(viewport_height);
         changed
     }
 
     fn toggle_selected_provider(&mut self, viewport_height: usize) -> bool {
+        if self.selection.is_some() {
+            return false;
+        }
         let Some(provider) = self.selected_provider.as_deref() else {
             return false;
         };
@@ -428,52 +535,45 @@ impl ConversationsViewState {
         let absolute_row = self
             .scroll
             .saturating_add(usize::from(row.saturating_sub(content_y)));
-        let Some(provider) = self.provider_at_row(absolute_row).map(str::to_owned) else {
-            return false;
-        };
-        let provider_index = self
-            .providers
-            .iter()
-            .position(|candidate| candidate == &provider)
-            .expect("visible provider belongs to provider inventory");
-        let mut changed = self.select_provider(provider_index, usize::from(content_height));
-        if action == PointerAction::Toggle || (action == PointerAction::Select && column == area.x)
+        let is_provider = matches!(
+            self.target_at_row(absolute_row),
+            Some(ConversationRowTarget::Provider(_))
+        );
+        let mut changed = self.select_row(absolute_row, usize::from(content_height));
+        if is_provider
+            && (action == PointerAction::Toggle
+                || (action == PointerAction::Select && column == area.x))
         {
             changed |= self.toggle_selected_provider(usize::from(content_height));
         }
         changed
     }
 
-    fn provider_at_row(&self, target: usize) -> Option<&str> {
+    fn selected_row(&self) -> Option<usize> {
+        let selected_provider = self.selected_provider.as_deref()?;
         let mut row = 0_usize;
         for provider in &self.providers {
             if !self.provider_is_visible(provider) {
                 continue;
             }
-            if row == target {
-                return Some(provider);
-            }
-            row = row.saturating_add(1);
-            if !self.provider_is_collapsed(provider) {
-                row = row.saturating_add(self.filtered_provider_count(provider));
-            }
-        }
-        None
-    }
-
-    fn selected_provider_row(&self) -> Option<usize> {
-        let selected = self.selected_provider.as_deref()?;
-        let mut row = 0_usize;
-        for provider in &self.providers {
-            if !self.provider_is_visible(provider) {
-                continue;
-            }
-            if provider == selected {
+            if provider == selected_provider && self.selection.is_none() {
                 return Some(row);
             }
             row = row.saturating_add(1);
-            if !self.provider_is_collapsed(provider) {
-                row = row.saturating_add(self.filtered_provider_count(provider));
+            if self.provider_is_collapsed(provider) {
+                continue;
+            }
+            let provider_matches = self.provider_matches_filter(provider);
+            for conversation in self.items.iter().filter(|conversation| {
+                conversation.tool().as_str() == provider
+                    && self.conversation_matches_filter(conversation, provider_matches)
+            }) {
+                if provider == selected_provider
+                    && self.selection.as_ref() == Some(conversation.session_reference())
+                {
+                    return Some(row);
+                }
+                row = row.saturating_add(1);
             }
         }
         None
@@ -493,8 +593,8 @@ impl ConversationsViewState {
             .sum()
     }
 
-    fn ensure_selected_provider_visible(&mut self, viewport_height: usize) {
-        let Some(row) = self.selected_provider_row() else {
+    fn ensure_selected_row_visible(&mut self, viewport_height: usize) {
+        let Some(row) = self.selected_row() else {
             self.scroll = 0;
             return;
         };
@@ -543,6 +643,25 @@ impl ConversationsViewState {
     pub const fn set_generations(&mut self, requested: u64, applied: u64) {
         self.requested_generation = requested;
         self.applied_generation = applied;
+    }
+
+    #[must_use]
+    pub const fn live_generations(&self) -> (u64, u64) {
+        (self.live_requested_generation, self.live_applied_generation)
+    }
+
+    pub const fn set_live_generations(&mut self, requested: u64, applied: u64) {
+        self.live_requested_generation = requested;
+        self.live_applied_generation = applied;
+    }
+
+    #[must_use]
+    pub const fn live_loading(&self) -> bool {
+        self.live_loading
+    }
+
+    pub const fn set_live_loading(&mut self, loading: bool) {
+        self.live_loading = loading;
     }
 }
 

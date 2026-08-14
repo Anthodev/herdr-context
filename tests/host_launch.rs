@@ -48,6 +48,10 @@ impl HostClient for FakeHost {
         Ok(self.panes.clone())
     }
 
+    fn live_sessions(&self) -> Result<Vec<herdr_context::host::HostAgentSession>, HostError> {
+        Ok(Vec::new())
+    }
+
     fn verified_dock_identity(
         &mut self,
         pane: &HostPane,

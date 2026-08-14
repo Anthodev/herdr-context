@@ -1,5 +1,6 @@
 //! Provider-neutral conversation model.
 
+pub mod active;
 pub mod discovery;
 pub mod index;
 pub mod sources;
