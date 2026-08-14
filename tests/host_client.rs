@@ -72,7 +72,7 @@ esac
 
     let workspace = WorkspaceId::new("workspace")?;
     let tab = TabId::new("tab")?;
-    let mut client = CommandHostClient::new(script);
+    let mut client = CommandHostClient::new(script).with_plugin_root(PathBuf::from("/plugin root"));
     let panes = client.panes_in_tab(&workspace, &tab)?;
     assert_eq!(panes.len(), 4);
     assert_eq!(panes[0].dock_identity(), Some(DockIdentity::PluginMetadata));
@@ -104,7 +104,7 @@ esac
 
     let argv = fs::read_to_string(log)?;
     assert!(argv.contains("pane list --workspace workspace"));
-    assert!(argv.contains("plugin pane open --plugin herdr-context --entrypoint dock --placement split --target-pane origin --direction right --cwd /project with space --focus"));
+    assert!(argv.contains("plugin pane open --plugin herdr-context --entrypoint dock --placement split --target-pane origin --direction right --cwd /plugin root --env HERDR_CONTEXT_ORIGIN_CWD=/project with space --focus"));
     assert!(argv.contains("pane swap --direction right --pane opened"));
     assert!(argv.contains("pane resize --direction right"));
     assert!(argv.contains("plugin pane focus opened"));

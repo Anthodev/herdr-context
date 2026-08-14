@@ -115,26 +115,33 @@ impl LaunchContext {
             "HERDR_PANE_ID",
             PaneId::new,
         )?;
-        let cwd = required_path(
-            &context,
-            &[
-                "/cwd",
-                "/focused_pane_cwd",
-                "/focused_pane/cwd",
-                "/pane/cwd",
-                "/workspace_cwd",
-            ],
-            "cwd",
-        )?;
-        let foreground_cwd = optional_path(
-            &context,
-            &[
-                "/foreground_cwd",
-                "/focused_pane/foreground_cwd",
-                "/pane/foreground_cwd",
-            ],
-            "foreground_cwd",
-        )?;
+        let origin_cwd = lookup("HERDR_CONTEXT_ORIGIN_CWD")?;
+        let (cwd, foreground_cwd) = if let Some(origin_cwd) = origin_cwd {
+            (absolute_path(origin_cwd, "HERDR_CONTEXT_ORIGIN_CWD")?, None)
+        } else {
+            (
+                required_path(
+                    &context,
+                    &[
+                        "/cwd",
+                        "/focused_pane_cwd",
+                        "/focused_pane/cwd",
+                        "/pane/cwd",
+                        "/workspace_cwd",
+                    ],
+                    "cwd",
+                )?,
+                optional_path(
+                    &context,
+                    &[
+                        "/foreground_cwd",
+                        "/focused_pane/foreground_cwd",
+                        "/pane/foreground_cwd",
+                    ],
+                    "foreground_cwd",
+                )?,
+            )
+        };
 
         Ok(Self {
             workspace_id,
@@ -205,11 +212,15 @@ fn optional_path(
     let Some(value) = first_json_string(context, pointers)? else {
         return Ok(None);
     };
+    absolute_path(value, field).map(Some)
+}
+
+fn absolute_path(value: String, field: &'static str) -> Result<PathBuf, LaunchContextError> {
     let path = PathBuf::from(value);
     if !path.is_absolute() {
         return Err(LaunchContextError::InvalidPath(field));
     }
-    Ok(Some(path))
+    Ok(path)
 }
 
 fn first_json_string(
@@ -630,6 +641,18 @@ mod tests {
             context.foreground_cwd().map(Path::to_string_lossy),
             Some("/project/subdir".into())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn packaged_dock_prefers_injected_origin_over_plugin_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut vars = valid_vars();
+        vars.push(("HERDR_CONTEXT_ORIGIN_CWD", "/original/project"));
+        let context = LaunchContext::from_vars(vars)?;
+
+        assert_eq!(context.cwd(), Path::new("/original/project"));
+        assert_eq!(context.foreground_cwd(), None);
         Ok(())
     }
 

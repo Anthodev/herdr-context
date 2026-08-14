@@ -14,7 +14,94 @@ The dock is a narrow Herdr pane rather than an extension of the native
 sidebar. This uses Herdr's public plugin surface, preserves compatibility with
 upstream Herdr, and keeps the plugin independently installable.
 
-## Planned features
+## Install a packaged release
+
+Version `0.11.0` supports these release targets:
+
+| Platform | Architecture | Artifact target |
+|---|---|---|
+| Linux with glibc 2.35 or newer | x86_64 | `x86_64-unknown-linux-gnu` |
+| Linux with glibc 2.39 or newer | AArch64 | `aarch64-unknown-linux-gnu` |
+| macOS 15 | Intel | `x86_64-apple-darwin` |
+| macOS 14 or newer | Apple silicon | `aarch64-apple-darwin` |
+
+Prerequisites are Herdr `0.8.0` or newer and a POSIX shell. The packaged
+binary needs neither Rust nor a source checkout. Git is optional; Jujutsu
+status needs `jj` `0.37` or newer. Missing optional VCS tools degrade the
+affected status view without closing the dock.
+
+Download the archive and adjacent `.sha256` file for the host target from the
+`v0.11.0` GitHub release, then verify and install it:
+
+```sh
+target=x86_64-unknown-linux-gnu # choose a target from the table
+
+# Linux checksum tool:
+sha256sum -c "herdr-context-v0.11.0-$target.tar.gz.sha256"
+# macOS checksum tool:
+shasum -a 256 -c "herdr-context-v0.11.0-$target.tar.gz.sha256"
+
+tar -xzf "herdr-context-v0.11.0-$target.tar.gz"
+cd "herdr-context-v0.11.0-$target"
+./install.sh
+```
+
+The installer copies the checksummed package to
+`${XDG_DATA_HOME:-$HOME/.local/share}/herdr-context/plugin` and registers that
+directory through Herdr's public `plugin link` command. Override the location
+with an absolute `HERDR_CONTEXT_INSTALL_DIR`. For a named Herdr session, set
+`HERDR_SESSION` while installing or uninstalling.
+
+Invoke `herdr-context.toggle` from a workspace, tab, or pane context. Each tab
+gets at most one rightmost 40-column dock by default; repeated invocation
+opens, focuses, then closes it.
+
+### Upgrade
+
+Verify and extract the new version, then run its `install.sh`. Upgrade replaces
+only the package installation directory and restores the previous files and
+registration if the new link fails. Herdr's plugin config and state directories
+are preserved.
+
+### Uninstall
+
+Run `uninstall.sh` from either the extracted archive or the installed package
+while the target Herdr session is running:
+
+```sh
+${XDG_DATA_HOME:-$HOME/.local/share}/herdr-context/plugin/uninstall.sh
+```
+
+Uninstall unregisters the plugin and removes only the owned installation
+directory. It deliberately preserves project files, conversation histories,
+and Herdr-managed config/state. Remove retained config or state manually only
+if that data is no longer wanted.
+
+### Paths and privacy
+
+- Config: `herdr plugin config-dir herdr-context`, normally below
+  `${XDG_CONFIG_HOME:-$HOME/.config}/herdr/plugins/config/herdr-context/`.
+- State and metadata-only conversation cache: normally below
+  `${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/herdr-context/`.
+- Installed binary and manifest:
+  `${XDG_DATA_HOME:-$HOME/.local/share}/herdr-context/plugin/`.
+
+Release archives contain only the binary, manifest, installer, uninstaller,
+README, and license. They contain no cache, history, credentials, telemetry,
+developer paths, or performance fixtures. Conversation content stays local;
+the disposable cache stores metadata only.
+
+### Limitations
+
+Windows, musl Linux, older glibc releases, and architectures outside the table
+are not release targets. External conversation discovery remains restricted to
+the fixture-validated provider versions and local readable metadata. The
+Conversations view does not resume, edit, delete, summarize, or upload sessions.
+Ratatui measurement excludes terminal-driver and multiplexer transport latency;
+see the retained performance evidence below.
+
+
+## Features
 
 ### Files
 
@@ -114,8 +201,7 @@ resume, launch, edit, delete, summarize, or upload action.
 
 When Herdr provides `HERDR_PLUGIN_STATE_DIR`, the Conversations worker also
 checks exactly the fixture-backed Claude Code `2.1.232`, Codex CLI `0.147.0`,
-and Pi `0.84.1` stores described in
-[`docs/conversation-source-formats.md`](docs/conversation-source-formats.md).
+Pi `0.84.1`, OMP `17.3.2`, and OpenCode `1.18.18` stores.
 Encoded directories, date paths, and filenames are only hints: native session
 IDs, timestamps, and canonical `cwd` evidence must agree before metadata is
 accepted.
@@ -207,12 +293,17 @@ renders status as potentially stale.
 - **Local privacy**: conversation content is not sent over the network, and
   the cache stores only the metadata required for discovery and display.
 
-## Project status
+## Release status
 
-The project is in the design phase. The planned architecture, data flows,
-performance constraints, and implementation order are recorded in
-[`TODO.md`](TODO.md). That document is input for future ticket preparation; it
-is not an implementation backlog.
+Version `0.11.0` is the V1 packaging contract. Tag `v0.11.0`, Cargo metadata,
+the source and packaged manifests, binary name, minimum Herdr version, archive
+names, and checksums are validated together. CI builds from `Cargo.lock` and
+blocks publication on formatting, Clippy, tests, release build, manifest,
+archive, checksum, clean-install, and packaged Herdr smoke failures.
+
+Every HDC-15 performance verdict has a retained independent review in
+`release/performance-review.toml`. A failed budget blocks packaging unless its
+record names the accepting authority, rationale, scope, and follow-up issue.
 
 ## References
 

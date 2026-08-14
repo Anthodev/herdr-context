@@ -1,0 +1,77 @@
+schema_version = 1
+ticket = "HDC-15"
+baseline = "docs/performance-baseline.json"
+baseline_sha256 = "bbd1a941e0b3413f74e7f1c0e7ddc378f406a9b9becc9b6f229e2d9f91e2fd9b"
+reviewed_revision = "4d8f8acf"
+
+[[budgets]]
+metric = "first_frame_p95_ms"
+verdict = "pass"
+reviewer = "HDC-15 dedicated reviewer"
+reviewed_at = "2026-08-14"
+
+[[budgets]]
+metric = "navigation_p95_ms"
+verdict = "pass"
+reviewer = "HDC-15 dedicated reviewer"
+reviewed_at = "2026-08-14"
+
+[[budgets]]
+metric = "idle_cpu_percent"
+verdict = "pass"
+reviewer = "HDC-15 dedicated reviewer"
+reviewed_at = "2026-08-14"
+
+[[budgets]]
+metric = "peak_rss_mib"
+verdict = "pass"
+reviewer = "HDC-15 dedicated reviewer"
+reviewed_at = "2026-08-14"
+
+[[budgets]]
+metric = "steady_rss_mib"
+verdict = "pass"
+reviewer = "HDC-15 dedicated reviewer"
+reviewed_at = "2026-08-14"
+
+[[budgets]]
+metric = "status_max_concurrent"
+verdict = "pass"
+reviewer = "HDC-15 dedicated reviewer"
+reviewed_at = "2026-08-14"
+
+[[budgets]]
+metric = "status_surviving_children"
+verdict = "pass"
+reviewer = "HDC-15 dedicated reviewer"
+reviewed_at = "2026-08-14"
+
+[[budgets]]
+metric = "surviving_workers"
+verdict = "pass"
+reviewer = "HDC-15 dedicated reviewer"
+reviewed_at = "2026-08-14"
+
+[[budgets]]
+metric = "surviving_children"
+verdict = "pass"
+reviewer = "HDC-15 dedicated reviewer"
+reviewed_at = "2026-08-14"
+
+[[budgets]]
+metric = "filesystem_surviving_children"
+verdict = "pass"
+reviewer = "HDC-15 dedicated reviewer"
+reviewed_at = "2026-08-14"
+
+[[budgets]]
+metric = "rss_exclusion_parent_delta_mib"
+verdict = "pass"
+reviewer = "HDC-15 dedicated reviewer"
+reviewed_at = "2026-08-14"
+
+[[budgets]]
+metric = "rss_exclusion_surviving_children"
+verdict = "pass"
+reviewer = "HDC-15 dedicated reviewer"
+reviewed_at = "2026-08-14"
