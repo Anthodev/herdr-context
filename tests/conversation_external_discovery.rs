@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use herdr_context::conversations::discovery::discover_conversations;
 use herdr_context::conversations::sources::{
     ClaudeCodeSource, CodexCliSource, ConversationSource, ConversationSourceErrorKind,
-    DiscoveryLimit, KnownStoreRoots, MetadataBudget, PiSource, SourceRegistry,
+    DiscoveryLimit, KnownStoreRoots, MetadataBudget, OmpSource, PiSource, SourceRegistry,
 };
 use herdr_context::conversations::{ProvenanceKind, ResumeCapability};
 use herdr_context::project::ProjectIdentity;
@@ -90,6 +90,36 @@ fn pi_directory(project: &ProjectIdentity) -> String {
     )
 }
 
+fn encode_omp_relative(prefix: &str, relative: &Path) -> String {
+    let encoded = relative.to_string_lossy().replace(['/', '\\', ':'], "-");
+    if encoded.is_empty() {
+        prefix.to_owned()
+    } else if prefix.ends_with('-') {
+        format!("{prefix}{encoded}")
+    } else {
+        format!("{prefix}-{encoded}")
+    }
+}
+
+fn omp_directory(project: &ProjectIdentity, home: &Path) -> String {
+    let home = fs::canonicalize(home).expect("canonical home");
+    let temp = fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
+    if let Ok(relative) = project.root().strip_prefix(&home) {
+        return encode_omp_relative("-", relative);
+    }
+    if let Ok(relative) = project.root().strip_prefix(&temp) {
+        return encode_omp_relative("-tmp", relative);
+    }
+    format!(
+        "--{}--",
+        project
+            .root()
+            .to_string_lossy()
+            .trim_start_matches(['/', '\\'])
+            .replace(['/', '\\', ':'], "-")
+    )
+}
+
 fn install_valid_fixtures(home: &Path, project: &ProjectIdentity) {
     let claude = home
         .join(".claude/projects")
@@ -100,6 +130,10 @@ fn install_valid_fixtures(home: &Path, project: &ProjectIdentity) {
         .join(".pi/agent/sessions")
         .join(pi_directory(project))
         .join("2026-01-02T03-04-05-000Z_019b7ca9-8c88-7000-8003-000000000003.jsonl");
+    let omp = home
+        .join(".omp/agent/sessions")
+        .join(omp_directory(project, home))
+        .join("2026-01-04T05-06-07-000Z_019b8721-4a18-7000-8005-000000000005.jsonl");
 
     for (destination, relative) in [
         (
@@ -113,6 +147,10 @@ fn install_valid_fixtures(home: &Path, project: &ProjectIdentity) {
         (
             pi,
             "pi/--workspace-project--/2026-01-02T03-04-05-000Z_019b7ca9-8c88-7000-8003-000000000003.jsonl",
+        ),
+        (
+            omp,
+            "omp/--workspace-project--/2026-01-04T05-06-07-000Z_019b8721-4a18-7000-8005-000000000005.jsonl",
         ),
     ] {
         fs::create_dir_all(destination.parent().expect("fixture parent")).expect("store");
@@ -151,7 +189,7 @@ fn discover_one(
 }
 
 #[test]
-fn registers_exactly_the_three_fixture_backed_external_adapters() {
+fn registers_exactly_the_four_fixture_backed_external_adapters() {
     let (_project_dir, project) = project();
     let home = TempDir::new().expect("home");
     install_valid_fixtures(home.path(), &project);
@@ -163,7 +201,7 @@ fn registers_exactly_the_three_fixture_backed_external_adapters() {
         .iter()
         .map(|source| source.source_id().as_str())
         .collect::<Vec<_>>();
-    assert_eq!(ids, ["claude-code", "codex-cli", "pi"]);
+    assert_eq!(ids, ["claude-code", "codex-cli", "omp", "pi"]);
 
     let discovery = discover_conversations(
         &registry,
@@ -173,17 +211,21 @@ fn registers_exactly_the_three_fixture_backed_external_adapters() {
         MetadataBudget::new(512 * 1024).expect("non-zero budget"),
     );
     assert!(discovery.errors().is_empty(), "{:?}", discovery.errors());
-    assert_eq!(discovery.conversations().len(), 3);
+    assert_eq!(discovery.conversations().len(), 4);
     assert_eq!(
         discovery
             .conversations()
             .iter()
             .map(|conversation| conversation.tool().as_str())
             .collect::<Vec<_>>(),
-        ["pi", "claude-code", "codex-cli"]
+        ["omp", "pi", "claude-code", "codex-cli"]
     );
     for conversation in discovery.conversations() {
-        assert!(conversation.title().is_none());
+        if conversation.tool().as_str() == "omp" {
+            assert_eq!(conversation.title(), Some("Synthetic OMP session"));
+        } else {
+            assert!(conversation.title().is_none());
+        }
         assert!(matches!(
             conversation.resume_capability(),
             ResumeCapability::Supported(_)
@@ -479,6 +521,13 @@ fn adapters_extract_native_identity_time_and_canonical_cwd_evidence() {
             "codex-cli",
         ),
         (
+            Box::new(
+                OmpSource::new(project.clone(), roots.omp().to_path_buf()).expect("OMP source"),
+            ),
+            "019b8721-4a18-7000-8005-000000000005",
+            "omp",
+        ),
+        (
             Box::new(PiSource::new(project.clone(), roots.pi().to_path_buf()).expect("Pi source")),
             "019b7ca9-8c88-7000-8003-000000000003",
             "pi",
@@ -522,6 +571,13 @@ fn partial_final_records_are_ignored_but_complete_prefixes_are_indexed() {
                 .join(pi_directory(&project))
                 .join("2026-01-03T04-05-06-000Z_019b8207-c550-7000-8004-000000000004.jsonl"),
             "pi/--workspace-project--/2026-01-03T04-05-06-000Z_019b8207-c550-7000-8004-000000000004.jsonl",
+        ),
+        (
+            roots
+                .omp()
+                .join(omp_directory(&project, home.path()))
+                .join("2026-01-05T06-07-08-000Z_019b8c49-5e80-7000-8006-000000000006.jsonl"),
+            "omp/--workspace-project--/2026-01-05T06-07-08-000Z_019b8c49-5e80-7000-8006-000000000006.jsonl",
         ),
     ];
     for (destination, relative) in cases {
@@ -574,8 +630,19 @@ fn conflicting_cwd_and_unverified_versions_are_adapter_scoped_errors() {
         MetadataBudget::new(512 * 1024).expect("budget"),
     );
 
-    assert_eq!(discovery.conversations().len(), 1, "Pi remains healthy");
-    assert_eq!(discovery.conversations()[0].tool().as_str(), "pi");
+    assert_eq!(
+        discovery.conversations().len(),
+        2,
+        "OMP and Pi remain healthy"
+    );
+    assert_eq!(
+        discovery
+            .conversations()
+            .iter()
+            .map(|conversation| conversation.tool().as_str())
+            .collect::<Vec<_>>(),
+        ["omp", "pi"]
+    );
     assert!(discovery.errors().iter().any(|error| {
         error.source_id().as_str() == "claude-code"
             && error.kind() == ConversationSourceErrorKind::ProjectMismatch
@@ -613,6 +680,11 @@ fn native_filename_hints_must_match_the_verified_exact_grammar() {
         ),
     )
     .expect("rename Pi fixture");
+    let omp = roots
+        .omp()
+        .join(omp_directory(&project, home.path()))
+        .join("2026-01-04T05-06-07-000Z_019b8721-4a18-7000-8005-000000000005.jsonl");
+    fs::rename(&omp, omp.with_file_name("similar-title.jsonl")).expect("rename OMP fixture");
 
     let registry =
         SourceRegistry::new(roots.sources(project.clone()).expect("sources")).expect("registry");
@@ -624,7 +696,7 @@ fn native_filename_hints_must_match_the_verified_exact_grammar() {
         MetadataBudget::new(512 * 1024).expect("budget"),
     );
     assert_eq!(discovery.conversations().len(), 1, "Claude remains healthy");
-    for source_id in ["codex-cli", "pi"] {
+    for source_id in ["codex-cli", "omp", "pi"] {
         assert!(discovery.errors().iter().any(|error| {
             error.source_id().as_str() == source_id
                 && error.kind() == ConversationSourceErrorKind::UnsupportedFormat

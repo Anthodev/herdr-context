@@ -305,10 +305,14 @@ impl KnownFormat for ClaudeCodeFormat {
             session_id: session_id.ok_or_else(|| {
                 FormatFailure::unsupported("Claude JSONL contains no current transcript record")
             })?,
+            title: None,
             created_at: created_at.ok_or_else(|| {
                 FormatFailure::unsupported("Claude JSONL contains no current timestamp")
             })?,
             updated_at: updated_at.ok_or_else(|| {
+                FormatFailure::unsupported("Claude JSONL contains no current timestamp")
+            })?,
+            chain_updated_at: updated_at.ok_or_else(|| {
                 FormatFailure::unsupported("Claude JSONL contains no current timestamp")
             })?,
             cwd: canonical.ok_or_else(|| {

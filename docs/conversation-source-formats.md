@@ -2,7 +2,7 @@
 
 ## Scope
 
-HDC-12 records the format boundary and sanitized evidence used by the three external adapters added in HDC-13. HDC-13 adds metadata-only indexing and UI discovery; it does not add network access, tool launch, transcript mutation, or compatibility beyond these fixtures. The current bounds below were verified against the latest official package releases and reproduced by sanitized fixtures.
+HDC-12 records the format boundary and sanitized evidence used by the three external adapters added in HDC-13. HDC-18 adds OMP as a fourth, independent adapter. External discovery remains metadata-only and does not add network access, tool launch, transcript mutation, or compatibility beyond these fixtures. The bounds below were verified against the named official package releases and reproduced by sanitized fixtures.
 
 The inventory contains exactly these stores:
 
@@ -11,8 +11,9 @@ The inventory contains exactly these stores:
 | Claude Code | `~/.claude/projects` | JSONL identity records whose `version` is exactly `2.1.232` |
 | Codex CLI | `~/.codex/sessions` | JSONL sessions whose `session_meta.payload.cli_version` is exactly `0.147.0` |
 | Pi | `~/.pi/agent/sessions` | JSONL sessions from Pi CLI `0.84.1` whose header `version` is exactly `3` |
+| OMP | `~/.omp/agent/sessions` | OMP CLI `17.3.2` session files with a 256-byte title slot at version `1` followed by a logical session header at schema version `3` |
 
-These are evidence bounds, not claims that later or earlier versions are incompatible. Versions outside the table remain unsupported until a structurally faithful fixture and validation are committed. Pi session files encode schema version `3`, not the CLI version; the executable-version bound is therefore maintained by this inventory and its fixture rather than inferred from a session file.
+These are evidence bounds, not claims that later or earlier versions are incompatible. Versions outside the table remain unsupported until a structurally faithful fixture and validation are committed. Pi and OMP session files encode schema version `3`, not the CLI version; their executable-version bounds are therefore maintained by this inventory and their fixtures rather than inferred from session files.
 
 ## Claude Code
 
@@ -78,13 +79,36 @@ Unsupported variants include sessions without a leading `session_meta`, missing 
 
 Unsupported variants include schema versions other than `3`, files without a leading session header, missing ID/cwd/timestamps, invalid entry root/parent shapes, missing variant-specific payload fields, non-JSONL framing, malformed records before the final line, nested child-run directories, and entry types outside Pi `0.84.1`'s current session-entry union.
 
+## OMP
+
+### Layout and framing
+
+- Layout: `<encoded-cwd>/<timestamp>_<session-id>.jsonl` below `~/.omp/agent/sessions`.
+- OMP `17.3.2` current files physically begin with one `type: "title"`, `v: 1` JSON line that is exactly 256 UTF-8 bytes including its newline. The following logical first record is the schema-`3` `session` header; later entries are appended JSON objects.
+- Only the single encoded bucket for the canonical project is listed, and only direct `.jsonl` files are candidates. Sibling child-run/artifact directories are opaque and are never traversed.
+- A partial final line is a recoverable append boundary only and is not an entry.
+
+### Identity, time, title, and project evidence
+
+- The session header `id` is the UUIDv7 native session ID. Entry `id` and `parentId` fields are eight lowercase hexadecimal characters and form an append-only session tree.
+- The header timestamp is the created time. Complete append timestamps are monotonic; the updated time is the latest complete append or fixed-slot `updatedAt` timestamp.
+- The current title comes only from the bounded fixed-width slot. Header titles, directory names, and filename similarity are not project evidence.
+- Project evidence consists of the exact OMP encoding of the canonical cwd plus the session header's absolute `cwd`. Home-relative buckets use `-<relative>`, temporary-root buckets use `-tmp-<relative>`, and other absolute paths use `--<encoded-absolute>--`, replacing separators and colons with `-`. Both the encoded bucket and canonical header cwd must match.
+- The filename must exactly reproduce the header timestamp with `:` and `.` replaced by `-`, followed by `_`, the native session ID, and `.jsonl`.
+
+### Fixture-backed record set and bounds
+
+`tests/fixtures/conversations/omp/--workspace-project--/2026-01-04T05-06-07-000Z_019b8721-4a18-7000-8005-000000000005.jsonl` contains the fixed-width current-title slot, a schema-`3` header, thinking-level and service-tier changes, user and assistant messages, a model change, and a title-change audit entry. The sibling `2026-01-05T06-07-08-000Z_019b8c49-5e80-7000-8006-000000000006.jsonl` contains the title slot and header followed by a truncated message append.
+
+The CLI version is not embedded in OMP session records. Compatibility is therefore bounded to the documented OMP `17.3.2` layout represented by these fixtures; schema `3` alone does not claim compatibility with another OMP release. Unsupported variants include legacy header-first files without the fixed slot, title-slot widths or versions other than the verified 256-byte/v1 form, schema versions other than `3`, missing or conflicting UUID/cwd/timestamps, invalid entry root/parent shapes, unverified entry payloads, non-JSONL framing, malformed records before the final line, incorrect filenames, symlink/path escapes, and nested child-run traversal.
+
 ## Fixture safety and validation
 
 All fixture paths, IDs, timestamps, messages, model/provider labels, instructions, Git metadata, and usage values are synthetic. The fixtures contain no captured prompts, responses, secrets, usernames, home paths, or repository names.
 
 `tests/conversation_source_fixtures.rs` enforces:
 
-- the exact recursive on-disk layouts for all three sources and the correspondence between filenames, IDs, timestamps, and project evidence;
+- the exact recursive on-disk layouts for all four sources and the correspondence between filenames, IDs, timestamps, and project evidence;
 - source-specific JSONL framing, version bounds, append linkage, and incremental partial-record cases;
 - exact malformed trailing records for every partial fixture;
 - an exhaustive per-source allowlist for every complete JSON string value, plus raw-content rejection of private paths, local identifiers, and common secret markers.

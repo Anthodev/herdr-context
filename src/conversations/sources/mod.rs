@@ -3,6 +3,7 @@ mod claude_code;
 mod codex_cli;
 mod generic_jsonl;
 mod known_stores;
+mod omp;
 mod pi;
 mod project_local;
 
@@ -10,6 +11,7 @@ pub use claude_code::ClaudeCodeSource;
 pub use codex_cli::CodexCliSource;
 pub use generic_jsonl::GenericJsonlSource;
 pub use known_stores::KnownStoreRoots;
+pub use omp::OmpSource;
 pub use pi::PiSource;
 pub use project_local::{ProjectLocalLocation, ProjectLocalLocationError};
 
@@ -37,6 +39,7 @@ impl KnownStoreRoots {
                 project.clone(),
                 self.codex_cli().to_path_buf(),
             )?),
+            Box::new(OmpSource::new(project.clone(), self.omp().to_path_buf())?),
             Box::new(PiSource::new(project, self.pi().to_path_buf())?),
         ])
     }
