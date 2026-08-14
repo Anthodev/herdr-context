@@ -3,21 +3,24 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::widgets::Widget;
-
+use crate::config::{FilesConfig, GitCadence, PluginConfig, RefreshPolicy, VcsBackendSelection};
+use crate::files::ignore::ConfiguredVisibilityPolicy;
 use crate::files::tree::{DirectorySnapshot, TreeNodeKind};
 use crate::files::{FilesModel, PreparedRefreshResult};
 use crate::host::LaunchContext;
 use crate::intent::{Intent, PointerAction};
-use crate::project::resolve_project_context;
+use crate::project::resolve_project_context_with_backend;
 use crate::ui::files::FilesView;
 use crate::vcs::git::GitService;
 use crate::vcs::jj::{JjService, JujutsuMode};
 use crate::vcs::{VcsBackendMetadata, VcsWorkspace};
 use crate::worker::{Job, JobKey, JobKind, Priority, SubmitStatus, WorkerRuntime};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::widgets::Widget;
 
 #[derive(Clone, Debug)]
 enum VcsRefresh {
@@ -36,6 +39,9 @@ impl VcsRefresh {
         match self {
             Self::Git { workspace, .. } | Self::Jujutsu { workspace, .. } => workspace,
         }
+    }
+    const fn is_git(&self) -> bool {
+        matches!(self, Self::Git { .. })
     }
 
     fn refresh_status_cancellable(
@@ -74,6 +80,10 @@ pub struct FilesRuntime {
     root: PathBuf,
     background_active: bool,
     vcs: Option<VcsRefresh>,
+    refresh_policy: RefreshPolicy,
+    status_refresh_interval: Duration,
+    next_status_refresh: Option<Instant>,
+    last_status_fingerprint: Option<u64>,
     expanded: BTreeSet<PathBuf>,
     desired_expanded: BTreeSet<PathBuf>,
     visible_rows: Vec<PathBuf>,
@@ -89,13 +99,22 @@ pub struct FilesRuntime {
     reload_pending: bool,
     filesystem_panic_retried: bool,
     filesystem_notice: Option<String>,
+    backend_notice: Option<String>,
 }
 
 impl FilesRuntime {
     pub fn bootstrap(context: &LaunchContext) -> Result<Self, FilesRuntimeError> {
         static NOT_CANCELLED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
-        Self::bootstrap_with_jujutsu_mode_cancellable(context, JujutsuMode::Fresh, &NOT_CANCELLED)
+        let config = PluginConfig::default();
+        Self::bootstrap_with_policy_cancellable(
+            context,
+            config.vcs().backend(),
+            config.vcs().jujutsu_mode(),
+            config.vcs().refresh(),
+            config.files(),
+            &NOT_CANCELLED,
+        )
     }
 
     pub fn bootstrap_with_jujutsu_mode(
@@ -104,26 +123,54 @@ impl FilesRuntime {
     ) -> Result<Self, FilesRuntimeError> {
         static NOT_CANCELLED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
-        Self::bootstrap_with_jujutsu_mode_cancellable(context, jujutsu_mode, &NOT_CANCELLED)
+        let config = PluginConfig::default();
+        Self::bootstrap_with_policy_cancellable(
+            context,
+            config.vcs().backend(),
+            jujutsu_mode,
+            config.vcs().refresh(),
+            config.files(),
+            &NOT_CANCELLED,
+        )
     }
 
-    pub(crate) fn bootstrap_cancellable(
+    pub fn bootstrap_with_config(
         context: &LaunchContext,
+        config: &PluginConfig,
+    ) -> Result<Self, FilesRuntimeError> {
+        static NOT_CANCELLED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        Self::bootstrap_with_config_cancellable(context, config, &NOT_CANCELLED)
+    }
+
+    pub(crate) fn bootstrap_with_config_cancellable(
+        context: &LaunchContext,
+        config: &PluginConfig,
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> Result<Self, FilesRuntimeError> {
-        Self::bootstrap_with_jujutsu_mode_cancellable(context, JujutsuMode::Fresh, cancelled)
+        Self::bootstrap_with_policy_cancellable(
+            context,
+            config.vcs().backend(),
+            config.vcs().jujutsu_mode(),
+            config.vcs().refresh(),
+            config.files(),
+            cancelled,
+        )
     }
 
-    fn bootstrap_with_jujutsu_mode_cancellable(
+    fn bootstrap_with_policy_cancellable(
         context: &LaunchContext,
+        backend: VcsBackendSelection,
         jujutsu_mode: JujutsuMode,
+        refresh_policy: RefreshPolicy,
+        files_config: &FilesConfig,
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> Result<Self, FilesRuntimeError> {
         if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(FilesRuntimeError::cancelled());
         }
         let opening_directory = context.foreground_cwd().unwrap_or_else(|| context.cwd());
-        let project = resolve_project_context(opening_directory)
+        let project = resolve_project_context_with_backend(opening_directory, backend)
             .map_err(|error| FilesRuntimeError::new(error.to_string()))?;
         let vcs = match project.vcs() {
             Some(detected) if detected.backend().as_str() == "git" => {
@@ -156,23 +203,38 @@ impl FilesRuntime {
             }
             Some(_) | None => None,
         };
+        let visibility = Arc::new(ConfiguredVisibilityPolicy::new(
+            files_config.show_hidden(),
+            files_config.exclusions().to_vec(),
+        ));
         let mut model = match &vcs {
-            Some(vcs) => FilesModel::for_workspace(
+            Some(vcs) => FilesModel::for_workspace_with_visibility(
                 project.files_root().to_path_buf(),
                 vcs.workspace().root().to_path_buf(),
+                visibility,
             )?,
-            None => FilesModel::new(project.files_root().to_path_buf())?,
+            None => {
+                FilesModel::with_visibility_policy(project.files_root().to_path_buf(), visibility)?
+            }
         };
         model.load_directory(Path::new(""))?;
         if vcs.as_ref().and_then(VcsRefresh::jujutsu_mode) == Some(JujutsuMode::Passive) {
             model.mark_status_stale();
         }
+        let configured_vcs_missing = backend != VcsBackendSelection::Auto && vcs.is_none();
 
         let mut runtime = Self {
             model,
             root: project.files_root().to_path_buf(),
             background_active: true,
             vcs,
+            refresh_policy,
+            status_refresh_interval: match refresh_policy.git() {
+                GitCadence::Manual => Duration::ZERO,
+                GitCadence::Adaptive { minimum, .. } => minimum,
+            },
+            next_status_refresh: None,
+            last_status_fingerprint: None,
             expanded: BTreeSet::new(),
             desired_expanded: BTreeSet::new(),
             visible_rows: Vec::new(),
@@ -188,6 +250,9 @@ impl FilesRuntime {
             reload_pending: false,
             filesystem_panic_retried: false,
             filesystem_notice: None,
+            backend_notice: configured_vcs_missing.then(|| {
+                "configured VCS backend was not found; showing the filesystem only".to_owned()
+            }),
         };
         runtime.rebuild_visible_rows();
         Ok(runtime)
@@ -195,6 +260,7 @@ impl FilesRuntime {
 
     pub fn render(&mut self, area: Rect, buffer: &mut Buffer) {
         let has_notice = self.filesystem_notice.is_some()
+            || self.backend_notice.is_some()
             || self.model.failure_notice().is_some()
             || self.model.status_is_stale();
         let notice_height = usize::from(has_notice);
@@ -207,11 +273,11 @@ impl FilesRuntime {
             .min(self.visible_rows.len());
         let rows = &self.visible_rows[self.viewport_offset.min(end)..end];
         let stale = self.model.status_is_stale();
-        let notice = match (
-            self.filesystem_notice.as_deref(),
-            self.model.failure_notice(),
-            stale,
-        ) {
+        let runtime_notice = self
+            .filesystem_notice
+            .as_deref()
+            .or(self.backend_notice.as_deref());
+        let notice = match (runtime_notice, self.model.failure_notice(), stale) {
             (Some(message), _, true) => Some(("Files / VCS stale", message)),
             (Some(message), _, false) => Some(("Files", message)),
             (None, Some(message), true) => Some(("VCS stale", message)),
@@ -593,6 +659,7 @@ impl FilesRuntime {
         if self.vcs.is_none() {
             return false;
         }
+        self.next_status_refresh = None;
         self.model.request_refresh();
         self.start_next_vcs_refresh(workers);
         true
@@ -627,6 +694,7 @@ impl FilesRuntime {
         ) {
             self.model.cancel_refresh_start(generation);
             self.filesystem_notice = Some("background VCS queue is unavailable".to_owned());
+            self.schedule_next_status_refresh(Instant::now(), None, false);
         }
     }
 
@@ -635,12 +703,69 @@ impl FilesRuntime {
         result: PreparedRefreshResult,
         workers: &mut WorkerRuntime,
     ) -> bool {
+        self.complete_vcs_refresh_at(result, workers, Instant::now())
+    }
+
+    fn complete_vcs_refresh_at(
+        &mut self,
+        result: PreparedRefreshResult,
+        workers: &mut WorkerRuntime,
+        now: Instant,
+    ) -> bool {
+        let fingerprint = result.status_fingerprint();
         let changed = self.model.complete_prepared_refresh(result);
+        self.schedule_next_status_refresh(now, fingerprint, changed);
         if changed {
             self.rebuild_visible_rows();
         }
         self.start_next_vcs_refresh(workers);
         true
+    }
+
+    fn schedule_next_status_refresh(
+        &mut self,
+        now: Instant,
+        fingerprint: Option<u64>,
+        applied: bool,
+    ) {
+        if !self.background_active {
+            self.next_status_refresh = None;
+            return;
+        }
+        let Some(vcs) = self.vcs.as_ref() else {
+            self.next_status_refresh = None;
+            return;
+        };
+        let interval = if vcs.is_git() {
+            match self.refresh_policy.git() {
+                GitCadence::Manual => None,
+                GitCadence::Adaptive { minimum, maximum } => {
+                    if applied {
+                        let changed = fingerprint
+                            .is_some_and(|value| self.last_status_fingerprint != Some(value));
+                        self.last_status_fingerprint = fingerprint;
+                        self.status_refresh_interval = if changed {
+                            minimum
+                        } else {
+                            self.status_refresh_interval
+                                .saturating_mul(2)
+                                .clamp(minimum, maximum)
+                        };
+                    } else if fingerprint.is_none() {
+                        self.status_refresh_interval = self
+                            .status_refresh_interval
+                            .saturating_mul(2)
+                            .clamp(minimum, maximum);
+                    }
+                    Some(self.status_refresh_interval)
+                }
+            }
+        } else if vcs.jujutsu_mode() == Some(JujutsuMode::Passive) {
+            self.refresh_policy.passive_jujutsu()
+        } else {
+            None
+        };
+        self.next_status_refresh = interval.and_then(|interval| now.checked_add(interval));
     }
 
     fn rebuild_visible_rows(&mut self) {
@@ -724,10 +849,26 @@ impl FilesRuntime {
             || (self.background_active
                 && (self.reload_pending || !self.pending_expansions.is_empty()))
     }
+    pub(crate) fn next_refresh_in(&self, now: Instant) -> Option<Duration> {
+        self.background_active
+            .then_some(self.next_status_refresh)
+            .flatten()
+            .map(|deadline| deadline.saturating_duration_since(now))
+    }
+
+    pub(crate) fn tick(&mut self, now: Instant, workers: &mut WorkerRuntime) -> bool {
+        let Some(deadline) = self.next_status_refresh else {
+            return false;
+        };
+        if !self.background_active || deadline > now {
+            return false;
+        }
+        self.request_vcs_refresh(workers)
+    }
 
     pub(crate) fn start_background(&mut self, workers: &mut WorkerRuntime) {
         self.background_active = true;
-        self.request_vcs_refresh(workers);
+        self.request_reload(workers);
         self.retry_pending(workers);
     }
 
@@ -747,13 +888,13 @@ impl FilesRuntime {
         if mode == JujutsuMode::Passive {
             self.model.mark_status_stale();
         }
-        self.model.request_refresh();
-        self.start_next_vcs_refresh(workers);
+        self.request_vcs_refresh(workers);
         true
     }
 
     pub(crate) const fn pause_background(&mut self) {
         self.background_active = false;
+        self.next_status_refresh = None;
     }
 
     pub(crate) fn complete_background(
@@ -812,7 +953,8 @@ impl FilesRuntime {
                 self.filesystem_notice =
                     Some("background VCS worker stopped unexpectedly".to_owned());
             }
-            JobKind::Bootstrap
+            JobKind::Config
+            | JobKind::Bootstrap
             | JobKind::ConversationDiscovery
             | JobKind::ConversationLive
             | JobKind::Process
@@ -882,7 +1024,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -892,9 +1034,13 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{FilesRuntime, RuntimeMessage, VcsRefresh};
+    use crate::config::{GitCadence, PluginConfig};
     use crate::host::LaunchContext;
+    use crate::vcs::git::GitService;
     use crate::vcs::jj::{JjService, JujutsuMode};
-    use crate::vcs::{VcsEntryStatus, VcsStatusKind, VcsStatusSnapshot};
+    use crate::vcs::{
+        VcsBackendMetadata, VcsEntryStatus, VcsStatusKind, VcsStatusSnapshot, VcsWorkspace,
+    };
     use crate::worker::WorkerRuntime;
 
     fn runtime(temp: &TempDir) -> FilesRuntime {
@@ -1464,7 +1610,9 @@ mod tests {
         let mut workers = workers();
 
         runtime.start_background(&mut workers);
-        assert!(runtime.complete_background(receive(&mut workers), &mut workers));
+        for _ in 0..2 {
+            assert!(runtime.complete_background(receive(&mut workers), &mut workers));
+        }
         assert_eq!(
             fs::read_to_string(&calls)
                 .expect("activation call")
@@ -1520,8 +1668,13 @@ mod tests {
             ),
         )])
         .expect("context");
-        let mut runtime = FilesRuntime::bootstrap_with_jujutsu_mode(&context, JujutsuMode::Passive)
-            .expect("runtime");
+        fs::write(
+            temp.path().join("config.toml"),
+            "[vcs]\njujutsu_mode = \"passive\"\npassive_jujutsu_interval_ms = 1000\n",
+        )
+        .expect("config");
+        let config = PluginConfig::load_from_dir(temp.path()).into_config();
+        let mut runtime = FilesRuntime::bootstrap_with_config(&context, &config).expect("runtime");
         let Some(VcsRefresh::Jujutsu { service, .. }) = &mut runtime.vcs else {
             panic!("Jujutsu backend");
         };
@@ -1529,7 +1682,12 @@ mod tests {
         let mut workers = workers();
 
         runtime.start_background(&mut workers);
-        runtime.complete_background(receive(&mut workers), &mut workers);
+        for _ in 0..4 {
+            if !runtime.has_pending_work() && !workers.has_pending_work() {
+                break;
+            }
+            runtime.complete_background(receive(&mut workers), &mut workers);
+        }
 
         assert!(runtime.model.tree().node(Path::new("visible")).is_some());
         assert!(
@@ -1539,6 +1697,11 @@ mod tests {
                 .is_some_and(|notice| notice.contains("Jujutsu status failed"))
         );
         assert!(runtime.model.status_is_stale());
+        assert!(
+            runtime
+                .next_refresh_in(Instant::now())
+                .is_some_and(|wait| wait <= Duration::from_secs(1))
+        );
         let area = Rect::new(0, 0, 64, 2);
         let mut buffer = Buffer::empty(area);
         runtime.render(area, &mut buffer);
@@ -1546,5 +1709,86 @@ mod tests {
             .map(|x| buffer[(x, 1)].symbol())
             .collect::<String>();
         assert!(notice.starts_with("VCS stale: Jujutsu status failed"));
+    }
+    #[test]
+    fn configured_backend_warning_survives_successful_filesystem_reload() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("visible"), b"file").expect("fixture");
+        fs::write(
+            temp.path().join("config.toml"),
+            "[vcs]\nbackend = \"git\"\n",
+        )
+        .expect("config");
+        let config = PluginConfig::load_from_dir(temp.path()).into_config();
+        let context = LaunchContext::from_vars([(
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            format!(
+                r#"{{"workspace_id":"workspace","tab_id":"tab","pane_id":"pane","cwd":"{}"}}"#,
+                temp.path().display()
+            ),
+        )])
+        .expect("context");
+        let mut runtime = FilesRuntime::bootstrap_with_config(&context, &config).expect("runtime");
+        let mut workers = WorkerRuntime::with_capacities(2, 1);
+        assert!(runtime.backend_notice.is_some());
+
+        runtime.start_background(&mut workers);
+        assert!(runtime.complete_background(receive(&mut workers), &mut workers));
+
+        assert!(runtime.backend_notice.is_some());
+        workers.shutdown();
+    }
+
+    #[test]
+    fn adaptive_git_cadence_backs_off_resets_and_suspends() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join(".git")).expect("git marker");
+        fs::write(
+            temp.path().join("config.toml"),
+            concat!(
+                "[vcs]\n",
+                "git_cadence = \"adaptive\"\n",
+                "git_min_interval_ms = 1000\n",
+                "git_max_interval_ms = 4000\n",
+            ),
+        )
+        .expect("config");
+        let config = PluginConfig::load_from_dir(temp.path()).into_config();
+        assert!(matches!(
+            config.vcs().refresh().git(),
+            GitCadence::Adaptive { .. }
+        ));
+        let context = LaunchContext::from_vars([(
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            format!(
+                r#"{{"workspace_id":"workspace","tab_id":"tab","pane_id":"pane","cwd":"{}"}}"#,
+                temp.path().display()
+            ),
+        )])
+        .expect("context");
+        let mut runtime = FilesRuntime::bootstrap_with_config(&context, &config).expect("runtime");
+        runtime.vcs = Some(VcsRefresh::Git {
+            service: GitService::default(),
+            workspace: VcsWorkspace::new(
+                temp.path().to_path_buf(),
+                VcsBackendMetadata::new("git", "Git", false).expect("metadata"),
+            )
+            .expect("workspace"),
+        });
+        let now = Instant::now();
+
+        runtime.schedule_next_status_refresh(now, Some(7), true);
+        assert_eq!(runtime.next_refresh_in(now), Some(Duration::from_secs(1)));
+        runtime.schedule_next_status_refresh(now, Some(7), true);
+        assert_eq!(runtime.next_refresh_in(now), Some(Duration::from_secs(2)));
+        runtime.schedule_next_status_refresh(now, Some(7), true);
+        assert_eq!(runtime.next_refresh_in(now), Some(Duration::from_secs(4)));
+        runtime.schedule_next_status_refresh(now, Some(7), true);
+        assert_eq!(runtime.next_refresh_in(now), Some(Duration::from_secs(4)));
+        runtime.schedule_next_status_refresh(now, Some(8), true);
+        assert_eq!(runtime.next_refresh_in(now), Some(Duration::from_secs(1)));
+
+        runtime.pause_background();
+        assert_eq!(runtime.next_refresh_in(now), None);
     }
 }

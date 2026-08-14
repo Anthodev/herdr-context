@@ -150,6 +150,15 @@ pub fn discover_conversations_cancellable(
     let mut removals = Vec::new();
     let mut purged_sources = Vec::new();
     let mut has_more = false;
+    let unregistered = watermarks
+        .keys()
+        .filter(|source_id| !registry.retains(source_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for source_id in unregistered {
+        next_watermarks.remove(&source_id);
+        purged_sources.push(source_id);
+    }
 
     for source in registry.iter() {
         if cancelled.load(Ordering::Relaxed) {
@@ -157,9 +166,11 @@ pub fn discover_conversations_cancellable(
         }
         match source.probe() {
             Ok(StorageProbe::Available) => {}
-            Ok(StorageProbe::Unavailable { .. }) => {
-                next_watermarks.remove(source.source_id());
-                purged_sources.push(source.source_id().clone());
+            Ok(StorageProbe::Unavailable { reason }) => {
+                errors.push(ConversationSourceError::unavailable(
+                    source.source_id().clone(),
+                    reason,
+                ));
                 continue;
             }
             Err(error) => {
@@ -256,5 +267,45 @@ pub fn discover_conversations_cancellable(
         purged_sources,
         errors,
         has_more,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+
+    use tempfile::TempDir;
+
+    use super::discover_conversations_cancellable;
+    use crate::conversations::sources::{
+        DiscoveryLimit, MetadataBudget, SourceId, SourceRegistry, SourceWatermark,
+    };
+    use crate::project::ProjectIdentity;
+
+    #[test]
+    fn desired_source_without_a_runtime_adapter_retains_its_watermark() {
+        let source_id = SourceId::new("temporarily-unavailable").expect("source ID");
+        let registry =
+            SourceRegistry::new_with_desired_source_ids(Vec::new(), vec![source_id.clone()])
+                .expect("registry");
+        let watermark =
+            SourceWatermark::new(source_id.clone(), "cached-cursor").expect("watermark");
+        let watermarks = HashMap::from([(source_id.clone(), watermark)]);
+        let project = TempDir::new().expect("project");
+        let project = ProjectIdentity::from_canonical_root(project.path().to_path_buf())
+            .expect("project identity");
+
+        let discovery = discover_conversations_cancellable(
+            &registry,
+            &project,
+            &watermarks,
+            DiscoveryLimit::new(1).expect("limit"),
+            MetadataBudget::new(1).expect("budget"),
+            &AtomicBool::new(false),
+        );
+
+        assert!(discovery.watermarks().contains_key(&source_id));
+        assert!(discovery.purged_sources().is_empty());
     }
 }

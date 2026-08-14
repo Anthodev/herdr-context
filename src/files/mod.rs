@@ -3,10 +3,13 @@
 pub mod ignore;
 pub mod refresh;
 pub mod tree;
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::files::ignore::VisibilityPolicy;
 use crate::vcs::{VcsError, VcsErrorKind, VcsStatusSnapshot};
 use refresh::{RefreshCoordinator, RefreshResult};
 use tree::FilesTree;
@@ -23,6 +26,7 @@ pub(crate) struct PreparedRefreshResult {
     generation: u64,
     tree_revision: u64,
     tree: Result<(FilesTree, bool), VcsError>,
+    status_fingerprint: Option<u64>,
 }
 
 impl PreparedRefreshResult {
@@ -31,6 +35,7 @@ impl PreparedRefreshResult {
         input: StatusMergeInput,
         snapshot: Result<VcsStatusSnapshot, VcsError>,
     ) -> Self {
+        let status_fingerprint = snapshot.as_ref().ok().map(snapshot_fingerprint);
         let tree = snapshot.and_then(|snapshot| {
             let stale = snapshot.is_stale();
             let mut tree = input.tree;
@@ -47,8 +52,29 @@ impl PreparedRefreshResult {
             generation,
             tree_revision: input.tree_revision,
             tree,
+            status_fingerprint,
         }
     }
+
+    pub(crate) const fn status_fingerprint(&self) -> Option<u64> {
+        self.status_fingerprint
+    }
+}
+
+fn snapshot_fingerprint(snapshot: &VcsStatusSnapshot) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    snapshot.is_stale().hash(&mut hasher);
+    for entry in snapshot.entries() {
+        entry.path().hash(&mut hasher);
+        entry.source_path().hash(&mut hasher);
+        (entry.kind() as u8).hash(&mut hasher);
+        entry.index_state().map(|kind| kind as u8).hash(&mut hasher);
+        entry
+            .worktree_state()
+            .map(|kind| kind as u8)
+            .hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// Files view state. Failed VCS refreshes never replace the current tree.
@@ -67,7 +93,30 @@ impl FilesModel {
         Self::for_workspace(root.clone(), root)
     }
 
+    pub fn with_visibility_policy(
+        root: PathBuf,
+        visibility: Arc<dyn VisibilityPolicy>,
+    ) -> io::Result<Self> {
+        Self::for_workspace_with_visibility(root.clone(), root, visibility)
+    }
+
     pub fn for_workspace(files_root: PathBuf, workspace_root: PathBuf) -> io::Result<Self> {
+        Self::build(files_root, workspace_root, None)
+    }
+
+    pub fn for_workspace_with_visibility(
+        files_root: PathBuf,
+        workspace_root: PathBuf,
+        visibility: Arc<dyn VisibilityPolicy>,
+    ) -> io::Result<Self> {
+        Self::build(files_root, workspace_root, Some(visibility))
+    }
+
+    fn build(
+        files_root: PathBuf,
+        workspace_root: PathBuf,
+        visibility: Option<Arc<dyn VisibilityPolicy>>,
+    ) -> io::Result<Self> {
         let files_root = std::fs::canonicalize(files_root)?;
         let workspace_root = std::fs::canonicalize(workspace_root)?;
         let workspace_prefix = files_root
@@ -79,8 +128,14 @@ impl FilesModel {
                 )
             })?
             .to_path_buf();
+        let tree = match visibility {
+            Some(visibility) => {
+                FilesTree::for_workspace_with_visibility(files_root, workspace_root, visibility)?
+            }
+            None => FilesTree::for_workspace(files_root, workspace_root)?,
+        };
         Ok(Self {
-            tree: FilesTree::for_workspace(files_root, workspace_root)?,
+            tree,
             refresh: RefreshCoordinator::new(),
             workspace_prefix,
             failure_notice: None,

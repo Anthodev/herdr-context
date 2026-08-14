@@ -5,10 +5,11 @@ use std::time::Duration;
 
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
+use std::time::Instant;
 
 use crate::controller::Controller;
 use crate::host::LaunchContext;
-use crate::input::{InputMode, map_event};
+use crate::input::{InputMode, map_event_with_keybindings};
 use crate::model::AppModel;
 use crate::worker::WorkerRuntime;
 
@@ -39,18 +40,25 @@ impl App {
 
         loop {
             let pending = self.has_pending_work();
-            let input = if pending {
-                event::poll(WORKER_WAIT_INTERVAL)?
-                    .then(event::read)
-                    .transpose()?
+            let refresh_wait = self.controller.next_refresh_in(Instant::now());
+            let wait = match (pending, refresh_wait) {
+                (true, Some(refresh_wait)) => Some(WORKER_WAIT_INTERVAL.min(refresh_wait)),
+                (true, None) => Some(WORKER_WAIT_INTERVAL),
+                (false, refresh_wait) => refresh_wait,
+            };
+            let input = if let Some(wait) = wait {
+                event::poll(wait)?.then(event::read).transpose()?
             } else {
                 Some(event::read()?)
             };
 
             let quit = if let Some(input) = input
-                && let Some(intent) =
-                    map_event(input, InputMode::Normal, self.controller.model().geometry())
-            {
+                && let Some(intent) = map_event_with_keybindings(
+                    input,
+                    InputMode::Normal,
+                    self.controller.model().geometry(),
+                    Some(self.controller.keybindings()),
+                ) {
                 let transition = self.controller.apply(intent, &mut self.workers);
                 self.dirty |= transition.dirty;
                 transition.quit
@@ -61,6 +69,7 @@ impl App {
             while let Some(result) = self.workers.try_recv() {
                 self.dirty |= self.controller.apply_result(result, &mut self.workers);
             }
+            self.dirty |= self.controller.tick(Instant::now(), &mut self.workers);
 
             if quit {
                 break;

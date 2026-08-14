@@ -17,6 +17,7 @@ fn normalize_nonempty(value: impl Into<String>) -> Option<String> {
 }
 
 pub mod app;
+pub mod config;
 mod controller;
 pub mod conversations;
 pub mod files;

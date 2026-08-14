@@ -39,6 +39,16 @@ impl OmpSource {
             inner: KnownJsonlSource::new(project, store_root, format)?,
         })
     }
+    pub(crate) fn new_with_source_id(
+        project: ProjectIdentity,
+        store_root: PathBuf,
+        source_id: SourceId,
+    ) -> Result<Self, ConversationSourceError> {
+        let format = OmpFormat::new(&store_root)?;
+        Ok(Self {
+            inner: KnownJsonlSource::new_with_source_id(project, store_root, format, source_id)?,
+        })
+    }
 
     fn metadata_budget_error(&self, candidate: &ConversationCandidate) -> ConversationSourceError {
         let error = ConversationSourceError::new(

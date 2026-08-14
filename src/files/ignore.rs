@@ -30,6 +30,37 @@ impl VisibilityPolicy for DefaultVisibilityPolicy {
         })
     }
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfiguredVisibilityPolicy {
+    show_hidden: bool,
+    exclusions: Vec<PathBuf>,
+}
+
+impl ConfiguredVisibilityPolicy {
+    #[must_use]
+    pub const fn new(show_hidden: bool, exclusions: Vec<PathBuf>) -> Self {
+        Self {
+            show_hidden,
+            exclusions,
+        }
+    }
+}
+
+impl VisibilityPolicy for ConfiguredVisibilityPolicy {
+    fn is_visible(&self, relative_path: &Path) -> bool {
+        let normal = relative_path.components().all(|component| {
+            let std::path::Component::Normal(name) = component else {
+                return false;
+            };
+            self.show_hidden || !name.as_encoded_bytes().starts_with(b".")
+        });
+        normal
+            && !self
+                .exclusions
+                .iter()
+                .any(|excluded| relative_path.starts_with(excluded))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VisibleEntryKind {
@@ -73,6 +104,13 @@ impl IgnorePolicy {
             workspace_root,
             Arc::new(DefaultVisibilityPolicy),
         )
+    }
+    pub(crate) fn for_workspace_with_visibility(
+        root: PathBuf,
+        workspace_root: PathBuf,
+        visibility: Arc<dyn VisibilityPolicy>,
+    ) -> io::Result<Self> {
+        Self::with_workspace_visibility_policy(root, workspace_root, visibility)
     }
 
     fn with_workspace_visibility_policy(

@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
@@ -84,7 +85,14 @@ fn refresh_all(index: &mut ConversationIndex, registry: &SourceRegistry) -> usiz
                 MetadataBudget::new(512 * 1024).expect("budget"),
             )
             .expect("index refresh");
-        assert!(refresh.errors().is_empty(), "{:?}", refresh.errors());
+        assert!(
+            refresh.errors().iter().all(|error| {
+                error.kind()
+                    == herdr_context::conversations::sources::ConversationSourceErrorKind::Unavailable
+            }),
+            "{:?}",
+            refresh.errors()
+        );
         if !refresh.has_more() {
             break;
         }
@@ -147,6 +155,80 @@ fn thousands_of_sessions_are_published_recent_first_in_bounded_pages() {
         recent.conversations().last().expect("recent").updated_at()
             >= older.conversations().first().expect("older").updated_at()
     );
+}
+
+#[test]
+fn configured_cache_limit_retains_only_the_newest_metadata() {
+    let (_project_dir, project, _home, codex_root, state) = setup();
+    install_codex_sessions(&codex_root, &project, 40);
+    let registry = registry(&project, &codex_root);
+    let mut index = ConversationIndex::open_with_max_entries(
+        state.path().join("plugin-state"),
+        project,
+        NonZeroUsize::new(16).expect("limit"),
+    )
+    .expect("index");
+
+    refresh_all(&mut index, &registry);
+
+    assert_eq!(index.len(), 16);
+    assert_eq!(
+        index.page(0, 16).conversations()[0]
+            .session_reference()
+            .id(),
+        uuid(39)
+    );
+}
+#[test]
+fn increasing_cache_limit_replays_trimmed_sessions() {
+    let (_project_dir, project, _home, codex_root, state) = setup();
+    install_codex_sessions(&codex_root, &project, 40);
+    let registry = registry(&project, &codex_root);
+    let state_dir = state.path().join("plugin-state");
+    let mut limited = ConversationIndex::open_with_max_entries(
+        &state_dir,
+        project.clone(),
+        NonZeroUsize::new(16).expect("limit"),
+    )
+    .expect("limited index");
+    refresh_all(&mut limited, &registry);
+    assert_eq!(limited.len(), 16);
+    drop(limited);
+
+    let mut expanded = ConversationIndex::open_with_max_entries(
+        &state_dir,
+        project,
+        NonZeroUsize::new(64).expect("limit"),
+    )
+    .expect("expanded index");
+    refresh_all(&mut expanded, &registry);
+
+    assert_eq!(expanded.len(), 40);
+}
+
+#[test]
+fn removing_a_configured_source_purges_its_cached_metadata() {
+    let (_project_dir, project, _home, codex_root, state) = setup();
+    install_codex_sessions(&codex_root, &project, 1);
+    let configured = registry(&project, &codex_root);
+    let state_dir = state.path().join("plugin-state");
+    let mut index = ConversationIndex::open(&state_dir, project.clone()).expect("index");
+    refresh_all(&mut index, &configured);
+    assert_eq!(index.len(), 1);
+
+    let cache = cache_files(&state_dir).remove(0);
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&cache).expect("cache")).expect("cache JSON");
+    json["watermarks"] = serde_json::json!([]);
+    fs::write(&cache, serde_json::to_vec(&json).expect("encoded cache"))
+        .expect("cache without watermarks");
+    let mut index = ConversationIndex::open(&state_dir, project).expect("reload cache");
+    assert_eq!(index.len(), 1);
+
+    let disabled = SourceRegistry::new(Vec::new()).expect("empty registry");
+    refresh_all(&mut index, &disabled);
+
+    assert!(index.is_empty());
 }
 
 #[test]
@@ -254,6 +336,7 @@ fn cache_is_private_atomically_replaced_and_contains_only_allowlisted_metadata()
         BTreeSet::from([
             "entries",
             "generation",
+            "max_entries",
             "project_root",
             "schema_version",
             "watermarks",
@@ -419,7 +502,7 @@ fn cancelled_refresh_does_not_publish_a_cache_generation() {
 }
 
 #[test]
-fn deleted_project_local_sessions_are_removed_from_the_cache() {
+fn unavailable_project_local_store_retains_cached_sessions() {
     let (project_dir, project, _home, _codex_root, state) = setup();
     let directory = project_dir.path().join(".herdr/conversations");
     fs::create_dir_all(&directory).expect("conversation directory");
@@ -475,11 +558,11 @@ fn deleted_project_local_sessions_are_removed_from_the_cache() {
     assert_eq!(index.len(), 1);
     fs::remove_dir_all(directory).expect("remove registered store");
     refresh_all(&mut index, &registry);
-    assert!(index.is_empty());
+    assert_eq!(index.len(), 1);
 }
 
 #[test]
-fn unavailable_known_store_purges_its_cached_sessions() {
+fn unavailable_known_store_retains_its_cached_sessions() {
     let (_project_dir, project, _home, codex_root, state) = setup();
     install_codex_sessions(&codex_root, &project, 1);
     let registry = registry(&project, &codex_root);
@@ -490,7 +573,7 @@ fn unavailable_known_store_purges_its_cached_sessions() {
 
     fs::remove_dir_all(codex_root).expect("remove Codex store");
     refresh_all(&mut index, &registry);
-    assert!(index.is_empty());
+    assert_eq!(index.len(), 1);
 }
 
 #[cfg(unix)]

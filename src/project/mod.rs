@@ -2,9 +2,19 @@
 
 mod root;
 
-pub use root::{IoError, ProjectResolutionError, path_is_within, resolve_project_context};
+pub use root::{
+    IoError, ProjectResolutionError, path_is_within, resolve_project_context,
+    resolve_project_context_with_backend,
+};
 
 use std::path::{Path, PathBuf};
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VcsBackendSelection {
+    #[default]
+    Auto,
+    Git,
+    Jujutsu,
+}
 
 /// Canonical, absolute path used at domain boundaries.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

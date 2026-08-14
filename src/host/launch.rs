@@ -63,20 +63,27 @@ pub enum ToggleOutcome {
 pub struct DockLauncher {
     state_dir: PathBuf,
     lock_timeout: Duration,
+    width: DockWidth,
 }
 
 impl DockLauncher {
     #[must_use]
-    pub const fn new(state_dir: PathBuf) -> Self {
+    pub fn new(state_dir: PathBuf) -> Self {
         Self {
             state_dir,
             lock_timeout: Duration::from_secs(2),
+            width: DockWidth::clamped(DEFAULT_DOCK_WIDTH),
         }
     }
 
     #[must_use]
     pub const fn with_lock_timeout(mut self, timeout: Duration) -> Self {
         self.lock_timeout = timeout;
+        self
+    }
+    #[must_use]
+    pub const fn with_width(mut self, width: DockWidth) -> Self {
+        self.width = width;
         self
     }
 
@@ -127,7 +134,7 @@ impl DockLauncher {
                     target_pane_id,
                     context.tab_id().clone(),
                     captured_cwd,
-                    DockWidth::clamped(DEFAULT_DOCK_WIDTH),
+                    self.width,
                 );
                 let opened_pane_id = host.open_dock(&request)?;
                 let panes = host.panes_in_tab(context.workspace_id(), context.tab_id())?;

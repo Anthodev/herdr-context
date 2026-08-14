@@ -139,6 +139,15 @@ impl<F: KnownFormat> KnownJsonlSource<F> {
         format: F,
     ) -> Result<Self, ConversationSourceError> {
         let id = SourceId::new(format.source_id()).expect("static source ID is valid");
+        Self::new_with_source_id(project, store_root, format, id)
+    }
+
+    pub(super) fn new_with_source_id(
+        project: ProjectIdentity,
+        store_root: PathBuf,
+        format: F,
+        id: SourceId,
+    ) -> Result<Self, ConversationSourceError> {
         if !cfg!(unix) {
             return Err(ConversationSourceError::new(
                 id,

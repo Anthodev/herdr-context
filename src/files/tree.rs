@@ -98,6 +98,20 @@ impl FilesTree {
             selection: None,
         })
     }
+    pub(crate) fn for_workspace_with_visibility(
+        root: PathBuf,
+        workspace_root: PathBuf,
+        visibility: Arc<dyn VisibilityPolicy>,
+    ) -> io::Result<Self> {
+        let ignore = IgnorePolicy::for_workspace_with_visibility(root, workspace_root, visibility)?;
+        Ok(Self {
+            loader: DirectoryLoader { ignore },
+            nodes: Arc::new(BTreeMap::new()),
+            statuses: Arc::new(BTreeMap::new()),
+            children: Arc::new(BTreeMap::new()),
+            selection: None,
+        })
+    }
 
     pub fn with_visibility_policy(
         root: PathBuf,

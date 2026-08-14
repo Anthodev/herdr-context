@@ -4,7 +4,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::{CanonicalPath, DetectedVcs, ProjectContext, ProjectIdentity, VcsBackendIdentity};
+use super::{
+    CanonicalPath, DetectedVcs, ProjectContext, ProjectIdentity, VcsBackendIdentity,
+    VcsBackendSelection,
+};
 
 /// Resolves project identity without running VCS commands or scanning descendants.
 ///
@@ -13,6 +16,13 @@ use super::{CanonicalPath, DetectedVcs, ProjectContext, ProjectIdentity, VcsBack
 /// nearest root, Jujutsu is authoritative.
 pub fn resolve_project_context(
     opening_directory: impl AsRef<Path>,
+) -> Result<ProjectContext, ProjectResolutionError> {
+    resolve_project_context_with_backend(opening_directory, VcsBackendSelection::Auto)
+}
+
+pub fn resolve_project_context_with_backend(
+    opening_directory: impl AsRef<Path>,
+    backend: VcsBackendSelection,
 ) -> Result<ProjectContext, ProjectResolutionError> {
     let files_root = opening_directory.as_ref().to_path_buf();
     if !files_root.is_absolute() {
@@ -27,14 +37,14 @@ pub fn resolve_project_context(
 
     let mut selected = None;
     for ancestor in canonical_opening.as_path().ancestors() {
-        if valid_jj_marker(ancestor)? {
+        if backend != VcsBackendSelection::Git && valid_jj_marker(ancestor)? {
             selected = Some((
                 "jj",
                 CanonicalPath::from_canonicalized(ancestor.to_path_buf()),
             ));
             break;
         }
-        if valid_git_marker(ancestor)? {
+        if backend != VcsBackendSelection::Jujutsu && valid_git_marker(ancestor)? {
             selected = Some((
                 "git",
                 CanonicalPath::from_canonicalized(ancestor.to_path_buf()),

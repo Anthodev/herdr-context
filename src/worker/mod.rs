@@ -17,6 +17,7 @@ type JobTask = Box<dyn FnOnce(&AtomicBool) -> JobOutput + Send + 'static>;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum JobKind {
+    Config,
     Bootstrap,
     Filesystem,
     Vcs,
