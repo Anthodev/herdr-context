@@ -1,0 +1,16 @@
+[package]
+name = "herdr-sqlite-vfs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+
+[dependencies]
+libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = "warn"
+nursery = "warn"

@@ -107,6 +107,7 @@ impl ConversationSource for FixtureSource {
             candidate.project_identity().clone(),
             Some("Sanitized fixture".to_owned()),
             Some(SystemTime::UNIX_EPOCH),
+            None,
             SystemTime::UNIX_EPOCH,
             ConversationState::Archived,
             vec![provenance],

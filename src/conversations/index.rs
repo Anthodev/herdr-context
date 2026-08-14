@@ -533,6 +533,8 @@ struct CachedConversation {
     #[serde(default)]
     title: Option<String>,
     created_at: Option<TimeParts>,
+    #[serde(default)]
+    archived_at: Option<TimeParts>,
     updated_at: TimeParts,
     state: String,
     provenance_kind: String,
@@ -590,6 +592,7 @@ impl CachedConversation {
             session_id: session_id.to_owned(),
             title: conversation.title().map(str::to_owned),
             created_at: conversation.created_at().map(TimeParts::from_system_time),
+            archived_at: conversation.archived_at().map(TimeParts::from_system_time),
             updated_at: TimeParts::from_system_time(conversation.updated_at()),
             state: state.to_owned(),
             provenance_kind: provenance_kind.to_owned(),
@@ -620,6 +623,9 @@ impl CachedConversation {
         self.updated_at.to_system_time()?;
         if let Some(created) = self.created_at {
             created.to_system_time()?;
+        }
+        if let Some(archived) = self.archived_at {
+            archived.to_system_time()?;
         }
         if !matches!(self.state.as_str(), "live" | "archived" | "unknown")
             || !matches!(
@@ -701,6 +707,10 @@ impl CachedConversation {
                 .map(TimeParts::to_system_time)
                 .transpose()
                 .map_err(|_| ConversationIndexError::InvalidCache("cached timestamp is invalid"))?,
+            self.archived_at
+                .map(TimeParts::to_system_time)
+                .transpose()
+                .map_err(|_| ConversationIndexError::InvalidCache("cached timestamp is invalid"))?,
             self.updated_at()?,
             state,
             vec![ConversationProvenance::new(
@@ -768,6 +778,7 @@ fn validate_source(source: &str, tool: Option<&str>) -> Result<(), LoadFailure> 
         "project-local-generic-jsonl" => "generic-jsonl",
         "claude-code" => "claude-code",
         "codex-cli" => "codex-cli",
+        "opencode" => "opencode",
         "omp" => "omp",
         "pi" => "pi",
         _ => return Err(LoadFailure::Incompatible),

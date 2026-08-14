@@ -43,6 +43,7 @@ fn conversation(
         project.clone(),
         None,
         Some(UNIX_EPOCH + Duration::from_secs(updated_seconds)),
+        None,
         UNIX_EPOCH + Duration::from_secs(updated_seconds),
         ConversationState::Unknown,
         vec![ConversationProvenance::new(
