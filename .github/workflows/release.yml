@@ -1,0 +1,176 @@
+---
+name: Release
+
+"on":
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Release quality gates
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust 1.97.1
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+
+      - name: Install Python 3.11
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate manifest, versions, and performance verdicts
+        run: python3 scripts/release.py validate --tag "$GITHUB_REF_NAME"
+
+      - name: Test release tooling
+        run: python3 -m unittest discover -s tests -p test_release.py
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-targets --all-features --locked
+
+  package:
+    name: Package ${{ matrix.target }}
+    needs: quality
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            herdr_asset: herdr-linux-x86_64
+            herdr_sha256: b872ea7e40fa2cb17e857ac9b62b1bf26db7b403c622f5d2f3f5b35f6e9acd28
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            herdr_asset: herdr-linux-aarch64
+            herdr_sha256: f647ac66468d9efbc642fe534fb284468f0aea60641606fc008dfc0d82a3ca87
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            herdr_asset: herdr-macos-x86_64
+            herdr_sha256: 77cb5afd6c8fcaaaf3bc28e474ec01c209331ad08094e20d7f8aa9b0bb78d649
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            herdr_asset: herdr-macos-aarch64
+            herdr_sha256: d53a9f93fccfdfcc55632927bf51002f5add0aa7990bcdf508ffbd84ac658178
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust 1.97.1
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+
+      - name: Install Python 3.11
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Remove developer paths from release objects
+        run: echo "RUSTFLAGS=--remap-path-prefix=$GITHUB_WORKSPACE=/usr/src/herdr-context --remap-path-prefix=$HOME=/usr/src/home" >> "$GITHUB_ENV"
+
+      - name: Build locked release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Create deterministic archives twice
+        run: |
+          scripts/package-release.sh \
+            --target "${{ matrix.target }}" \
+            --binary "target/${{ matrix.target }}/release/herdr-context" \
+            --output-dir target/release-a
+          scripts/package-release.sh \
+            --target "${{ matrix.target }}" \
+            --binary "target/${{ matrix.target }}/release/herdr-context" \
+            --output-dir target/release-b
+          cmp target/release-a/*.tar.gz target/release-b/*.tar.gz
+          cmp target/release-a/*.sha256 target/release-b/*.sha256
+
+      - name: Download pinned Herdr 0.8.0
+        env:
+          HERDR_ASSET: ${{ matrix.herdr_asset }}
+          HERDR_SHA256: ${{ matrix.herdr_sha256 }}
+        run: |
+          curl --fail --location --silent --show-error \
+            "https://github.com/herdrdev/herdr/releases/download/v0.8.0/$HERDR_ASSET" \
+            --output target/herdr
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          actual = hashlib.sha256(Path("target/herdr").read_bytes()).hexdigest()
+          expected = os.environ["HERDR_SHA256"]
+          if actual != expected:
+              raise SystemExit(f"Herdr checksum mismatch: {actual}")
+          PY
+          chmod 755 target/herdr
+
+      - name: Verify clean packaged installation
+        run: |
+          scripts/verify-clean-install.sh \
+            target/release-a/*.tar.gz \
+            target/release-a/*.sha256 \
+            --herdr-bin target/herdr
+
+      - name: Upload verified release artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: herdr-context-${{ matrix.target }}
+          path: |
+            target/release-a/*.tar.gz
+            target/release-a/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs: package
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: herdr-context-*
+          path: release-files
+          merge-multiple: true
+
+      - name: Create combined checksum index
+        run: cat release-files/*.sha256 | LC_ALL=C sort > release-files/SHA256SUMS
+
+      - name: Publish immutable tag artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            release-files/*.tar.gz \
+            release-files/*.sha256 \
+            release-files/SHA256SUMS \
+            --verify-tag \
+            --generate-notes \
+            --title "herdr-context $GITHUB_REF_NAME"

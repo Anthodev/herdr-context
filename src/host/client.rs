@@ -35,27 +35,38 @@ const MAX_LIVE_TITLE_BYTES: usize = 256;
 #[derive(Clone, Debug)]
 pub struct CommandHostClient {
     binary: PathBuf,
+    plugin_root: Option<PathBuf>,
     timeout: Duration,
 }
 
 impl CommandHostClient {
     pub fn from_env() -> Result<Self, HostError> {
-        env::var_os("HERDR_BIN_PATH")
+        let binary = env::var_os("HERDR_BIN_PATH")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
-            .map(Self::new)
             .ok_or_else(|| {
                 HostError::new(
                     HostErrorKind::Unavailable,
                     "missing required variable HERDR_BIN_PATH",
                 )
-            })
+            })?;
+        let plugin_root = env::var_os("HERDR_PLUGIN_ROOT")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                HostError::new(
+                    HostErrorKind::Unavailable,
+                    "missing required variable HERDR_PLUGIN_ROOT",
+                )
+            })?;
+        Ok(Self::new(binary).with_plugin_root(plugin_root))
     }
 
     #[must_use]
     pub const fn new(binary: PathBuf) -> Self {
         Self {
             binary,
+            plugin_root: None,
             timeout: DEFAULT_COMMAND_TIMEOUT,
         }
     }
@@ -63,6 +74,12 @@ impl CommandHostClient {
     #[must_use]
     pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    #[must_use]
+    pub fn with_plugin_root(mut self, plugin_root: PathBuf) -> Self {
+        self.plugin_root = Some(plugin_root);
         self
     }
 
@@ -220,6 +237,9 @@ impl HostClient for CommandHostClient {
     }
 
     fn open_dock(&mut self, request: &OpenDockRequest) -> Result<PaneId, HostError> {
+        let mut origin_cwd = OsString::from("HERDR_CONTEXT_ORIGIN_CWD=");
+        origin_cwd.push(request.cwd().as_os_str());
+        let pane_cwd = self.plugin_root.as_deref().unwrap_or_else(|| request.cwd());
         let args = vec![
             OsString::from("plugin"),
             OsString::from("pane"),
@@ -235,7 +255,9 @@ impl HostClient for CommandHostClient {
             OsString::from("--direction"),
             OsString::from("right"),
             OsString::from("--cwd"),
-            request.cwd().as_os_str().to_owned(),
+            pane_cwd.as_os_str().to_owned(),
+            OsString::from("--env"),
+            origin_cwd,
             OsString::from("--focus"),
         ];
         let result = self.invoke(args)?;
