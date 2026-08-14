@@ -68,14 +68,15 @@ require a dedicated adapter and cannot be inferred safely.
 ### Controls
 
 - `Tab` / `Shift+Tab` or `1` / `2`: switch views without restarting the dock;
-- arrow keys or `h` / `j` / `k` / `l`: navigate the Files tree or Conversation
-  provider groups;
+- arrow keys or `h` / `j` / `k` / `l`: navigate the Files tree or visible
+  Conversation provider/session rows;
 - `Home` / `End`: select the first or last visible row;
-- `Enter` / `Space`: expand or collapse the selected directory or provider;
+- `Enter` / `Space`: expand or collapse the selected directory or Conversation
+  provider; no Conversation action is attached to a session row;
 - `r`: refresh the active view;
-- left click selects and right click toggles a Files row or Conversation
-  provider; clicking a Conversation disclosure marker also toggles its group,
-  and the mouse wheel navigates;
+- left click selects a Files or Conversation row; right click toggles a Files
+  row or Conversation provider, and clicking a Conversation disclosure marker
+  also toggles its group; the mouse wheel navigates;
 - `q`, `Esc`, or `Ctrl+C`: close the TUI and restore the terminal.
 
 ### Project-local generic conversations
@@ -92,6 +93,22 @@ returned to the UI or diagnostics.
 Conversations are grouped alphabetically by provider, with sessions ordered
 most-recent-first inside each expanded group. Provider groups can be collapsed
 without loading or exposing transcript content.
+
+### Live Herdr conversations
+
+Conversation history remains filesystem-first. A separate coalesced background
+job reads Herdr's normalized `agent list` session references, associates them
+with the canonical project, and enriches matching rows without writing live
+metadata to the conversation cache. Matching uses, in order, the tool plus
+native session ID, an exact canonical transcript path plus file fingerprint,
+then a verified tool-specific path identity. Titles, timestamps, and path
+prefixes are never identities.
+
+Unmatched active sessions appear as transient live-only rows. Their stable
+documented identity lets selection survive when the filesystem transcript
+appears later. Herdr failures are warnings: filesystem history remains visible.
+The browser exposes status and resumability metadata only; it provides no
+resume, launch, edit, delete, summarize, or upload action.
 
 ### Verified external conversations
 

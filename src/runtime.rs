@@ -814,6 +814,7 @@ impl FilesRuntime {
             }
             JobKind::Bootstrap
             | JobKind::ConversationDiscovery
+            | JobKind::ConversationLive
             | JobKind::Process
             | JobKind::Filesystem => {}
         }

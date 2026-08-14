@@ -6,7 +6,8 @@ use std::path::PathBuf;
 
 use herdr_context::host::client::CommandHostClient;
 use herdr_context::host::{
-    DockIdentity, DockWidth, HostClient, OpenDockRequest, PaneId, TabId, WorkspaceId,
+    DockIdentity, DockWidth, HostAgentStatus, HostClient, HostErrorKind, HostSessionReference,
+    OpenDockRequest, PaneId, TabId, WorkspaceId,
 };
 use tempfile::TempDir;
 
@@ -108,6 +109,95 @@ esac
     assert!(argv.contains("pane resize --direction right"));
     assert!(argv.contains("plugin pane focus opened"));
     assert!(argv.contains("plugin pane close opened"));
+    Ok(())
+}
+
+#[test]
+fn argv_client_normalizes_bounded_live_agent_sessions() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let script = temp.path().join("fake-herdr-live");
+    let transcript = temp.path().join("session.jsonl");
+    let mut agents = (0..300)
+        .map(|index| {
+            serde_json::json!({
+                "agent": "shell",
+                "agent_status": "unknown",
+                "cwd": temp.path(),
+                "pane_id": format!("pane-shell-{index}"),
+            })
+        })
+        .collect::<Vec<_>>();
+    agents.push(serde_json::json!({
+        "agent": "omp",
+        "agent_session": {
+            "source": "herdr:omp",
+            "agent": "omp",
+            "kind": "path",
+            "value": transcript,
+        },
+        "agent_status": "working",
+        "cwd": temp.path(),
+        "foreground_cwd": temp.path(),
+        "pane_id": "pane-live",
+        "title": "live title",
+    }));
+    let response = serde_json::json!({
+        "id": "test",
+        "result": {
+            "type": "agent_list",
+            "agents": agents,
+        },
+    });
+    fs::write(
+        &script,
+        format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", response),
+    )?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+
+    let sessions = CommandHostClient::new(script.clone()).live_sessions()?;
+
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].source(), "herdr:omp");
+    assert_eq!(sessions[0].agent(), "omp");
+    assert_eq!(sessions[0].pane_id().as_str(), "pane-live");
+    assert_eq!(sessions[0].title(), Some("live title"));
+    assert_eq!(sessions[0].status(), HostAgentStatus::Working);
+    assert!(matches!(
+        sessions[0].reference(),
+        HostSessionReference::TranscriptPath(path) if path == &transcript
+    ));
+
+    let agents = (0..257)
+        .map(|index| {
+            serde_json::json!({
+                "agent": "omp",
+                "agent_session": {
+                    "source": "herdr:omp",
+                    "agent": "omp",
+                    "kind": "id",
+                    "value": format!("session-{index}"),
+                },
+                "agent_status": "working",
+                "cwd": temp.path(),
+                "pane_id": format!("pane-live-{index}"),
+            })
+        })
+        .collect::<Vec<_>>();
+    let response = serde_json::json!({
+        "id": "test",
+        "result": {
+            "type": "agent_list",
+            "agents": agents,
+        },
+    });
+    fs::write(
+        &script,
+        format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", response),
+    )?;
+    let error = CommandHostClient::new(script)
+        .live_sessions()
+        .expect_err("live session limit");
+    assert_eq!(error.kind(), HostErrorKind::InvalidResponse);
     Ok(())
 }
 

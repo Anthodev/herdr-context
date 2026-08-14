@@ -5,7 +5,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use herdr_context::conversations::{
     Conversation, ConversationProvenance, ConversationState, ProvenanceKind, ResumeCapability,
-    SessionReference, SourceId, ToolIdentity,
+    ResumeReference, SessionReference, SourceId, ToolIdentity,
 };
 use herdr_context::host::LaunchContext;
 use herdr_context::input::{InputMode, map_event};
@@ -185,4 +185,88 @@ fn terminal_control_characters_are_never_rendered_verbatim() {
     render_shell(&mut model, area, &mut buffer);
 
     assert!(!line(&buffer, 1).contains('\u{1b}'));
+
+    let project_dir = TempDir::new().expect("project");
+    let project = ProjectIdentity::from_canonical_root(project_dir.path().to_path_buf())
+        .expect("project identity");
+    let mut model = AppModel::new(context());
+    model.set_active_view(View::Conversations);
+    model.conversations_mut().replace_items(
+        vec![conversation(&project, "bad\u{1b}[2J", "session", 1)],
+        1,
+    );
+    let area = Rect::new(0, 0, 80, 4);
+    let mut buffer = Buffer::empty(area);
+    render_shell(&mut model, area, &mut buffer);
+    assert!((0..area.height).all(|row| !line(&buffer, row).contains('\u{1b}')));
+}
+
+#[test]
+fn live_metadata_and_background_states_render_in_wide_and_compact_layouts() {
+    let project_dir = TempDir::new().expect("project");
+    let project = ProjectIdentity::from_canonical_root(project_dir.path().to_path_buf())
+        .expect("project identity");
+    let rich = Conversation::new(
+        ToolIdentity::new("omp").expect("tool"),
+        SessionReference::new("omp", "session-live").expect("session"),
+        project,
+        Some("live\u{1b} title".to_owned()),
+        None,
+        None,
+        UNIX_EPOCH + Duration::from_secs(60),
+        ConversationState::Live,
+        vec![
+            ConversationProvenance::new(
+                SourceId::new("omp").expect("source"),
+                ProvenanceKind::ExternalLocal,
+                None,
+            ),
+            ConversationProvenance::new(
+                SourceId::new("herdr:omp").expect("source"),
+                ProvenanceKind::HostRuntime,
+                None,
+            ),
+        ],
+        ResumeCapability::Supported(
+            ResumeReference::new("session-live").expect("resume reference"),
+        ),
+    )
+    .expect("conversation");
+    let mut model = AppModel::new(context());
+    model.set_active_view(View::Conversations);
+    model
+        .conversations_mut()
+        .replace_items(vec![rich.clone()], 1);
+
+    let wide = Rect::new(0, 0, 120, 4);
+    let mut wide_buffer = Buffer::empty(wide);
+    render_shell(&mut model, wide, &mut wide_buffer);
+    let wide_row = line(&wide_buffer, 2);
+    assert!(wide_row.contains("live� title"));
+    assert!(wide_row.contains("tool=omp"));
+    assert!(wide_row.contains("updated=1970-01-01 00:01Z"));
+    assert!(wide_row.contains("source=external+live"));
+    assert!(wide_row.contains("resume=yes"));
+    assert!(wide_row.contains("state=live"));
+
+    model.conversations_mut().replace_items(vec![rich], 2);
+    let compact = Rect::new(0, 0, 80, 4);
+    let mut compact_buffer = Buffer::empty(compact);
+    render_shell(&mut model, compact, &mut compact_buffer);
+    let compact_row = line(&compact_buffer, 2);
+    assert!(compact_row.contains("live� title · omp · 1970-01-01 00:01Z · E+L · R · live"));
+
+    model.conversations_mut().set_live_loading(true);
+    let mut loading_buffer = Buffer::empty(wide);
+    render_shell(&mut model, wide, &mut loading_buffer);
+    assert!(line(&loading_buffer, 1).contains("Loading live sessions"));
+
+    model.conversations_mut().set_live_loading(false);
+    model
+        .conversations_mut()
+        .set_live_error(Some("bad\u{1b} live response".to_owned()));
+    let mut error_buffer = Buffer::empty(wide);
+    render_shell(&mut model, wide, &mut error_buffer);
+    assert!(line(&error_buffer, 1).contains("bad� live response"));
+    assert!(!line(&error_buffer, 1).contains('\u{1b}'));
 }

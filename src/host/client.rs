@@ -10,8 +10,8 @@ use command_group::{CommandGroup, GroupChild};
 use serde_json::Value;
 
 use super::{
-    DockIdentity, DockWidth, HostClient, HostError, HostErrorKind, HostPane, OpenDockRequest,
-    PaneId, TabId, WorkspaceId,
+    DockIdentity, DockWidth, HostAgentSession, HostAgentStatus, HostClient, HostError,
+    HostErrorKind, HostPane, HostSessionReference, OpenDockRequest, PaneId, TabId, WorkspaceId,
 };
 
 pub const PLUGIN_ID: &str = "herdr-context";
@@ -25,6 +25,11 @@ const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_EXECUTABLE_BUSY_RETRIES: usize = 10;
 const MAX_COMMAND_OUTPUT: u64 = 1024 * 1024;
+const MAX_LIVE_SESSIONS: usize = 256;
+const MAX_LIVE_ID_BYTES: usize = 256;
+const MAX_LIVE_LABEL_BYTES: usize = 64;
+const MAX_LIVE_PATH_BYTES: usize = 4_096;
+const MAX_LIVE_TITLE_BYTES: usize = 256;
 
 /// `HostClient` backed only by Herdr's public argv CLI.
 #[derive(Clone, Debug)]
@@ -166,6 +171,34 @@ impl HostClient for CommandHostClient {
             .collect()
     }
 
+    fn live_sessions(&self) -> Result<Vec<HostAgentSession>, HostError> {
+        let result = self.invoke(["agent", "list"])?;
+        expect_type(&result, "agent_list")?;
+        let agents = result
+            .get("agents")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                HostError::new(
+                    HostErrorKind::InvalidResponse,
+                    "agent list response is missing agents",
+                )
+            })?;
+        let mut sessions = Vec::new();
+        for agent in agents
+            .iter()
+            .filter(|agent| !agent.get("agent_session").is_none_or(Value::is_null))
+        {
+            if sessions.len() == MAX_LIVE_SESSIONS {
+                return Err(HostError::new(
+                    HostErrorKind::InvalidResponse,
+                    "agent list exceeds the live session limit",
+                ));
+            }
+            sessions.push(parse_live_session(agent)?);
+        }
+        Ok(sessions)
+    }
+
     fn verified_dock_identity(
         &mut self,
         pane: &HostPane,
@@ -294,6 +327,167 @@ impl HostClient for CommandHostClient {
             ),
         ))
     }
+}
+
+fn parse_live_session(value: &Value) -> Result<HostAgentSession, HostError> {
+    let session = value
+        .get("agent_session")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            HostError::new(
+                HostErrorKind::InvalidResponse,
+                "agent response has invalid session metadata",
+            )
+        })?;
+    let source = bounded_string(
+        session.get("source"),
+        "live session source",
+        MAX_LIVE_LABEL_BYTES,
+    )?;
+    if !source.starts_with("herdr:") {
+        return Err(HostError::new(
+            HostErrorKind::InvalidResponse,
+            "live session source is not an official Herdr integration",
+        ));
+    }
+    let agent = bounded_string(
+        session.get("agent"),
+        "live session agent",
+        MAX_LIVE_LABEL_BYTES,
+    )?;
+    if let Some(reported) = value.get("agent").filter(|reported| !reported.is_null()) {
+        let reported = bounded_string(Some(reported), "agent identity", MAX_LIVE_LABEL_BYTES)?;
+        if reported != agent {
+            return Err(HostError::new(
+                HostErrorKind::InvalidResponse,
+                "agent and live session identities conflict",
+            ));
+        }
+    }
+    let kind = bounded_string(
+        session.get("kind"),
+        "live session reference kind",
+        MAX_LIVE_LABEL_BYTES,
+    )?;
+    let reference = match kind {
+        "id" => HostSessionReference::NativeId(
+            bounded_string(
+                session.get("value"),
+                "live session native ID",
+                MAX_LIVE_ID_BYTES,
+            )?
+            .to_owned(),
+        ),
+        "path" => {
+            let raw = bounded_string(
+                session.get("value"),
+                "live session transcript path",
+                MAX_LIVE_PATH_BYTES,
+            )?;
+            let path = PathBuf::from(raw);
+            if !path.is_absolute() {
+                return Err(HostError::new(
+                    HostErrorKind::InvalidResponse,
+                    "live session transcript path is not absolute",
+                ));
+            }
+            HostSessionReference::TranscriptPath(path)
+        }
+        _ => {
+            return Err(HostError::new(
+                HostErrorKind::InvalidResponse,
+                "live session reference kind is unsupported",
+            ));
+        }
+    };
+    let pane_id = PaneId::new(bounded_string(
+        value.get("pane_id"),
+        "live session pane ID",
+        MAX_LIVE_LABEL_BYTES,
+    )?)?;
+    let cwd = optional_bounded_path(value.get("cwd"), "live session cwd")?;
+    let foreground_cwd =
+        optional_bounded_path(value.get("foreground_cwd"), "live session foreground cwd")?;
+    let title = optional_bounded_string(
+        value.get("title"),
+        "live session title",
+        MAX_LIVE_TITLE_BYTES,
+    )?;
+    let status = match bounded_string(
+        value.get("agent_status"),
+        "live session agent status",
+        MAX_LIVE_LABEL_BYTES,
+    )? {
+        "idle" => HostAgentStatus::Idle,
+        "working" => HostAgentStatus::Working,
+        "blocked" => HostAgentStatus::Blocked,
+        "done" => HostAgentStatus::Done,
+        "unknown" => HostAgentStatus::Unknown,
+        _ => {
+            return Err(HostError::new(
+                HostErrorKind::InvalidResponse,
+                "live session agent status is unsupported",
+            ));
+        }
+    };
+    HostAgentSession::new(
+        source,
+        agent,
+        reference,
+        pane_id,
+        cwd,
+        foreground_cwd,
+        title,
+        status,
+    )
+}
+
+fn bounded_string<'a>(
+    value: Option<&'a Value>,
+    field: &str,
+    max_bytes: usize,
+) -> Result<&'a str, HostError> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= max_bytes
+                && value.trim() == *value
+                && !value.contains('\0')
+        })
+        .ok_or_else(|| {
+            HostError::new(
+                HostErrorKind::InvalidResponse,
+                format!("Herdr response has invalid {field}"),
+            )
+        })
+}
+
+fn optional_bounded_string(
+    value: Option<&Value>,
+    field: &str,
+    max_bytes: usize,
+) -> Result<Option<String>, HostError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => bounded_string(Some(value), field, max_bytes)
+            .map(str::to_owned)
+            .map(Some),
+    }
+}
+
+fn optional_bounded_path(value: Option<&Value>, field: &str) -> Result<Option<PathBuf>, HostError> {
+    let Some(raw) = optional_bounded_string(value, field, MAX_LIVE_PATH_BYTES)? else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        return Err(HostError::new(
+            HostErrorKind::InvalidResponse,
+            format!("Herdr response has non-absolute {field}"),
+        ));
+    }
+    Ok(Some(path))
 }
 
 fn parse_pane(value: &Value) -> Result<HostPane, HostError> {

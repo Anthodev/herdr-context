@@ -1,9 +1,13 @@
+use std::time::UNIX_EPOCH;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
+use time::OffsetDateTime;
 
+use crate::conversations::{Conversation, ConversationState, ProvenanceKind, ResumeCapability};
 use crate::model::ConversationsViewState;
 
 use super::sanitize_terminal_text;
@@ -56,13 +60,7 @@ pub(crate) fn render(state: &ConversationsViewState, area: Rect, buffer: &mut Bu
                 return;
             }
             if absolute_row >= state.scroll() {
-                let title = conversation
-                    .title()
-                    .unwrap_or_else(|| conversation.session_reference().id());
-                let mut line = Line::from(vec![
-                    Span::raw("  "),
-                    Span::raw(sanitize_terminal_text(title)),
-                ]);
+                let mut line = conversation_line(conversation, area.width >= 96);
                 if state.selection() == Some(conversation.session_reference()) {
                     line = line.style(Style::new().add_modifier(Modifier::REVERSED));
                 }
@@ -78,4 +76,91 @@ pub(crate) fn render(state: &ConversationsViewState, area: Rect, buffer: &mut Bu
             return;
         }
     }
+}
+
+fn conversation_line(conversation: &Conversation, wide: bool) -> Line<'static> {
+    let title = sanitize_terminal_text(
+        conversation
+            .title()
+            .unwrap_or_else(|| conversation.session_reference().id()),
+    )
+    .into_owned();
+    let updated = display_timestamp(conversation.updated_at());
+    let tool = sanitize_terminal_text(conversation.tool().as_str()).into_owned();
+    let provenance = provenance_label(conversation, wide);
+    let resumable = matches!(
+        conversation.resume_capability(),
+        ResumeCapability::Supported(_)
+    );
+    let state = match conversation.state() {
+        ConversationState::Live => "live",
+        ConversationState::Archived => "archived",
+        ConversationState::Unknown => "unknown",
+    };
+    let metadata = if wide {
+        format!(
+            "  tool={} updated={updated} source={provenance} resume={} state={state}",
+            tool,
+            if resumable { "yes" } else { "no" },
+        )
+    } else {
+        format!(
+            " · {} · {updated} · {provenance} · {} · {state}",
+            tool,
+            if resumable { "R" } else { "-" },
+        )
+    };
+    Line::from(vec![
+        Span::raw("  "),
+        Span::raw(title),
+        Span::styled(metadata, Style::new().fg(Color::DarkGray)),
+    ])
+}
+
+fn display_timestamp(value: std::time::SystemTime) -> String {
+    let Some(seconds) = value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+    else {
+        return "before-epoch".to_owned();
+    };
+    let Ok(value) = OffsetDateTime::from_unix_timestamp(seconds) else {
+        return "out-of-range".to_owned();
+    };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}Z",
+        value.year(),
+        u8::from(value.month()),
+        value.day(),
+        value.hour(),
+        value.minute(),
+    )
+}
+
+fn provenance_label(conversation: &Conversation, wide: bool) -> String {
+    let mut project = false;
+    let mut external = false;
+    let mut live = false;
+    for provenance in conversation.provenance() {
+        match provenance.kind() {
+            ProvenanceKind::ProjectLocal => project = true,
+            ProvenanceKind::ExternalLocal => external = true,
+            ProvenanceKind::HostRuntime => live = true,
+        }
+    }
+    let labels = if wide {
+        [
+            project.then_some("project"),
+            external.then_some("external"),
+            live.then_some("live"),
+        ]
+    } else {
+        [
+            project.then_some("P"),
+            external.then_some("E"),
+            live.then_some("L"),
+        ]
+    };
+    labels.into_iter().flatten().collect::<Vec<_>>().join("+")
 }

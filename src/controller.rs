@@ -4,37 +4,58 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 use crate::conversations::Conversation;
+use crate::conversations::active::{
+    FilesystemConversationSnapshot, LiveConversationSnapshot, merge_prepared_live_sessions,
+    prepare_filesystem_conversations, prepare_live_conversations,
+};
 use crate::conversations::discovery::discover_conversations_cancellable;
 use crate::conversations::index::ConversationIndex;
 use crate::conversations::sources::{
     ConversationSourceError, DiscoveryLimit, GenericJsonlSource, KnownStoreRoots, MetadataBudget,
     SourceRegistry,
 };
-use crate::host::LaunchContext;
+use crate::host::client::CommandHostClient;
+use crate::host::{HostClient, LaunchContext};
 use crate::intent::{Intent, View};
 use crate::model::{AppModel, LoadingState};
-use crate::project::resolve_project_context;
+use crate::project::{ProjectIdentity, resolve_project_context};
 use crate::runtime::{FilesRuntime, RuntimeMessage};
 use crate::ui::render_shell;
 use crate::worker::{CompletedJob, Job, JobKey, JobKind, Priority, SubmitStatus, WorkerRuntime};
 
 struct BootstrapResult(Result<FilesRuntime, crate::runtime::FilesRuntimeError>);
 struct ConversationsResult(ConversationJobResult);
+struct LiveConversationsResult(LiveConversationJobResult);
 
 enum ConversationJobResult {
     Ready {
-        conversations: Vec<Conversation>,
+        project: ProjectIdentity,
+        conversations: FilesystemConversationSnapshot,
         has_more: bool,
         source_errors: Vec<String>,
         reset_source_errors: bool,
     },
     Cancelled,
     Error(String),
+}
+
+enum LiveConversationJobResult {
+    Ready(LiveSnapshot),
+    Cancelled,
+    Error(String),
+}
+
+#[derive(Clone)]
+struct LiveSnapshot {
+    project: ProjectIdentity,
+    sessions: LiveConversationSnapshot,
+    observed_at: SystemTime,
 }
 #[derive(Clone, Debug)]
 struct ConversationPaths {
@@ -65,6 +86,10 @@ pub struct Controller {
     model: AppModel,
     files: Option<FilesRuntime>,
     conversation_paths: Option<ConversationPaths>,
+    host_binary: Option<PathBuf>,
+    filesystem_conversations: Option<FilesystemConversationSnapshot>,
+    conversation_project: Option<ProjectIdentity>,
+    live_snapshot: Option<LiveSnapshot>,
 }
 
 impl Controller {
@@ -73,6 +98,12 @@ impl Controller {
             model: AppModel::new(context),
             files: None,
             conversation_paths: ConversationPaths::from_env(),
+            host_binary: env::var_os("HERDR_BIN_PATH")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+            filesystem_conversations: None,
+            conversation_project: None,
+            live_snapshot: None,
         }
     }
     #[cfg(test)]
@@ -85,6 +116,10 @@ impl Controller {
             model: AppModel::new(context),
             files: None,
             conversation_paths: Some(ConversationPaths { state_dir, home }),
+            host_binary: None,
+            filesystem_conversations: None,
+            conversation_project: None,
+            live_snapshot: None,
         }
     }
 
@@ -114,6 +149,7 @@ impl Controller {
 
     fn schedule_conversations(&mut self, workers: &mut WorkerRuntime) {
         self.schedule_conversation_page(workers, true);
+        self.schedule_live_conversations(workers);
     }
 
     fn schedule_conversation_page(&mut self, workers: &mut WorkerRuntime, show_loading: bool) {
@@ -153,6 +189,45 @@ impl Controller {
                 .set_loading(LoadingState::Error(
                     "background conversation queue is unavailable".to_owned(),
                 ));
+        }
+    }
+
+    fn schedule_live_conversations(&mut self, workers: &mut WorkerRuntime) {
+        let Some(binary) = self.host_binary.clone() else {
+            self.model.conversations_mut().set_live_loading(false);
+            return;
+        };
+        let (requested, applied) = self.model.conversations().live_generations();
+        let generation = requested.saturating_add(1);
+        self.model
+            .conversations_mut()
+            .set_live_generations(generation, applied);
+        self.model.conversations_mut().set_live_loading(true);
+        let root = self
+            .model
+            .launch_context()
+            .foreground_cwd()
+            .unwrap_or_else(|| self.model.launch_context().cwd())
+            .to_path_buf();
+        let job = Job::new(
+            JobKey::new(JobKind::ConversationLive, &root),
+            generation,
+            Priority::Low,
+            move |cancelled| {
+                Box::new(LiveConversationsResult(load_live_conversations(
+                    &root, binary, cancelled,
+                )))
+            },
+        );
+        if !accepted(workers.submit(job)) {
+            self.live_snapshot = None;
+            self.model
+                .conversations_mut()
+                .set_live_error(Some("Herdr live session queue is unavailable".to_owned()));
+            let visible = self.merged_conversations();
+            self.model
+                .conversations_mut()
+                .replace_live_items(visible, generation);
         }
     }
 
@@ -229,8 +304,20 @@ impl Controller {
                 && let Some(files) = &mut self.files
             {
                 files.fail_background(kind, generation, workers);
-            }
-            if !matches!(kind, JobKind::Filesystem | JobKind::Vcs) {
+            } else if kind == JobKind::ConversationLive {
+                let requested = self.model.conversations().live_generations().0;
+                if generation < requested {
+                    return false;
+                }
+                self.live_snapshot = None;
+                self.model.conversations_mut().set_live_error(Some(
+                    "Herdr live session worker stopped unexpectedly".to_owned(),
+                ));
+                let visible = self.merged_conversations();
+                self.model
+                    .conversations_mut()
+                    .replace_live_items(visible, generation);
+            } else {
                 self.set_worker_error(kind);
             }
             self.retry_files(workers);
@@ -276,15 +363,19 @@ impl Controller {
                 };
                 match result.0 {
                     ConversationJobResult::Ready {
+                        project,
                         conversations,
                         has_more,
                         source_errors,
                         reset_source_errors,
                     } => {
+                        self.conversation_project = Some(project);
+                        self.filesystem_conversations = Some(conversations);
+                        let visible = self.merged_conversations();
                         let changed = self
                             .model
                             .conversations_mut()
-                            .replace_items(conversations, generation);
+                            .replace_items(visible, generation);
                         let mut visible_errors = if reset_source_errors {
                             Vec::new()
                         } else {
@@ -319,6 +410,47 @@ impl Controller {
                     }
                 }
             }
+            JobKind::ConversationLive => {
+                let generation = result.generation();
+                let requested = self.model.conversations().live_generations().0;
+                if generation < requested {
+                    return false;
+                }
+                let Ok(result) = result.downcast::<LiveConversationsResult>() else {
+                    self.live_snapshot = None;
+                    self.model
+                        .conversations_mut()
+                        .set_live_error(Some("invalid live conversation worker result".to_owned()));
+                    let visible = self.merged_conversations();
+                    self.model
+                        .conversations_mut()
+                        .replace_live_items(visible, generation);
+                    return true;
+                };
+                match result.0 {
+                    LiveConversationJobResult::Ready(snapshot) => {
+                        self.live_snapshot = Some(snapshot);
+                        self.model.conversations_mut().set_live_error(None);
+                    }
+                    LiveConversationJobResult::Cancelled => {
+                        self.model
+                            .conversations_mut()
+                            .set_live_generations(requested, generation);
+                        self.model.conversations_mut().set_live_loading(false);
+                        return true;
+                    }
+                    LiveConversationJobResult::Error(message) => {
+                        self.live_snapshot = None;
+                        self.model
+                            .conversations_mut()
+                            .set_live_error(Some(format!("Herdr: {message}")));
+                    }
+                }
+                let visible = self.merged_conversations();
+                self.model
+                    .conversations_mut()
+                    .replace_live_items(visible, generation)
+            }
             JobKind::Filesystem | JobKind::Vcs => {
                 let Ok(message) = result.downcast::<RuntimeMessage>() else {
                     self.model.files_mut().set_loading(LoadingState::Error(
@@ -345,6 +477,12 @@ impl Controller {
         let state = LoadingState::Error("background worker stopped unexpectedly".to_owned());
         match kind {
             JobKind::ConversationDiscovery => self.model.conversations_mut().set_loading(state),
+            JobKind::ConversationLive => {
+                self.model.conversations_mut().set_live_error(Some(
+                    "Herdr live session worker stopped unexpectedly".to_owned(),
+                ));
+                self.model.conversations_mut().set_live_loading(false);
+            }
             JobKind::Bootstrap | JobKind::Filesystem | JobKind::Vcs | JobKind::Process => {
                 self.model.files_mut().set_loading(state);
             }
@@ -355,6 +493,23 @@ impl Controller {
         if let Some(files) = &mut self.files {
             files.retry_pending(workers);
         }
+    }
+
+    fn merged_conversations(&self) -> Vec<Conversation> {
+        let Some(filesystem) = &self.filesystem_conversations else {
+            return Vec::new();
+        };
+        let Some(project) = &self.conversation_project else {
+            return Vec::new();
+        };
+        let Some(live) = self
+            .live_snapshot
+            .as_ref()
+            .filter(|live| live.project == *project)
+        else {
+            return filesystem.conversations().to_vec();
+        };
+        merge_prepared_live_sessions(filesystem, &live.sessions, project, live.observed_at)
     }
 
     fn sync_files_state(&mut self) {
@@ -439,7 +594,7 @@ fn load_conversations(
         .expect("non-zero conversation discovery limit");
     let budget = MetadataBudget::new(512 * 1024).expect("non-zero conversation metadata budget");
     let (conversations, has_more, source_errors) = if let Some(paths) = paths {
-        let mut index = match ConversationIndex::open(&paths.state_dir, project) {
+        let mut index = match ConversationIndex::open(&paths.state_dir, project.clone()) {
             Ok(index) => index,
             Err(error) => return ConversationJobResult::Error(error.to_string()),
         };
@@ -469,14 +624,48 @@ fn load_conversations(
         (discovery.into_conversations(), false, source_errors)
     };
     if cancelled.load(Ordering::Relaxed) {
+        return ConversationJobResult::Cancelled;
+    }
+    let conversations = prepare_filesystem_conversations(conversations);
+    if cancelled.load(Ordering::Relaxed) {
         ConversationJobResult::Cancelled
     } else {
         ConversationJobResult::Ready {
+            project,
             conversations,
             has_more,
             source_errors,
             reset_source_errors,
         }
+    }
+}
+
+fn load_live_conversations(
+    root: &Path,
+    binary: PathBuf,
+    cancelled: &AtomicBool,
+) -> LiveConversationJobResult {
+    if cancelled.load(Ordering::Relaxed) {
+        return LiveConversationJobResult::Cancelled;
+    }
+    let project = match resolve_project_context(root) {
+        Ok(context) => context.conversation_identity().clone(),
+        Err(_) => {
+            return LiveConversationJobResult::Error("project identity is unavailable".to_owned());
+        }
+    };
+    let sessions = match CommandHostClient::new(binary).live_sessions() {
+        Ok(sessions) => prepare_live_conversations(sessions, &project),
+        Err(error) => return LiveConversationJobResult::Error(error.to_string()),
+    };
+    if cancelled.load(Ordering::Relaxed) {
+        LiveConversationJobResult::Cancelled
+    } else {
+        LiveConversationJobResult::Ready(LiveSnapshot {
+            project,
+            sessions,
+            observed_at: SystemTime::now(),
+        })
     }
 }
 
@@ -537,7 +726,7 @@ mod tests {
             ToolIdentity::new(tool).expect("tool"),
             SessionReference::new(tool, session_id).expect("session"),
             project.clone(),
-            None,
+            Some(session_id.to_owned()),
             Some(UNIX_EPOCH + Duration::from_secs(updated_seconds)),
             None,
             UNIX_EPOCH + Duration::from_secs(updated_seconds),
@@ -641,6 +830,7 @@ mod tests {
         let small = Rect::new(0, 0, 40, 4);
         controller.render(small, &mut Buffer::empty(small));
         let mut workers = WorkerRuntime::with_capacities(2, 1);
+        assert!(controller.apply(Intent::SelectNext, &mut workers).dirty);
         assert!(controller.apply(Intent::SelectNext, &mut workers).dirty);
 
         let mut next_page = (0_u64..10)
@@ -980,6 +1170,240 @@ mod tests {
         let (requested, applied) = controller.model.conversations().generations();
         assert!(requested >= 2);
         assert_eq!(applied, requested);
+        workers.shutdown();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_and_live_jobs_merge_coalesce_and_fail_independently() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = TempDir::new().expect("project");
+        let directory = project.path().join(".herdr/conversations");
+        fs::create_dir_all(&directory).expect("conversation directory");
+        fs::write(
+            directory.join("filesystem.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "session_id": "filesystem-session",
+                    "cwd": project.path(),
+                    "timestamp": "2026-01-02T03:04:05Z",
+                    "role": "user",
+                    "message": "private controller fixture",
+                })
+            ),
+        )
+        .expect("filesystem conversation");
+        let live_id = "019b8721-4a18-7000-8005-000000000005";
+        let response = serde_json::json!({
+            "id": "test",
+            "result": {
+                "type": "agent_list",
+                "agents": [{
+                    "agent": "omp",
+                    "agent_session": {
+                        "source": "herdr:omp",
+                        "agent": "omp",
+                        "kind": "id",
+                        "value": live_id,
+                    },
+                    "agent_status": "working",
+                    "cwd": project.path(),
+                    "foreground_cwd": project.path(),
+                    "pane_id": "pane-live",
+                    "title": "live only",
+                }],
+            },
+        });
+        let binary = project.path().join("fake-herdr");
+        fs::write(
+            &binary,
+            format!("#!/bin/sh\nsleep 0.05\nprintf '%s\\n' '{response}'\n"),
+        )
+        .expect("fake Herdr");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+            .expect("executable fake Herdr");
+
+        let mut controller = controller(&project);
+        controller.host_binary = Some(binary.clone());
+        controller.model.set_active_view(View::Conversations);
+        let mut workers = WorkerRuntime::with_capacities(2, 4);
+        controller.start(&mut workers);
+        controller.schedule_live_conversations(&mut workers);
+        while workers.has_pending_work() {
+            let result = workers
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("worker result");
+            controller.apply_result(result, &mut workers);
+        }
+
+        assert!(
+            controller
+                .model
+                .conversations()
+                .items()
+                .iter()
+                .any(|item| item.session_reference().id() == "filesystem-session")
+        );
+        assert!(
+            controller
+                .model
+                .conversations()
+                .items()
+                .iter()
+                .any(|item| item.session_reference().id() == live_id)
+        );
+        let (requested, applied) = controller.model.conversations().live_generations();
+        assert_eq!(requested, 2);
+        assert_eq!(applied, requested);
+
+        fs::write(&binary, "#!/bin/sh\nprintf 'not json\\n'\n").expect("broken fake Herdr");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+            .expect("executable fake Herdr");
+        controller.apply(Intent::Refresh, &mut workers);
+        while workers.has_pending_work() {
+            let result = workers
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("worker result");
+            controller.apply_result(result, &mut workers);
+        }
+
+        assert_eq!(
+            controller.model.conversations().items().len(),
+            1,
+            "Herdr failure must remove only transient live rows"
+        );
+        assert_eq!(
+            controller.model.conversations().items()[0]
+                .session_reference()
+                .id(),
+            "filesystem-session"
+        );
+        assert!(
+            controller
+                .model
+                .conversations()
+                .visible_errors()
+                .iter()
+                .any(|error| error.starts_with("Herdr:"))
+        );
+        workers.shutdown();
+    }
+    #[test]
+    fn conversation_row_selection_survives_refresh_filter_and_view_switches() {
+        let project_dir = TempDir::new().expect("project");
+        let project = ProjectIdentity::from_canonical_root(project_dir.path().to_path_buf())
+            .expect("project identity");
+        let mut controller = controller(&project_dir);
+        controller.model.set_active_view(View::Conversations);
+        controller.model.conversations_mut().replace_items(
+            vec![
+                conversation(&project, "omp", "new", 20),
+                conversation(&project, "omp", "old", 10),
+            ],
+            1,
+        );
+        let area = Rect::new(0, 0, 50, 6);
+        controller.render(area, &mut Buffer::empty(area));
+        let mut workers = WorkerRuntime::with_capacities(2, 1);
+
+        assert!(controller.apply(Intent::SelectNext, &mut workers).dirty);
+        assert_eq!(
+            controller
+                .model
+                .conversations()
+                .selection()
+                .map(SessionReference::id),
+            Some("new")
+        );
+        controller.model.conversations_mut().set_filter("no-match");
+        controller.model.conversations_mut().replace_items(
+            vec![
+                conversation(&project, "omp", "new", 30),
+                conversation(&project, "omp", "old", 10),
+            ],
+            2,
+        );
+        assert_eq!(
+            controller
+                .model
+                .conversations()
+                .selection()
+                .map(SessionReference::id),
+            Some("new")
+        );
+        controller.apply(Intent::SwitchView(View::Files), &mut workers);
+        controller.apply(Intent::SwitchView(View::Conversations), &mut workers);
+        assert_eq!(
+            controller
+                .model
+                .conversations()
+                .selection()
+                .map(SessionReference::id),
+            Some("new")
+        );
+        controller.model.conversations_mut().set_filter("");
+        controller.render(area, &mut Buffer::empty(area));
+        assert!(
+            controller
+                .apply(
+                    Intent::Pointer {
+                        column: area.x.saturating_add(3),
+                        row: area.y.saturating_add(3),
+                        action: PointerAction::Select,
+                    },
+                    &mut workers,
+                )
+                .dirty
+        );
+        assert_eq!(
+            controller
+                .model
+                .conversations()
+                .selection()
+                .map(SessionReference::id),
+            Some("old")
+        );
+        workers.shutdown();
+    }
+
+    #[test]
+    fn filtered_navigation_enters_at_the_first_visible_row() {
+        let project_dir = TempDir::new().expect("project");
+        let project = ProjectIdentity::from_canonical_root(project_dir.path().to_path_buf())
+            .expect("project identity");
+        let mut controller = controller(&project_dir);
+        controller.model.set_active_view(View::Conversations);
+        controller.model.conversations_mut().replace_items(
+            vec![
+                conversation(&project, "omp", "hidden", 20),
+                conversation(&project, "omp", "visible", 10),
+            ],
+            1,
+        );
+        controller.model.conversations_mut().set_selection(Some(
+            SessionReference::new("omp", "hidden").expect("selection"),
+        ));
+        controller.model.conversations_mut().set_filter("visible");
+        let area = Rect::new(0, 0, 50, 6);
+        controller.render(area, &mut Buffer::empty(area));
+        let mut workers = WorkerRuntime::with_capacities(2, 1);
+
+        assert!(controller.apply(Intent::SelectNext, &mut workers).dirty);
+        assert_eq!(controller.model.conversations().selection(), None);
+        assert_eq!(
+            controller.model.conversations().selected_provider(),
+            Some("omp")
+        );
+        assert!(controller.apply(Intent::SelectNext, &mut workers).dirty);
+        assert_eq!(
+            controller
+                .model
+                .conversations()
+                .selection()
+                .map(SessionReference::id),
+            Some("visible")
+        );
         workers.shutdown();
     }
 }

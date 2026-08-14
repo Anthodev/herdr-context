@@ -21,6 +21,7 @@ pub enum JobKind {
     Filesystem,
     Vcs,
     ConversationDiscovery,
+    ConversationLive,
     Process,
 }
 

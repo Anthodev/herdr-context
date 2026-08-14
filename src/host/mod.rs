@@ -327,6 +327,141 @@ impl HostPane {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostAgentStatus {
+    Idle,
+    Working,
+    Blocked,
+    Done,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HostSessionReference {
+    NativeId(String),
+    TranscriptPath(PathBuf),
+}
+
+impl HostSessionReference {
+    #[must_use]
+    pub fn native_id(&self) -> Option<&str> {
+        match self {
+            Self::NativeId(value) => Some(value),
+            Self::TranscriptPath(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn transcript_path(&self) -> Option<&Path> {
+        match self {
+            Self::NativeId(_) => None,
+            Self::TranscriptPath(path) => Some(path),
+        }
+    }
+}
+
+/// Bounded, transport-neutral metadata for one live Herdr agent session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostAgentSession {
+    source: String,
+    agent: String,
+    reference: HostSessionReference,
+    pane_id: PaneId,
+    cwd: Option<PathBuf>,
+    foreground_cwd: Option<PathBuf>,
+    title: Option<String>,
+    status: HostAgentStatus,
+}
+
+impl HostAgentSession {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        source: impl Into<String>,
+        agent: impl Into<String>,
+        reference: HostSessionReference,
+        pane_id: PaneId,
+        cwd: Option<PathBuf>,
+        foreground_cwd: Option<PathBuf>,
+        title: Option<String>,
+        status: HostAgentStatus,
+    ) -> Result<Self, HostError> {
+        let source = crate::normalize_nonempty(source).ok_or_else(|| {
+            HostError::new(
+                HostErrorKind::InvalidResponse,
+                "live session source is empty",
+            )
+        })?;
+        let agent = crate::normalize_nonempty(agent).ok_or_else(|| {
+            HostError::new(
+                HostErrorKind::InvalidResponse,
+                "live session agent is empty",
+            )
+        })?;
+        let reference_is_valid = match &reference {
+            HostSessionReference::NativeId(value) => !value.trim().is_empty(),
+            HostSessionReference::TranscriptPath(path) => {
+                path.is_absolute() && !path.as_os_str().is_empty()
+            }
+        };
+        if !reference_is_valid {
+            return Err(HostError::new(
+                HostErrorKind::InvalidResponse,
+                "live session reference is invalid",
+            ));
+        }
+        Ok(Self {
+            source,
+            agent,
+            reference,
+            pane_id,
+            cwd,
+            foreground_cwd,
+            title: title.and_then(crate::normalize_nonempty),
+            status,
+        })
+    }
+
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    #[must_use]
+    pub fn agent(&self) -> &str {
+        &self.agent
+    }
+
+    #[must_use]
+    pub const fn reference(&self) -> &HostSessionReference {
+        &self.reference
+    }
+
+    #[must_use]
+    pub const fn pane_id(&self) -> &PaneId {
+        &self.pane_id
+    }
+
+    #[must_use]
+    pub fn cwd(&self) -> Option<&Path> {
+        self.cwd.as_deref()
+    }
+
+    #[must_use]
+    pub fn foreground_cwd(&self) -> Option<&Path> {
+        self.foreground_cwd.as_deref()
+    }
+
+    #[must_use]
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> HostAgentStatus {
+        self.status
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenDockRequest {
     origin_pane_id: PaneId,
@@ -380,6 +515,7 @@ pub trait HostClient: Send {
         workspace_id: &WorkspaceId,
         tab_id: &TabId,
     ) -> Result<Vec<HostPane>, HostError>;
+    fn live_sessions(&self) -> Result<Vec<HostAgentSession>, HostError>;
     fn verified_dock_identity(
         &mut self,
         pane: &HostPane,
