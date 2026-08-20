@@ -1002,6 +1002,7 @@ impl FilesRuntime {
             | JobKind::Bootstrap
             | JobKind::ConversationDiscovery
             | JobKind::ConversationLive
+            | JobKind::ConversationLaunch
             | JobKind::PaneInput
             | JobKind::Process
             | JobKind::Filesystem => {}

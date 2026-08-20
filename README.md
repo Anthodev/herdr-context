@@ -16,7 +16,7 @@ upstream Herdr, and keeps the plugin independently installable.
 
 ## Install a packaged release
 
-Version `0.13.0` supports these release targets:
+Version `0.14.0` supports these release targets:
 
 | Platform | Architecture | Artifact target |
 |---|---|---|
@@ -31,18 +31,18 @@ status needs `jj` `0.37` or newer. Missing optional VCS tools degrade the
 affected status view without closing the dock.
 
 Download the archive and adjacent `.sha256` file for the host target from the
-`v0.13.0` GitHub release, then verify and install it:
+`v0.14.0` GitHub release, then verify and install it:
 
 ```sh
 target=x86_64-unknown-linux-gnu # choose a target from the table
 
 # Linux checksum tool:
-sha256sum -c "herdr-context-v0.13.0-$target.tar.gz.sha256"
+sha256sum -c "herdr-context-v0.14.0-$target.tar.gz.sha256"
 # macOS checksum tool:
-shasum -a 256 -c "herdr-context-v0.13.0-$target.tar.gz.sha256"
+shasum -a 256 -c "herdr-context-v0.14.0-$target.tar.gz.sha256"
 
-tar -xzf "herdr-context-v0.13.0-$target.tar.gz"
-cd "herdr-context-v0.13.0-$target"
+tar -xzf "herdr-context-v0.14.0-$target.tar.gz"
+cd "herdr-context-v0.14.0-$target"
 ./install.sh
 ```
 
@@ -96,7 +96,8 @@ the disposable cache stores metadata only.
 Windows, musl Linux, older glibc releases, and architectures outside the table
 are not release targets. External conversation discovery remains restricted to
 the fixture-validated provider versions and local readable metadata. The
-Conversations view does not resume, edit, delete, summarize, or upload sessions.
+Conversations view can resume fixture-backed Claude Code, Codex CLI, Pi, OMP,
+and OpenCode sessions, but does not edit, delete, summarize, or upload them.
 Ratatui measurement excludes terminal-driver and multiplexer transport latency;
 see the retained performance evidence below.
 
@@ -137,6 +138,7 @@ bookmark, operation-rewrite, or other explicit mutation commands.
   enrichment rather than as the sole history source;
 - support an extensible set of LLM tools instead of a closed provider list;
 - show at least the title, tool, timestamp, source, and live/archived state;
+- resume supported sessions in a new focused tab of the current Herdr workspace;
 - isolate source-specific failures so one unreadable history cannot hide the
   others.
 
@@ -166,8 +168,9 @@ require a dedicated adapter and cannot be inferred safely.
 - `Home` / `End`: select the first or last visible row;
 - `Enter` / `Space`: expand or collapse the selected directory or Conversation
   provider; on a Files file row, insert its project-relative `@path` reference
-  followed by a space into the originating pane, then focus that pane; no
-  Conversation action is attached to a session row;
+  followed by a space into the originating pane, then focus that pane; on a
+  resumable Conversation session, open a new focused tab in the current Herdr
+  workspace and launch its harness with that session;
 - `r`: refresh the active view;
 - left click selects a Files or Conversation row; right click toggles a Files
   row or Conversation provider, and clicking a Conversation disclosure marker
@@ -322,7 +325,7 @@ renders status as potentially stale.
 
 ## Release status
 
-Version `0.13.0` is the V1 packaging contract. Tag `v0.13.0`, Cargo metadata,
+Version `0.14.0` is the V1 packaging contract. Tag `v0.14.0`, Cargo metadata,
 the source and packaged manifests, binary name, minimum Herdr version, archive
 names, and checksums are validated together. CI builds from `Cargo.lock` and
 blocks publication on formatting, Clippy, tests, release build, manifest,
