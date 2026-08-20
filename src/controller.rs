@@ -10,7 +10,6 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 use crate::config::{ConfigLoad, ExternalHistoryRoot, KeyBindings, PluginConfig};
-use crate::conversations::Conversation;
 use crate::conversations::active::{
     FilesystemConversationSnapshot, LiveConversationSnapshot, merge_filesystem_snapshots,
     merge_prepared_live_sessions, prepare_filesystem_conversations, prepare_live_conversations,
@@ -22,8 +21,9 @@ use crate::conversations::sources::{
     GenericJsonlSource, KnownStoreRoots, MetadataBudget, OmpSource, OpenCodeSource, PiSource,
     ProjectLocalLocation, SourceId, SourceRegistry,
 };
+use crate::conversations::{Conversation, ResumeCapability};
 use crate::host::client::CommandHostClient;
-use crate::host::{HostClient, LaunchContext};
+use crate::host::{AgentHarness, HostClient, LaunchContext, ResumeConversationRequest};
 use crate::intent::{Intent, View};
 use crate::model::{AppModel, LoadingState};
 use crate::project::{ProjectIdentity, resolve_project_context_with_backend};
@@ -37,6 +37,7 @@ struct ConfigResult(ConfigLoad);
 struct BootstrapResult(Result<FilesRuntime, crate::runtime::FilesRuntimeError>);
 struct ConversationsResult(ConversationJobResult);
 struct LiveConversationsResult(LiveConversationJobResult);
+struct ConversationLaunchResult(Result<(), crate::host::HostError>);
 struct PaneInputResult(Result<(), crate::host::HostError>);
 
 enum ConversationJobResult {
@@ -96,6 +97,8 @@ pub struct Controller {
     filesystem_conversations: Option<FilesystemConversationSnapshot>,
     conversation_project: Option<ProjectIdentity>,
     live_snapshot: Option<LiveSnapshot>,
+    conversation_launch_generation: u64,
+    conversation_launch_running: bool,
     pane_input_generation: u64,
     pane_input_queue: VecDeque<String>,
     pane_input_running: bool,
@@ -114,6 +117,8 @@ impl Controller {
                 .map(PathBuf::from),
             filesystem_conversations: None,
             conversation_project: None,
+            conversation_launch_generation: 0,
+            conversation_launch_running: false,
             pane_input_generation: 0,
             pane_input_queue: VecDeque::new(),
             pane_input_running: false,
@@ -138,6 +143,8 @@ impl Controller {
             host_binary: None,
             filesystem_conversations: None,
             conversation_project: None,
+            conversation_launch_generation: 0,
+            conversation_launch_running: false,
             pane_input_generation: 0,
             pane_input_queue: VecDeque::new(),
             pane_input_running: false,
@@ -321,6 +328,19 @@ impl Controller {
                     quit: false,
                 }
             }
+            Intent::ToggleSelected if self.model.active_view() == View::Conversations => {
+                let conversation = self.model.conversations().selected_conversation().cloned();
+                let dirty = match conversation {
+                    Some(conversation) => self.launch_conversation(conversation, workers),
+                    None => {
+                        let area = self.model.geometry().content();
+                        self.model
+                            .conversations_mut()
+                            .handle_intent(&Intent::ToggleSelected, area)
+                    }
+                };
+                Transition { dirty, quit: false }
+            }
             intent if self.model.active_view() == View::Conversations => {
                 let area = self.model.geometry().content();
                 let dirty = self.model.conversations_mut().handle_intent(&intent, area);
@@ -354,6 +374,77 @@ impl Controller {
             }
             _ => Transition::default(),
         }
+    }
+
+    fn launch_conversation(
+        &mut self,
+        conversation: Conversation,
+        workers: &mut WorkerRuntime,
+    ) -> bool {
+        if self.conversation_launch_running {
+            return false;
+        }
+        let reference = match conversation.resume_capability() {
+            ResumeCapability::Supported(reference) => reference.as_str(),
+            ResumeCapability::Unsupported => {
+                self.model
+                    .conversations_mut()
+                    .set_launch_error(Some("selected conversation cannot be resumed".to_owned()));
+                return true;
+            }
+        };
+        let Some(harness) = AgentHarness::from_tool(conversation.tool().as_str()) else {
+            self.model
+                .conversations_mut()
+                .set_launch_error(Some(format!(
+                    "no supported harness for {}",
+                    conversation.tool().as_str()
+                )));
+            return true;
+        };
+        let Some(binary) = self.host_binary.clone() else {
+            self.model
+                .conversations_mut()
+                .set_launch_error(Some("Herdr conversation launch is unavailable".to_owned()));
+            return true;
+        };
+        let request = match ResumeConversationRequest::new(
+            self.model.launch_context().workspace_id().clone(),
+            conversation.project_identity().root().to_path_buf(),
+            harness,
+            reference,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                self.model
+                    .conversations_mut()
+                    .set_launch_error(Some(format!("cannot open conversation: {error}")));
+                return true;
+            }
+        };
+        self.conversation_launch_generation = self.conversation_launch_generation.saturating_add(1);
+        let generation = self.conversation_launch_generation;
+        let key = JobKey::new(JobKind::ConversationLaunch, request.cwd());
+        let job = Job::new(key, generation, Priority::High, move |cancelled| {
+            let result = if cancelled.load(Ordering::Relaxed) {
+                Err(crate::host::HostError::new(
+                    crate::host::HostErrorKind::OperationFailed,
+                    "conversation launch was cancelled",
+                ))
+            } else {
+                CommandHostClient::new(binary).resume_conversation(&request)
+            };
+            Box::new(ConversationLaunchResult(result))
+        });
+        if accepted(workers.submit(job)) {
+            self.conversation_launch_running = true;
+            self.model.conversations_mut().set_launch_error(None);
+            return true;
+        }
+        self.model.conversations_mut().set_launch_error(Some(
+            "Herdr conversation launch queue is unavailable".to_owned(),
+        ));
+        true
     }
 
     fn send_file_reference(&mut self, reference: String, workers: &mut WorkerRuntime) -> bool {
@@ -454,6 +545,11 @@ impl Controller {
                 self.model
                     .conversations_mut()
                     .replace_live_items(visible, generation);
+            } else if kind == JobKind::ConversationLaunch {
+                self.conversation_launch_running = false;
+                self.model.conversations_mut().set_launch_error(Some(
+                    "Herdr conversation launch worker stopped unexpectedly".to_owned(),
+                ));
             } else if kind == JobKind::PaneInput {
                 self.pane_input_running = false;
                 self.set_worker_error(kind);
@@ -617,6 +713,22 @@ impl Controller {
                     .conversations_mut()
                     .replace_live_items(visible, generation)
             }
+            JobKind::ConversationLaunch => {
+                self.conversation_launch_running = false;
+                let launch_error = result.downcast::<ConversationLaunchResult>().map_or_else(
+                    |_| Some("invalid Herdr conversation launch worker result".to_owned()),
+                    |result| {
+                        result
+                            .0
+                            .err()
+                            .map(|error| format!("cannot open conversation: {error}"))
+                    },
+                );
+                self.model
+                    .conversations_mut()
+                    .set_launch_error(launch_error);
+                true
+            }
             JobKind::PaneInput => {
                 self.pane_input_running = false;
                 let notice = result.downcast::<PaneInputResult>().map_or_else(
@@ -670,6 +782,12 @@ impl Controller {
                     "Herdr live session worker stopped unexpectedly".to_owned(),
                 ));
                 self.model.conversations_mut().set_live_loading(false);
+            }
+            JobKind::ConversationLaunch => {
+                self.conversation_launch_running = false;
+                self.model.conversations_mut().set_launch_error(Some(
+                    "Herdr conversation launch worker stopped unexpectedly".to_owned(),
+                ));
             }
             JobKind::PaneInput => {
                 if let Some(files) = &mut self.files {
@@ -1105,7 +1223,7 @@ mod tests {
     };
     use crate::conversations::{
         Conversation, ConversationProvenance, ConversationState, ProvenanceKind, ResumeCapability,
-        SessionReference, SourceId, ToolIdentity,
+        ResumeReference, SessionReference, SourceId, ToolIdentity,
     };
     use crate::host::LaunchContext;
     use crate::intent::{Intent, PointerAction, View};
@@ -1201,6 +1319,36 @@ esac
         session_id: &str,
         updated_seconds: u64,
     ) -> Conversation {
+        conversation_with_resume(
+            project,
+            tool,
+            session_id,
+            updated_seconds,
+            ResumeCapability::Unsupported,
+        )
+    }
+
+    fn resumable_conversation(
+        project: &ProjectIdentity,
+        tool: &str,
+        session_id: &str,
+    ) -> Conversation {
+        conversation_with_resume(
+            project,
+            tool,
+            session_id,
+            1,
+            ResumeCapability::Supported(ResumeReference::new(session_id).expect("resume")),
+        )
+    }
+
+    fn conversation_with_resume(
+        project: &ProjectIdentity,
+        tool: &str,
+        session_id: &str,
+        updated_seconds: u64,
+        resume: ResumeCapability,
+    ) -> Conversation {
         Conversation::new(
             ToolIdentity::new(tool).expect("tool"),
             SessionReference::new(tool, session_id).expect("session"),
@@ -1215,9 +1363,73 @@ esac
                 ProvenanceKind::ExternalLocal,
                 None,
             )],
-            ResumeCapability::Unsupported,
+            resume,
         )
         .expect("conversation")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conversation_enter_launches_one_resumed_harness_in_a_new_tab() {
+        let project_dir = TempDir::new().expect("project");
+        let project = ProjectIdentity::from_canonical_root(project_dir.path().to_path_buf())
+            .expect("project identity");
+        let host = TempDir::new().expect("host");
+        let argv = host.path().join("argv.log");
+        let script = host.path().join("fake-herdr");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  tab\ create*)
+    printf '%s\n' '{{"id":"test","result":{{"type":"tab_created","tab":{{"tab_id":"created-tab"}},"root_pane":{{"pane_id":"created-pane"}}}}}}'
+    ;;
+  agent\ start*|"tab focus created-tab")
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#,
+                argv.display(),
+            ),
+        )
+        .expect("script");
+        let mut permissions = fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script, permissions).expect("permissions");
+
+        let mut controller = controller(&project_dir);
+        controller.host_binary = Some(script);
+        controller.model.set_active_view(View::Conversations);
+        controller.model.conversations_mut().replace_items(
+            vec![resumable_conversation(&project, "omp", "session-id")],
+            1,
+        );
+        let area = Rect::new(0, 0, 80, 8);
+        controller.render(area, &mut Buffer::empty(area));
+        let mut workers = WorkerRuntime::with_capacities(2, 1);
+
+        assert!(controller.apply(Intent::SelectNext, &mut workers).dirty);
+        assert!(controller.apply(Intent::ToggleSelected, &mut workers).dirty);
+        assert!(!controller.apply(Intent::ToggleSelected, &mut workers).dirty);
+        let result = workers
+            .recv_timeout(Duration::from_secs(1))
+            .expect("conversation launch result");
+        assert_eq!(result.key().kind(), JobKind::ConversationLaunch);
+        assert!(controller.apply_result(result, &mut workers));
+        workers.shutdown();
+
+        assert!(controller.model.conversations().visible_errors().is_empty());
+        assert_eq!(
+            fs::read_to_string(argv).expect("argv"),
+            format!(
+                "tab create --workspace workspace --cwd {} --no-focus\nagent start omp --kind omp --pane created-pane --timeout 30000 -- --resume session-id\ntab focus created-tab\n",
+                project.root().display()
+            )
+        );
     }
 
     #[test]

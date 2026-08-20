@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use herdr_context::host::client::CommandHostClient;
 use herdr_context::host::{
-    DockIdentity, DockWidth, HostAgentStatus, HostClient, HostErrorKind, HostSessionReference,
-    OpenDockRequest, PaneId, TabId, WorkspaceId,
+    AgentHarness, DockIdentity, DockWidth, HostAgentStatus, HostClient, HostErrorKind,
+    HostSessionReference, OpenDockRequest, PaneId, ResumeConversationRequest, TabId, WorkspaceId,
 };
 use tempfile::TempDir;
 
@@ -211,6 +211,151 @@ fn argv_client_normalizes_bounded_live_agent_sessions() -> Result<(), Box<dyn st
         .live_sessions()
         .expect_err("live session limit");
     assert_eq!(error.kind(), HostErrorKind::InvalidResponse);
+    Ok(())
+}
+
+#[test]
+fn argv_client_resumes_every_supported_harness_in_a_new_focused_tab()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Duration;
+
+    let temp = TempDir::new()?;
+    let log = temp.path().join("argv.log");
+    let script = temp.path().join("fake-herdr-resume");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+for arg in "$@"; do printf '<%s>' "$arg" >> '{}'; done
+printf '\n' >> '{}'
+case "$*" in
+  "tab create --workspace workspace --cwd /project with space --no-focus")
+    printf '%s\n' '{{"id":"test","result":{{"type":"tab_created","tab":{{"tab_id":"created-tab"}},"root_pane":{{"pane_id":"created-pane"}}}}}}'
+    ;;
+  agent\ start*|"tab focus created-tab")
+    ;;
+  *)
+    printf '%s\n' '{{"error":{{"code":"operation_failed","message":"unexpected argv"}},"id":"test"}}'
+    exit 1
+    ;;
+esac
+"#,
+            log.display(),
+            log.display(),
+        ),
+    )?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+    let client = CommandHostClient::new(script)
+        .with_timeout(Duration::from_millis(20))
+        .with_agent_ready_timeout(Duration::from_millis(5));
+    let workspace = WorkspaceId::new("workspace")?;
+
+    let cases = [
+        (
+            "claude-code",
+            AgentHarness::Claude,
+            "<agent><start><claude><--kind><claude><--pane><created-pane><--timeout><5><--><--resume><session-id>",
+        ),
+        (
+            "codex-cli",
+            AgentHarness::Codex,
+            "<agent><start><codex><--kind><codex><--pane><created-pane><--timeout><5><--><resume><session-id>",
+        ),
+        (
+            "opencode",
+            AgentHarness::OpenCode,
+            "<agent><start><opencode><--kind><opencode><--pane><created-pane><--timeout><5><--><--session><session-id>",
+        ),
+        (
+            "omp",
+            AgentHarness::Omp,
+            "<agent><start><omp><--kind><omp><--pane><created-pane><--timeout><5><--><--resume><session-id>",
+        ),
+        (
+            "pi",
+            AgentHarness::Pi,
+            "<agent><start><pi><--kind><pi><--pane><created-pane><--timeout><5><--><--session><session-id>",
+        ),
+    ];
+    for (tool, harness, expected_start) in cases {
+        assert_eq!(AgentHarness::from_tool(tool), Some(harness));
+        let request = ResumeConversationRequest::new(
+            workspace.clone(),
+            PathBuf::from("/project with space"),
+            harness,
+            "session-id",
+        )?;
+        client.resume_conversation(&request)?;
+        assert!(
+            fs::read_to_string(&log)?
+                .lines()
+                .any(|line| line == expected_start)
+        );
+    }
+    assert_eq!(AgentHarness::from_tool("generic-jsonl"), None);
+
+    let argv = fs::read_to_string(log)?;
+    assert_eq!(
+        argv.matches(
+            "<tab><create><--workspace><workspace><--cwd></project with space><--no-focus>"
+        )
+        .count(),
+        5
+    );
+    assert_eq!(argv.matches("<tab><focus><created-tab>").count(), 5);
+    Ok(())
+}
+
+#[test]
+fn argv_client_closes_created_tab_when_harness_start_fails()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Duration;
+
+    let temp = TempDir::new()?;
+    let log = temp.path().join("argv.log");
+    let script = temp.path().join("fake-herdr-resume-failure");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  tab\ create*)
+    printf '%s\n' '{{"id":"test","result":{{"type":"tab_created","tab":{{"tab_id":"created-tab"}},"root_pane":{{"pane_id":"created-pane"}}}}}}'
+    ;;
+  agent\ start*)
+    printf '%s\n' '{{"error":{{"code":"operation_failed","message":"harness failed"}},"id":"test"}}'
+    exit 1
+    ;;
+  "tab close created-tab")
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#,
+            log.display(),
+        ),
+    )?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+    let client = CommandHostClient::new(script)
+        .with_timeout(Duration::from_millis(20))
+        .with_agent_ready_timeout(Duration::from_millis(5));
+    let request = ResumeConversationRequest::new(
+        WorkspaceId::new("workspace")?,
+        PathBuf::from("/project"),
+        AgentHarness::Omp,
+        "session-id",
+    )?;
+
+    let error = client
+        .resume_conversation(&request)
+        .expect_err("harness start must fail");
+
+    assert!(error.to_string().contains("harness failed"));
+    let argv = fs::read_to_string(log)?;
+    assert!(argv.contains("tab close created-tab\n"));
+    assert!(!argv.contains("tab focus"));
     Ok(())
 }
 

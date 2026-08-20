@@ -10,8 +10,9 @@ use command_group::{CommandGroup, GroupChild};
 use serde_json::Value;
 
 use super::{
-    DockIdentity, DockWidth, HostAgentSession, HostAgentStatus, HostClient, HostError,
-    HostErrorKind, HostPane, HostSessionReference, OpenDockRequest, PaneId, TabId, WorkspaceId,
+    AgentHarness, DockIdentity, DockWidth, HostAgentSession, HostAgentStatus, HostClient,
+    HostError, HostErrorKind, HostPane, HostSessionReference, OpenDockRequest, PaneId,
+    ResumeConversationRequest, TabId, WorkspaceId,
 };
 
 pub const PLUGIN_ID: &str = "herdr-context";
@@ -23,6 +24,7 @@ const MAX_FOCUS_STEPS: usize = 256;
 const MAX_RESIZE_ATTEMPTS: usize = 8;
 const MIN_OTHER_PANE_WIDTH: u16 = 10;
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_EXECUTABLE_BUSY_RETRIES: usize = 10;
 const MAX_COMMAND_OUTPUT: u64 = 1024 * 1024;
@@ -38,6 +40,7 @@ pub struct CommandHostClient {
     binary: PathBuf,
     plugin_root: Option<PathBuf>,
     timeout: Duration,
+    agent_ready_timeout: Duration,
 }
 
 impl CommandHostClient {
@@ -69,6 +72,7 @@ impl CommandHostClient {
             binary,
             plugin_root: None,
             timeout: DEFAULT_COMMAND_TIMEOUT,
+            agent_ready_timeout: DEFAULT_AGENT_READY_TIMEOUT,
         }
     }
 
@@ -77,19 +81,16 @@ impl CommandHostClient {
         self.timeout = timeout;
         self
     }
+    #[must_use]
+    pub const fn with_agent_ready_timeout(mut self, timeout: Duration) -> Self {
+        self.agent_ready_timeout = timeout;
+        self
+    }
 
     #[must_use]
     pub fn with_plugin_root(mut self, plugin_root: PathBuf) -> Self {
         self.plugin_root = Some(plugin_root);
         self
-    }
-
-    fn run<I, S>(&self, args: I) -> Result<ProcessOutput, HostError>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        self.run_with_timeout(args, self.timeout)
     }
 
     fn run_with_timeout<I, S>(&self, args: I, timeout: Duration) -> Result<ProcessOutput, HostError>
@@ -160,7 +161,19 @@ impl CommandHostClient {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let output = self.run(args)?;
+        self.invoke_without_response_with_timeout(args, self.timeout)
+    }
+
+    fn invoke_without_response_with_timeout<I, S>(
+        &self,
+        args: I,
+        timeout: Duration,
+    ) -> Result<(), HostError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = self.run_with_timeout(args, timeout)?;
         if output.status.success() {
             return Ok(());
         }
@@ -178,6 +191,87 @@ impl CommandHostClient {
         Err(response_error(&response, &output.stderr))
     }
 
+    pub fn resume_conversation(
+        &self,
+        request: &ResumeConversationRequest,
+    ) -> Result<(), HostError> {
+        let operation_timeout = self
+            .agent_ready_timeout
+            .saturating_add(self.timeout.saturating_mul(4));
+        let deadline = Instant::now()
+            .checked_add(operation_timeout)
+            .ok_or_else(conversation_launch_timeout)?;
+        let create_timeout = command_timeout(deadline, self.timeout, self.timeout)?;
+        let result = self.invoke_with_timeout(
+            [
+                OsString::from("tab"),
+                OsString::from("create"),
+                OsString::from("--workspace"),
+                OsString::from(request.workspace_id().as_str()),
+                OsString::from("--cwd"),
+                request.cwd().as_os_str().to_owned(),
+                OsString::from("--no-focus"),
+            ],
+            create_timeout,
+        )?;
+        let tab_id = TabId::new(required_string(&result, "/tab/tab_id", "created tab id")?)
+            .map_err(HostError::from)?;
+        let pane_id = match required_string(&result, "/root_pane/pane_id", "created root pane id")
+            .and_then(|pane_id| PaneId::new(pane_id).map_err(HostError::from))
+        {
+            Ok(pane_id) => pane_id,
+            Err(error) => {
+                self.close_created_tab(&tab_id, deadline);
+                return Err(error);
+            }
+        };
+
+        let start_timeout = match command_timeout(
+            deadline,
+            self.timeout,
+            self.agent_ready_timeout.saturating_add(self.timeout),
+        ) {
+            Ok(timeout) => timeout,
+            Err(error) => {
+                self.close_created_tab(&tab_id, deadline);
+                return Err(error);
+            }
+        };
+        let start_result = self.invoke_without_response_with_timeout(
+            agent_start_arguments(request, &pane_id, self.agent_ready_timeout),
+            start_timeout,
+        );
+        if let Err(error) = start_result {
+            self.close_created_tab(&tab_id, deadline);
+            return Err(error);
+        }
+
+        let focus_timeout = match command_timeout(deadline, self.timeout, self.timeout) {
+            Ok(timeout) => timeout,
+            Err(error) => {
+                self.close_created_tab(&tab_id, deadline);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self
+            .invoke_without_response_with_timeout(["tab", "focus", tab_id.as_str()], focus_timeout)
+        {
+            self.close_created_tab(&tab_id, deadline);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn close_created_tab(&self, tab_id: &TabId, deadline: Instant) {
+        let timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(self.timeout);
+        if !timeout.is_zero() {
+            let _ = self
+                .invoke_without_response_with_timeout(["tab", "close", tab_id.as_str()], timeout);
+        }
+    }
+
     fn layout(&self, pane_id: &PaneId) -> Result<Value, HostError> {
         let result = self.invoke(["pane", "layout", "--pane", pane_id.as_str()])?;
         expect_type(&result, "pane_layout")?;
@@ -188,6 +282,64 @@ impl CommandHostClient {
             )
         })
     }
+}
+
+fn command_timeout(
+    deadline: Instant,
+    reserve: Duration,
+    limit: Duration,
+) -> Result<Duration, HostError> {
+    let available = deadline
+        .saturating_duration_since(Instant::now())
+        .saturating_sub(reserve)
+        .min(limit);
+    if available.is_zero() {
+        return Err(conversation_launch_timeout());
+    }
+    Ok(available)
+}
+
+fn conversation_launch_timeout() -> HostError {
+    HostError::new(
+        HostErrorKind::OperationFailed,
+        "conversation launch timed out",
+    )
+}
+
+fn agent_start_arguments(
+    request: &ResumeConversationRequest,
+    pane_id: &PaneId,
+    ready_timeout: Duration,
+) -> Vec<OsString> {
+    let harness = request.harness();
+    let timeout_ms = ready_timeout.as_millis().clamp(1, 300_000).to_string();
+    let mut args = vec![
+        OsString::from("agent"),
+        OsString::from("start"),
+        OsString::from(harness.as_str()),
+        OsString::from("--kind"),
+        OsString::from(harness.as_str()),
+        OsString::from("--pane"),
+        OsString::from(pane_id.as_str()),
+        OsString::from("--timeout"),
+        OsString::from(timeout_ms),
+        OsString::from("--"),
+    ];
+    match harness {
+        AgentHarness::Claude | AgentHarness::Omp => {
+            args.push(OsString::from("--resume"));
+            args.push(OsString::from(request.reference()));
+        }
+        AgentHarness::Codex => {
+            args.push(OsString::from("resume"));
+            args.push(OsString::from(request.reference()));
+        }
+        AgentHarness::OpenCode | AgentHarness::Pi => {
+            args.push(OsString::from("--session"));
+            args.push(OsString::from(request.reference()));
+        }
+    }
+    args
 }
 
 impl HostClient for CommandHostClient {

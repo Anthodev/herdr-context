@@ -1,6 +1,7 @@
 #![cfg(feature = "perf-harness")]
 
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use herdr_context::host::LaunchContext;
@@ -10,6 +11,14 @@ use herdr_context::perf::{
     summarize_durations,
 };
 use tempfile::TempDir;
+
+static PROCESS_PROBE_LOCK: Mutex<()> = Mutex::new(());
+
+fn process_probe_guard() -> MutexGuard<'static, ()> {
+    PROCESS_PROBE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[test]
 fn duration_summary_uses_nearest_rank_percentiles() {
@@ -100,6 +109,7 @@ fn live_snapshot_is_process_local_and_internally_consistent() {
 
 #[test]
 fn first_frame_measurement_does_not_start_background_work() {
+    let _probe_guard = process_probe_guard();
     let temp = TempDir::new().expect("project");
     let summary = measure_first_frame(&context(temp.path()), 1, 3).expect("first frame");
 
@@ -118,6 +128,7 @@ fn first_frame_measurement_does_not_start_background_work() {
 )]
 #[test]
 fn files_probe_measures_changed_navigation_and_shuts_workers_down() {
+    let _probe_guard = process_probe_guard();
     let temp = TempDir::new().expect("project");
     for index in 0..16 {
         std::fs::write(temp.path().join(format!("item-{index:02}")), b"synthetic")
@@ -135,6 +146,7 @@ fn files_probe_measures_changed_navigation_and_shuts_workers_down() {
 
 #[test]
 fn idle_probe_tracks_cpu_without_redrawing_clean_state() {
+    let _probe_guard = process_probe_guard();
     let temp = TempDir::new().expect("project");
     let mut probe = FilesProbe::new(&context(temp.path()), 80, 24).expect("files probe");
 
@@ -153,6 +165,7 @@ fn idle_probe_tracks_cpu_without_redrawing_clean_state() {
 )]
 #[test]
 fn rapid_refresh_probe_settles_coalesced_work_before_cleanup() {
+    let _probe_guard = process_probe_guard();
     let temp = TempDir::new().expect("project");
     let mut probe = FilesProbe::new(&context(temp.path()), 80, 24).expect("files probe");
 

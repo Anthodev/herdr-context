@@ -484,6 +484,103 @@ impl HostAgentSession {
     }
 }
 
+const MAX_RESUME_REFERENCE_BYTES: usize = 256;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentHarness {
+    Claude,
+    Codex,
+    OpenCode,
+    Omp,
+    Pi,
+}
+
+impl AgentHarness {
+    #[must_use]
+    pub fn from_tool(tool: &str) -> Option<Self> {
+        match tool {
+            "claude-code" => Some(Self::Claude),
+            "codex-cli" => Some(Self::Codex),
+            "opencode" => Some(Self::OpenCode),
+            "omp" => Some(Self::Omp),
+            "pi" => Some(Self::Pi),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::OpenCode => "opencode",
+            Self::Omp => "omp",
+            Self::Pi => "pi",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResumeConversationRequest {
+    workspace_id: WorkspaceId,
+    cwd: PathBuf,
+    harness: AgentHarness,
+    reference: String,
+}
+
+impl ResumeConversationRequest {
+    pub fn new(
+        workspace_id: WorkspaceId,
+        cwd: PathBuf,
+        harness: AgentHarness,
+        reference: impl Into<String>,
+    ) -> Result<Self, HostError> {
+        let reference = reference.into();
+        if !cwd.is_absolute() {
+            return Err(HostError::new(
+                HostErrorKind::OperationFailed,
+                "conversation working directory must be absolute",
+            ));
+        }
+        if reference.is_empty()
+            || reference.len() > MAX_RESUME_REFERENCE_BYTES
+            || reference.trim() != reference
+            || reference.chars().any(char::is_control)
+        {
+            return Err(HostError::new(
+                HostErrorKind::OperationFailed,
+                "conversation resume reference is invalid",
+            ));
+        }
+        Ok(Self {
+            workspace_id,
+            cwd,
+            harness,
+            reference,
+        })
+    }
+
+    #[must_use]
+    pub const fn workspace_id(&self) -> &WorkspaceId {
+        &self.workspace_id
+    }
+
+    #[must_use]
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    #[must_use]
+    pub const fn harness(&self) -> AgentHarness {
+        self.harness
+    }
+
+    #[must_use]
+    pub fn reference(&self) -> &str {
+        &self.reference
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenDockRequest {
     origin_pane_id: PaneId,

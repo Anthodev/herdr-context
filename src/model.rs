@@ -161,6 +161,7 @@ pub struct ConversationsViewState {
     loading: LoadingState,
     source_errors: Vec<String>,
     live_error: Option<String>,
+    launch_error: Option<String>,
     visible_errors: Vec<String>,
     live_loading: bool,
     requested_generation: u64,
@@ -182,6 +183,7 @@ impl Default for ConversationsViewState {
             loading: LoadingState::Loading,
             source_errors: Vec::new(),
             live_error: None,
+            launch_error: None,
             visible_errors: Vec::new(),
             live_loading: false,
             requested_generation: 0,
@@ -293,18 +295,31 @@ impl ConversationsViewState {
         self.rebuild_visible_errors();
     }
 
+    pub fn set_launch_error(&mut self, launch_error: Option<String>) {
+        self.launch_error = launch_error;
+        self.rebuild_visible_errors();
+    }
+
     fn rebuild_visible_errors(&mut self) {
         self.visible_errors.clone_from(&self.source_errors);
-        if let Some(error) = &self.live_error
-            && !self.visible_errors.contains(error)
-        {
-            self.visible_errors.push(error.clone());
+        for error in [&self.live_error, &self.launch_error].into_iter().flatten() {
+            if !self.visible_errors.contains(error) {
+                self.visible_errors.push(error.clone());
+            }
         }
     }
 
     #[must_use]
     pub const fn selection(&self) -> Option<&SessionReference> {
         self.selection.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) fn selected_conversation(&self) -> Option<&Conversation> {
+        let selection = self.selection.as_ref()?;
+        self.items
+            .iter()
+            .find(|conversation| conversation.session_reference() == selection)
     }
 
     pub fn set_selection(&mut self, selection: Option<SessionReference>) {
