@@ -19,6 +19,7 @@ pub const DOCK_ENTRYPOINT: &str = "dock";
 pub const DOCK_TITLE: &str = "herdr-context dock";
 
 const MAX_RIGHT_SWAPS: usize = 256;
+const MAX_FOCUS_STEPS: usize = 256;
 const MAX_RESIZE_ATTEMPTS: usize = 8;
 const MIN_OTHER_PANE_WIDTH: u16 = 10;
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
@@ -83,7 +84,15 @@ impl CommandHostClient {
         self
     }
 
-    fn invoke<I, S>(&self, args: I) -> Result<Value, HostError>
+    fn run<I, S>(&self, args: I) -> Result<ProcessOutput, HostError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.run_with_timeout(args, self.timeout)
+    }
+
+    fn run_with_timeout<I, S>(&self, args: I, timeout: Duration) -> Result<ProcessOutput, HostError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -94,7 +103,7 @@ impl CommandHostClient {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let output = run_command(command, self.timeout).map_err(|error| {
+        run_command(command, timeout).map_err(|error| {
             let kind = match error.kind() {
                 io::ErrorKind::TimedOut => HostErrorKind::OperationFailed,
                 io::ErrorKind::InvalidData => HostErrorKind::InvalidResponse,
@@ -104,7 +113,23 @@ impl CommandHostClient {
                 kind,
                 format!("failed to execute {}: {error}", self.binary.display()),
             )
-        })?;
+        })
+    }
+
+    fn invoke<I, S>(&self, args: I) -> Result<Value, HostError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.invoke_with_timeout(args, self.timeout)
+    }
+
+    fn invoke_with_timeout<I, S>(&self, args: I, timeout: Duration) -> Result<Value, HostError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = self.run_with_timeout(args, timeout)?;
         let response_bytes = if output.status.success() {
             &output.stdout
         } else if output.stdout.is_empty() {
@@ -128,6 +153,29 @@ impl CommandHostClient {
                 "Herdr response is missing result",
             )
         })
+    }
+
+    fn invoke_without_response<I, S>(&self, args: I) -> Result<(), HostError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = self.run(args)?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let response_bytes = if output.stdout.is_empty() {
+            &output.stderr
+        } else {
+            &output.stdout
+        };
+        let response: Value = serde_json::from_slice(response_bytes).map_err(|error| {
+            HostError::new(
+                HostErrorKind::InvalidResponse,
+                format!("Herdr returned invalid JSON: {error}"),
+            )
+        })?;
+        Err(response_error(&response, &output.stderr))
     }
 
     fn layout(&self, pane_id: &PaneId) -> Result<Value, HostError> {
@@ -216,6 +264,62 @@ impl HostClient for CommandHostClient {
         Ok(sessions)
     }
 
+    fn send_text(&self, pane_id: &PaneId, text: &str) -> Result<(), HostError> {
+        self.invoke_without_response(["pane", "send-text", pane_id.as_str(), text])
+    }
+
+    fn focus_origin_pane(
+        &self,
+        dock_pane_id: &PaneId,
+        origin_pane_id: &PaneId,
+    ) -> Result<(), HostError> {
+        if dock_pane_id == origin_pane_id {
+            return Ok(());
+        }
+        let deadline = Instant::now().checked_add(self.timeout).ok_or_else(|| {
+            HostError::new(
+                HostErrorKind::OperationFailed,
+                "pane focus timeout is too large",
+            )
+        })?;
+        let mut current = dock_pane_id.clone();
+        for _ in 0..MAX_FOCUS_STEPS {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let result = self.invoke_with_timeout(
+                [
+                    "pane",
+                    "focus",
+                    "--direction",
+                    "left",
+                    "--pane",
+                    current.as_str(),
+                ],
+                remaining,
+            )?;
+            expect_type(&result, "pane_focus_direction")?;
+            let focused = required_string(&result, "/focus/focused_pane_id", "focused pane id")?;
+            if focused == origin_pane_id.as_str() {
+                return Ok(());
+            }
+            let next = PaneId::new(focused).map_err(HostError::from)?;
+            if next == current {
+                break;
+            }
+            current = next;
+        }
+        Err(HostError::new(
+            HostErrorKind::OperationFailed,
+            format!(
+                "could not focus origin pane {} from dock {}",
+                origin_pane_id.as_str(),
+                dock_pane_id.as_str()
+            ),
+        ))
+    }
+
     fn verified_dock_identity(
         &mut self,
         pane: &HostPane,
@@ -239,6 +343,8 @@ impl HostClient for CommandHostClient {
     fn open_dock(&mut self, request: &OpenDockRequest) -> Result<PaneId, HostError> {
         let mut origin_cwd = OsString::from("HERDR_CONTEXT_ORIGIN_CWD=");
         origin_cwd.push(request.cwd().as_os_str());
+        let mut origin_pane_id = OsString::from("HERDR_CONTEXT_ORIGIN_PANE_ID=");
+        origin_pane_id.push(request.origin_pane_id().as_str());
         let pane_cwd = self.plugin_root.as_deref().unwrap_or_else(|| request.cwd());
         let args = vec![
             OsString::from("plugin"),
@@ -258,6 +364,8 @@ impl HostClient for CommandHostClient {
             pane_cwd.as_os_str().to_owned(),
             OsString::from("--env"),
             origin_cwd,
+            OsString::from("--env"),
+            origin_pane_id,
             OsString::from("--focus"),
         ];
         let result = self.invoke(args)?;

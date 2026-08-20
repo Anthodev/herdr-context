@@ -1,6 +1,6 @@
 //! Intent transitions and orchestration between state and bounded workers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,10 +31,13 @@ use crate::runtime::{FilesRuntime, RuntimeMessage};
 use crate::ui::render_shell;
 use crate::worker::{CompletedJob, Job, JobKey, JobKind, Priority, SubmitStatus, WorkerRuntime};
 
+const MAX_PENDING_PANE_INPUTS: usize = 16;
+
 struct ConfigResult(ConfigLoad);
 struct BootstrapResult(Result<FilesRuntime, crate::runtime::FilesRuntimeError>);
 struct ConversationsResult(ConversationJobResult);
 struct LiveConversationsResult(LiveConversationJobResult);
+struct PaneInputResult(Result<(), crate::host::HostError>);
 
 enum ConversationJobResult {
     Ready {
@@ -93,6 +96,9 @@ pub struct Controller {
     filesystem_conversations: Option<FilesystemConversationSnapshot>,
     conversation_project: Option<ProjectIdentity>,
     live_snapshot: Option<LiveSnapshot>,
+    pane_input_generation: u64,
+    pane_input_queue: VecDeque<String>,
+    pane_input_running: bool,
     config: PluginConfig,
     subsystems_started: bool,
 }
@@ -108,6 +114,9 @@ impl Controller {
                 .map(PathBuf::from),
             filesystem_conversations: None,
             conversation_project: None,
+            pane_input_generation: 0,
+            pane_input_queue: VecDeque::new(),
+            pane_input_running: false,
             live_snapshot: None,
             config: PluginConfig::default(),
             subsystems_started: false,
@@ -129,6 +138,9 @@ impl Controller {
             host_binary: None,
             filesystem_conversations: None,
             conversation_project: None,
+            pane_input_generation: 0,
+            pane_input_queue: VecDeque::new(),
+            pane_input_running: false,
             live_snapshot: None,
             config: PluginConfig::default(),
             subsystems_started: false,
@@ -314,6 +326,24 @@ impl Controller {
                 let dirty = self.model.conversations_mut().handle_intent(&intent, area);
                 Transition { dirty, quit: false }
             }
+            Intent::ToggleSelected if self.model.active_view() == View::Files => {
+                let reference = self
+                    .files
+                    .as_ref()
+                    .and_then(FilesRuntime::selected_file_reference);
+                let dirty =
+                    match reference {
+                        Some(Ok(reference)) => self.send_file_reference(reference, workers),
+                        Some(Err(message)) => self.files.as_mut().is_some_and(|files| {
+                            files.set_pane_input_notice(Some(message.to_owned()))
+                        }),
+                        None => self.files.as_mut().is_some_and(|files| {
+                            files.handle_intent(&Intent::ToggleSelected, workers)
+                        }),
+                    };
+                self.sync_files_state();
+                Transition { dirty, quit: false }
+            }
             intent if self.model.active_view() == View::Files => {
                 let dirty = self
                     .files
@@ -324,6 +354,55 @@ impl Controller {
             }
             _ => Transition::default(),
         }
+    }
+
+    fn send_file_reference(&mut self, reference: String, workers: &mut WorkerRuntime) -> bool {
+        if self.pane_input_queue.len() >= MAX_PENDING_PANE_INPUTS {
+            return self.files.as_mut().is_some_and(|files| {
+                files.set_pane_input_notice(Some("Herdr pane input queue is full".to_owned()))
+            });
+        }
+        self.pane_input_queue.push_back(reference);
+        self.start_next_pane_input(workers)
+    }
+
+    fn start_next_pane_input(&mut self, workers: &mut WorkerRuntime) -> bool {
+        if self.pane_input_running {
+            return false;
+        }
+        let Some(reference) = self.pane_input_queue.pop_front() else {
+            return false;
+        };
+        let Some(binary) = self.host_binary.clone() else {
+            self.pane_input_queue.clear();
+            return self.files.as_mut().is_some_and(|files| {
+                files.set_pane_input_notice(Some("Herdr pane input is unavailable".to_owned()))
+            });
+        };
+        let origin_pane_id = self.model.launch_context().focused_pane_id().clone();
+        let dock_pane_id = self.model.launch_context().runtime_pane_id().clone();
+        self.pane_input_generation = self.pane_input_generation.saturating_add(1);
+        let generation = self.pane_input_generation;
+        let job = Job::new(
+            JobKey::new(JobKind::PaneInput, origin_pane_id.as_str()),
+            generation,
+            Priority::High,
+            move |_| {
+                let client = CommandHostClient::new(binary);
+                let result = client
+                    .send_text(&origin_pane_id, &reference)
+                    .and_then(|()| client.focus_origin_pane(&dock_pane_id, &origin_pane_id));
+                Box::new(PaneInputResult(result))
+            },
+        );
+        if accepted(workers.submit(job)) {
+            self.pane_input_running = true;
+            return false;
+        }
+        self.pane_input_queue.clear();
+        self.files.as_mut().is_some_and(|files| {
+            files.set_pane_input_notice(Some("Herdr pane input queue is unavailable".to_owned()))
+        })
     }
 
     fn switch_view(&mut self, view: View, workers: &mut WorkerRuntime) -> bool {
@@ -375,6 +454,10 @@ impl Controller {
                 self.model
                     .conversations_mut()
                     .replace_live_items(visible, generation);
+            } else if kind == JobKind::PaneInput {
+                self.pane_input_running = false;
+                self.set_worker_error(kind);
+                self.start_next_pane_input(workers);
             } else {
                 self.set_worker_error(kind);
             }
@@ -534,6 +617,23 @@ impl Controller {
                     .conversations_mut()
                     .replace_live_items(visible, generation)
             }
+            JobKind::PaneInput => {
+                self.pane_input_running = false;
+                let notice = result.downcast::<PaneInputResult>().map_or_else(
+                    |_| Some("invalid Herdr pane input worker result".to_owned()),
+                    |result| {
+                        result
+                            .0
+                            .err()
+                            .map(|error| format!("cannot insert file reference: {error}"))
+                    },
+                );
+                let changed = self
+                    .files
+                    .as_mut()
+                    .is_some_and(|files| files.set_pane_input_notice(notice));
+                self.start_next_pane_input(workers) || changed
+            }
             JobKind::Filesystem | JobKind::Vcs => {
                 let Ok(message) = result.downcast::<RuntimeMessage>() else {
                     self.model.files_mut().set_loading(LoadingState::Error(
@@ -570,6 +670,13 @@ impl Controller {
                     "Herdr live session worker stopped unexpectedly".to_owned(),
                 ));
                 self.model.conversations_mut().set_live_loading(false);
+            }
+            JobKind::PaneInput => {
+                if let Some(files) = &mut self.files {
+                    files.set_pane_input_notice(Some(
+                        "Herdr pane input worker stopped unexpectedly".to_owned(),
+                    ));
+                }
             }
             JobKind::Bootstrap | JobKind::Filesystem | JobKind::Vcs | JobKind::Process => {
                 self.model.files_mut().set_loading(state);
@@ -981,6 +1088,8 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, UNIX_EPOCH};
@@ -1002,6 +1111,7 @@ mod tests {
     use crate::intent::{Intent, PointerAction, View};
     use crate::model::LoadingState;
     use crate::project::ProjectIdentity;
+    use crate::runtime::FilesRuntime;
     use crate::worker::{JobKind, WorkerRuntime};
 
     fn controller(temp: &TempDir) -> Controller {
@@ -1014,6 +1124,75 @@ mod tests {
         )])
         .expect("context");
         Controller::new(context)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_enter_inserts_selected_reference_into_origin_pane() {
+        let project = TempDir::new().expect("project");
+        fs::write(project.path().join("main.rs"), []).expect("file");
+        let host = TempDir::new().expect("host");
+        let argv = host.path().join("argv.log");
+        let script = host.path().join("fake-herdr");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  "pane send-text origin @main.rs ")
+    ;;
+  "pane focus --direction left --pane dock")
+    printf '%s\n' '{{"id":"test","result":{{"type":"pane_focus_direction","focus":{{"changed":true,"focused_pane_id":"origin","source_pane_id":"dock"}}}}}}'
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#,
+                argv.display()
+            ),
+        )
+        .expect("script");
+        let mut permissions = fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script, permissions).expect("permissions");
+
+        let context = LaunchContext::from_vars([
+            (
+                "HERDR_PLUGIN_CONTEXT_JSON",
+                format!(
+                    r#"{{"workspace_id":"workspace","tab_id":"tab","pane_id":"dock","cwd":"{}"}}"#,
+                    project.path().display()
+                ),
+            ),
+            ("HERDR_CONTEXT_ORIGIN_PANE_ID", "origin".to_owned()),
+        ])
+        .expect("context");
+        let mut controller = Controller::new(context);
+        controller.files = Some(
+            FilesRuntime::bootstrap(controller.model.launch_context()).expect("Files runtime"),
+        );
+        controller
+            .model
+            .files_mut()
+            .set_loading(LoadingState::Ready);
+        controller.host_binary = Some(script);
+        let mut workers = WorkerRuntime::with_capacities(2, 1);
+
+        let transition = controller.apply(Intent::ToggleSelected, &mut workers);
+        assert!(!transition.quit);
+        let result = workers
+            .recv_timeout(Duration::from_secs(1))
+            .expect("pane input result");
+        assert_eq!(result.key().kind(), JobKind::PaneInput);
+        controller.apply_result(result, &mut workers);
+        workers.shutdown();
+
+        assert_eq!(
+            fs::read_to_string(argv).expect("argv"),
+            "pane send-text origin @main.rs \npane focus --direction left --pane dock\n"
+        );
     }
 
     fn conversation(

@@ -23,6 +23,7 @@ pub enum JobKind {
     Vcs,
     ConversationDiscovery,
     ConversationLive,
+    PaneInput,
     Process,
 }
 
