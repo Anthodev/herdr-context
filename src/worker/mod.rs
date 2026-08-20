@@ -20,6 +20,8 @@ pub enum JobKind {
     Config,
     Bootstrap,
     Filesystem,
+    FileSearch,
+    FileSearchProjection,
     Vcs,
     ConversationDiscovery,
     ConversationLive,

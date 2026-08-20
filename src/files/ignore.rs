@@ -4,9 +4,71 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cap_std::fs::{Dir, Metadata};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+
+const MAX_IGNORE_FILE_BYTES: usize = 1_048_576;
+const MAX_SEARCH_MATCHER_COMPONENTS: usize = 4_096;
+const MAX_SEARCH_IGNORE_BYTES: usize = 4 * 1_048_576;
+const MAX_SEARCH_IGNORE_RULES: usize = 100_000;
+
+struct EnumerationBounds<'a> {
+    max_entries: usize,
+    max_examined: usize,
+    cancelled: &'a AtomicBool,
+    page_cancelled: &'a AtomicBool,
+}
+
+struct MatcherBudget<'a> {
+    remaining_components: usize,
+    remaining_bytes: usize,
+    remaining_rules: usize,
+    cancelled: &'a AtomicBool,
+    page_cancelled: &'a AtomicBool,
+}
+
+impl<'a> MatcherBudget<'a> {
+    const fn new(bounds: &'a EnumerationBounds<'a>) -> Self {
+        Self {
+            remaining_components: MAX_SEARCH_MATCHER_COMPONENTS,
+            remaining_bytes: MAX_SEARCH_IGNORE_BYTES,
+            remaining_rules: MAX_SEARCH_IGNORE_RULES,
+            cancelled: bounds.cancelled,
+            page_cancelled: bounds.page_cancelled,
+        }
+    }
+
+    fn checkpoint(&self) -> io::Result<()> {
+        if self.cancelled.load(Ordering::Relaxed) || self.page_cancelled.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "file search was cancelled",
+            ));
+        }
+        Ok(())
+    }
+
+    fn consume_component(&mut self) -> io::Result<()> {
+        self.checkpoint()?;
+        if self.remaining_components == 0 {
+            return Err(search_budget_exhausted());
+        }
+        self.remaining_components = self.remaining_components.saturating_sub(1);
+        Ok(())
+    }
+
+    fn consume_matcher(&mut self, bytes: usize, rules: usize) -> io::Result<()> {
+        self.checkpoint()?;
+        if bytes > self.remaining_bytes || rules > self.remaining_rules {
+            return Err(search_budget_exhausted());
+        }
+        self.remaining_bytes = self.remaining_bytes.saturating_sub(bytes);
+        self.remaining_rules = self.remaining_rules.saturating_sub(rules);
+        Ok(())
+    }
+}
 
 /// Decides whether a root-relative filesystem entry is shown.
 ///
@@ -73,6 +135,12 @@ pub(crate) enum VisibleEntryKind {
 pub(crate) struct VisibleEntry {
     pub(crate) path: PathBuf,
     pub(crate) kind: VisibleEntryKind,
+}
+
+pub(crate) struct VisibleEntriesBatch {
+    pub(crate) entries: Vec<VisibleEntry>,
+    pub(crate) examined: usize,
+    pub(crate) truncated: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -171,13 +239,62 @@ impl IgnorePolicy {
         &self,
         relative_directory: &Path,
     ) -> io::Result<Vec<VisibleEntry>> {
+        self.visible_entries_with_bounds(relative_directory, None)
+            .map(|batch| batch.entries)
+    }
+
+    pub(crate) fn visible_entries_bounded(
+        &self,
+        relative_directory: &Path,
+        max_entries: usize,
+        max_examined: usize,
+        cancelled: &AtomicBool,
+        page_cancelled: &AtomicBool,
+    ) -> io::Result<VisibleEntriesBatch> {
+        self.visible_entries_with_bounds(
+            relative_directory,
+            Some(EnumerationBounds {
+                max_entries: max_entries.max(1),
+                max_examined: max_examined.max(1),
+                cancelled,
+                page_cancelled,
+            }),
+        )
+    }
+
+    fn visible_entries_with_bounds(
+        &self,
+        relative_directory: &Path,
+        bounds: Option<EnumerationBounds<'_>>,
+    ) -> io::Result<VisibleEntriesBatch> {
+        let mut matcher_budget = bounds.as_ref().map(MatcherBudget::new);
         let (directory, matchers, ancestor_ignored) =
-            self.open_directory_with_matchers(relative_directory)?;
+            self.open_directory_with_matchers(relative_directory, matcher_budget.as_mut())?;
         if ancestor_ignored {
-            return Ok(Vec::new());
+            return Ok(VisibleEntriesBatch {
+                entries: Vec::new(),
+                examined: 0,
+                truncated: false,
+            });
         }
-        let mut children = Vec::new();
+        let mut entries = Vec::new();
+        let mut examined = 0_usize;
+        let mut truncated = false;
         for result in directory.entries()? {
+            if bounds
+                .as_ref()
+                .is_some_and(|bounds| examined >= bounds.max_examined)
+            {
+                truncated = true;
+                break;
+            }
+            if bounds.as_ref().is_some_and(|bounds| {
+                bounds.cancelled.load(Ordering::Relaxed)
+                    || bounds.page_cancelled.load(Ordering::Relaxed)
+            }) {
+                break;
+            }
+            examined = examined.saturating_add(1);
             let entry = match result {
                 Ok(entry) => entry,
                 Err(_) => continue,
@@ -205,13 +322,24 @@ impl IgnorePolicy {
             ) {
                 continue;
             }
-            children.push(VisibleEntry {
+            if bounds
+                .as_ref()
+                .is_some_and(|bounds| entries.len() >= bounds.max_entries)
+            {
+                truncated = true;
+                break;
+            }
+            entries.push(VisibleEntry {
                 path: relative,
                 kind,
             });
         }
-        children.sort_unstable_by(|left, right| left.path.cmp(&right.path));
-        Ok(children)
+        entries.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        Ok(VisibleEntriesBatch {
+            entries,
+            examined,
+            truncated,
+        })
     }
 
     pub(crate) fn symlink_metadata(&self, relative_path: &Path) -> io::Result<Metadata> {
@@ -224,12 +352,26 @@ impl IgnorePolicy {
     }
 
     fn open_directory(&self, relative_directory: &Path) -> io::Result<Dir> {
+        self.open_directory_bounded(relative_directory, None)
+    }
+
+    fn open_directory_bounded(
+        &self,
+        relative_directory: &Path,
+        mut budget: Option<&mut MatcherBudget<'_>>,
+    ) -> io::Result<Dir> {
         validate_relative_directory(relative_directory)?;
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.checkpoint()?;
+        }
         let mut directory = self.root.try_clone()?;
         for component in relative_directory.components() {
             let std::path::Component::Normal(name) = component else {
                 return Err(invalid_relative_path());
             };
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.consume_component()?;
+            }
             directory = open_child_directory_nofollow(&directory, name)?;
         }
         Ok(directory)
@@ -238,23 +380,31 @@ impl IgnorePolicy {
     fn open_directory_with_matchers(
         &self,
         relative_directory: &Path,
+        mut budget: Option<&mut MatcherBudget<'_>>,
     ) -> io::Result<(Dir, Vec<Gitignore>, bool)> {
-        let directory = self.open_directory(relative_directory)?;
-        let (matchers, ancestor_ignored) = self.ignore_matchers(relative_directory)?;
+        let directory = self.open_directory_bounded(relative_directory, budget.as_deref_mut())?;
+        let (matchers, ancestor_ignored) = self.ignore_matchers(relative_directory, budget)?;
         Ok((directory, matchers, ancestor_ignored))
     }
 
-    fn ignore_matchers(&self, relative_directory: &Path) -> io::Result<(Vec<Gitignore>, bool)> {
+    fn ignore_matchers(
+        &self,
+        relative_directory: &Path,
+        mut budget: Option<&mut MatcherBudget<'_>>,
+    ) -> io::Result<(Vec<Gitignore>, bool)> {
         validate_relative_directory(relative_directory)?;
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.checkpoint()?;
+        }
         let mut directory = self.ignore_root.try_clone()?;
         let mut prefix = PathBuf::new();
         let mut matchers = Vec::new();
         let mut ancestor_ignored = false;
         if self.gitignore_enabled {
-            if let Some(exclude) = self.git_exclude() {
+            if let Some(exclude) = self.git_exclude(budget.as_deref_mut())? {
                 matchers.push(exclude);
             }
-            if let Some(matcher) = self.gitignore(&directory, &prefix) {
+            if let Some(matcher) = self.gitignore(&directory, &prefix, budget.as_deref_mut())? {
                 matchers.push(matcher);
             }
         }
@@ -263,6 +413,9 @@ impl IgnorePolicy {
             let std::path::Component::Normal(name) = component else {
                 return Err(invalid_relative_path());
             };
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.consume_component()?;
+            }
             prefix.push(name);
             if is_ignored(&matchers, &self.ignore_root_path.join(&prefix), true) {
                 ancestor_ignored = true;
@@ -270,7 +423,7 @@ impl IgnorePolicy {
             }
             directory = open_child_directory_nofollow(&directory, name)?;
             if self.gitignore_enabled
-                && let Some(matcher) = self.gitignore(&directory, &prefix)
+                && let Some(matcher) = self.gitignore(&directory, &prefix, budget.as_deref_mut())?
             {
                 matchers.push(matcher);
             }
@@ -278,24 +431,55 @@ impl IgnorePolicy {
         Ok((matchers, ancestor_ignored))
     }
 
-    fn gitignore(&self, directory: &Dir, prefix: &Path) -> Option<Gitignore> {
+    fn gitignore(
+        &self,
+        directory: &Dir,
+        prefix: &Path,
+        budget: Option<&mut MatcherBudget<'_>>,
+    ) -> io::Result<Option<Gitignore>> {
         let matcher_root = self.ignore_root_path.join(prefix);
         self.matcher_from_file(
             directory,
             OsStr::new(".gitignore"),
             matcher_root.clone(),
             matcher_root.join(".gitignore"),
+            budget,
         )
     }
 
-    fn git_exclude(&self) -> Option<Gitignore> {
-        let git = open_child_directory_nofollow(&self.ignore_root, OsStr::new(".git")).ok()?;
-        let info = open_child_directory_nofollow(&git, OsStr::new("info")).ok()?;
+    fn git_exclude(
+        &self,
+        mut budget: Option<&mut MatcherBudget<'_>>,
+    ) -> io::Result<Option<Gitignore>> {
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.consume_component()?;
+        }
+        let git = match open_child_directory_nofollow(&self.ignore_root, OsStr::new(".git")) {
+            Ok(git) => git,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.consume_component()?;
+        }
+        let info = match open_child_directory_nofollow(&git, OsStr::new("info")) {
+            Ok(info) => info,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
         self.matcher_from_file(
             &info,
             OsStr::new("exclude"),
             self.ignore_root_path.clone(),
             self.ignore_root_path.join(".git/info/exclude"),
+            budget,
         )
     }
 
@@ -305,10 +489,48 @@ impl IgnorePolicy {
         name: &OsStr,
         matcher_root: PathBuf,
         source: PathBuf,
-    ) -> Option<Gitignore> {
-        let mut file = open_file_nofollow(directory, name).ok()?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents).ok()?;
+        mut budget: Option<&mut MatcherBudget<'_>>,
+    ) -> io::Result<Option<Gitignore>> {
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.checkpoint()?;
+        }
+        let metadata = match directory.symlink_metadata(name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if metadata.is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ignore source must be a regular file",
+            ));
+        }
+        if metadata.len() > MAX_IGNORE_FILE_BYTES as u64 {
+            return Err(search_budget_exhausted());
+        }
+        let file = open_file_nofollow(directory, name)?;
+        let mut reader = file.take((MAX_IGNORE_FILE_BYTES as u64).saturating_add(1));
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 8_192];
+        loop {
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.checkpoint()?;
+            }
+            let read = reader.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+            if bytes.len() > MAX_IGNORE_FILE_BYTES {
+                return Err(search_budget_exhausted());
+            }
+        }
+        let contents = String::from_utf8(bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let rules = contents.lines().count();
+        if let Some(budget) = budget {
+            budget.consume_matcher(contents.len(), rules)?;
+        }
         let mut builder = GitignoreBuilder::new(matcher_root);
         for (index, line) in contents.lines().enumerate() {
             let line = if index == 0 {
@@ -316,10 +538,22 @@ impl IgnorePolicy {
             } else {
                 line
             };
-            let _ = builder.add_line(Some(source.clone()), line);
+            builder
+                .add_line(Some(source.clone()), line)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         }
-        builder.build().ok()
+        builder
+            .build()
+            .map(Some)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
+}
+
+fn search_budget_exhausted() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "file search ignore budget was exhausted",
+    )
 }
 
 fn is_ignored(matchers: &[Gitignore], path: &Path, is_directory: bool) -> bool {
@@ -420,7 +654,7 @@ fn open_file_nofollow(parent: &Dir, name: &OsStr) -> io::Result<cap_std::fs::Fil
     let mut options = OpenOptions::new();
     options
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
     parent.open_with(name, &options)
 }
 
@@ -442,7 +676,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::IgnorePolicy;
+    use super::{IgnorePolicy, MAX_IGNORE_FILE_BYTES};
 
     fn touch(path: impl AsRef<Path>) {
         fs::write(path, []).expect("write fixture");
@@ -556,6 +790,28 @@ mod tests {
         assert!(policy.visible_children(Path::new("../outside")).is_err());
     }
 
+    #[test]
+    fn rejects_oversized_gitignore_files_without_unbounded_reads() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join(".git")).expect("git marker");
+        let mut contents = b"visible\n".to_vec();
+        contents.resize(MAX_IGNORE_FILE_BYTES.saturating_add(1), b'#');
+        fs::write(temp.path().join(".gitignore"), contents).expect("oversized ignore");
+        touch(temp.path().join("visible"));
+        let policy = IgnorePolicy::new(temp.path().to_path_buf()).expect("policy");
+
+        assert!(policy.visible_children(Path::new("")).is_err());
+    }
+    #[test]
+    fn rejects_non_regular_gitignore_sources() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join(".git")).expect("git marker");
+        fs::create_dir(temp.path().join(".gitignore")).expect("non-regular ignore");
+        touch(temp.path().join("visible"));
+        let policy = IgnorePolicy::new(temp.path().to_path_buf()).expect("policy");
+
+        assert!(policy.visible_children(Path::new("")).is_err());
+    }
     #[cfg(unix)]
     #[test]
     fn rejects_directories_reached_through_an_intermediate_symlink() {

@@ -2,10 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crate::vcs::{VcsStatusKind, VcsStatusSnapshot};
 
-use super::ignore::{DefaultVisibilityPolicy, IgnorePolicy, VisibilityPolicy, VisibleEntryKind};
+use super::ignore::{
+    DefaultVisibilityPolicy, IgnorePolicy, VisibilityPolicy, VisibleEntry, VisibleEntryKind,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TreeNodeKind {
@@ -52,6 +55,32 @@ pub(crate) struct DirectoryLoader {
 impl DirectoryLoader {
     pub(crate) fn load(&self, directory: PathBuf) -> io::Result<DirectorySnapshot> {
         let entries = self.ignore.visible_entries(&directory)?;
+        Ok(Self::snapshot(directory, entries))
+    }
+
+    pub(crate) fn load_bounded(
+        &self,
+        directory: PathBuf,
+        max_entries: usize,
+        max_examined: usize,
+        cancelled: &AtomicBool,
+        page_cancelled: &AtomicBool,
+    ) -> io::Result<(DirectorySnapshot, usize, bool)> {
+        let batch = self.ignore.visible_entries_bounded(
+            &directory,
+            max_entries,
+            max_examined,
+            cancelled,
+            page_cancelled,
+        )?;
+        Ok((
+            Self::snapshot(directory, batch.entries),
+            batch.examined,
+            batch.truncated,
+        ))
+    }
+
+    fn snapshot(directory: PathBuf, entries: Vec<VisibleEntry>) -> DirectorySnapshot {
         let nodes = entries
             .into_iter()
             .map(|entry| TreeNode {
@@ -64,7 +93,7 @@ impl DirectoryLoader {
                 status: None,
             })
             .collect();
-        Ok(DirectorySnapshot { directory, nodes })
+        DirectorySnapshot { directory, nodes }
     }
 }
 
@@ -72,6 +101,13 @@ impl DirectoryLoader {
 pub(crate) struct DirectorySnapshot {
     directory: PathBuf,
     nodes: Vec<TreeNode>,
+}
+
+impl DirectorySnapshot {
+    #[must_use]
+    pub(crate) fn nodes(&self) -> &[TreeNode] {
+        &self.nodes
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -284,6 +320,50 @@ impl FilesTree {
             .flatten()
             .filter_map(|path| self.nodes.get(path))
             .collect()
+    }
+
+    pub(crate) fn nodes(&self) -> impl Iterator<Item = &TreeNode> {
+        self.nodes.values()
+    }
+
+    pub(crate) fn search_index(&self, max_entries: usize) -> Self {
+        let nodes = self
+            .nodes
+            .values()
+            .filter(|node| node.kind == TreeNodeKind::Virtual)
+            .take(max_entries)
+            .cloned()
+            .map(|node| (node.path.clone(), node))
+            .collect::<BTreeMap<_, _>>();
+        let mut index = Self {
+            loader: self.loader.clone(),
+            nodes: Arc::new(nodes),
+            statuses: Arc::clone(&self.statuses),
+            children: Arc::new(BTreeMap::new()),
+            selection: self.selection.clone(),
+        };
+        index.rebuild_children();
+        index.restore_selection();
+        index
+    }
+
+    pub(crate) fn sync_status_overlay_from(&mut self, source: &Self) {
+        self.statuses = Arc::clone(&source.statuses);
+        let nodes = Arc::make_mut(&mut self.nodes);
+        nodes.retain(|_, node| node.kind != TreeNodeKind::Virtual);
+        for node in nodes.values_mut() {
+            node.status = self.statuses.get(&node.path).copied();
+        }
+        nodes.extend(
+            source
+                .nodes
+                .values()
+                .filter(|node| node.kind == TreeNodeKind::Virtual)
+                .cloned()
+                .map(|node| (node.path.clone(), node)),
+        );
+        self.rebuild_children();
+        self.restore_selection();
     }
 
     #[must_use]

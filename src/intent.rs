@@ -42,6 +42,12 @@ pub enum Intent {
     CollapseOrAscend,
     ToggleSelected,
     Refresh,
+    BeginFileSearch,
+    FileSearchInput(String),
+    FileSearchBackspace,
+    FileSearchClear,
+    FileSearchCommit,
+    FileSearchCancel,
     Pointer {
         column: u16,
         row: u16,

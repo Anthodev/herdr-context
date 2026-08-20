@@ -1,21 +1,27 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::config::{
     DisplayMode, FilesConfig, GitCadence, PluginConfig, RefreshPolicy, VcsBackendSelection,
 };
 use crate::files::ignore::ConfiguredVisibilityPolicy;
-use crate::files::tree::{DirectorySnapshot, TreeNodeKind};
+use crate::files::search::{
+    DIRECTORIES_PER_PAGE, IndexedSearchPath, MAX_EXAMINED_ENTRIES, MAX_INDEX_ENTRIES,
+    MAX_QUERY_BYTES, PreparedSearchPage, SearchPageRequest, SearchProjection, SearchablePaths,
+    prepare_page, project,
+};
+use crate::files::tree::{DirectorySnapshot, FilesTree, TreeNodeKind};
 use crate::files::{FilesModel, PreparedRefreshResult};
 use crate::host::LaunchContext;
 use crate::intent::{Intent, PointerAction};
 use crate::project::resolve_project_context_with_backend;
-use crate::ui::files::FilesView;
+use crate::ui::files::{FileSearchDisplay, FilesView};
 use crate::vcs::git::GitService;
 use crate::vcs::jj::{JjService, JujutsuMode};
 use crate::vcs::{VcsBackendMetadata, VcsWorkspace};
@@ -77,6 +83,112 @@ impl VcsRefresh {
     }
 }
 
+#[derive(Debug)]
+struct FileSearchState {
+    editing: bool,
+    query: String,
+    index: FilesTree,
+    searchable: SearchablePaths,
+    matches: BTreeSet<PathBuf>,
+    expanded_context: BTreeSet<PathBuf>,
+    pending_directories: VecDeque<PathBuf>,
+    running: Option<(u64, u64)>,
+    running_directories: Vec<PathBuf>,
+    page_cancel: Option<Arc<AtomicBool>>,
+    projection_cancel: Option<Arc<AtomicBool>>,
+    job_generation: u64,
+    scan_epoch: u64,
+    scanned_entries: usize,
+    examined_entries: usize,
+    skipped_directories: usize,
+    complete: bool,
+    truncated: bool,
+    projection_requested: u64,
+    projection_submitted: u64,
+    projection_applied: u64,
+}
+
+impl FileSearchState {
+    fn new(index: FilesTree) -> Self {
+        let searchable: SearchablePaths = Arc::new(
+            index
+                .nodes()
+                .filter(|node| node.kind() != TreeNodeKind::Directory)
+                .map(|node| {
+                    (
+                        node.path().to_path_buf(),
+                        IndexedSearchPath {
+                            kind: node.kind(),
+                            normalized: node.path().to_string_lossy().to_lowercase(),
+                        },
+                    )
+                })
+                .collect(),
+        );
+        let seeded_entries = searchable.len();
+        Self {
+            editing: true,
+            query: String::new(),
+            index,
+            searchable,
+            matches: BTreeSet::new(),
+            expanded_context: BTreeSet::new(),
+            pending_directories: VecDeque::from([PathBuf::new()]),
+            running: None,
+            running_directories: Vec::new(),
+            page_cancel: None,
+            projection_cancel: None,
+            job_generation: 0,
+            scan_epoch: 0,
+            scanned_entries: seeded_entries,
+            examined_entries: 0,
+            skipped_directories: 0,
+            complete: false,
+            truncated: false,
+            projection_requested: 0,
+            projection_submitted: 0,
+            projection_applied: 0,
+        }
+    }
+
+    const fn active(&self) -> bool {
+        !self.query.is_empty()
+    }
+
+    const fn should_scan(&self) -> bool {
+        self.editing || self.active()
+    }
+
+    const fn scanning(&self) -> bool {
+        !self.complete
+            || self.running.is_some()
+            || self.projection_applied < self.projection_requested
+    }
+
+    fn sync_virtual_entries(&mut self) {
+        let virtual_entries = self
+            .index
+            .nodes()
+            .filter(|node| node.kind() == TreeNodeKind::Virtual)
+            .map(|node| {
+                (
+                    node.path().to_path_buf(),
+                    IndexedSearchPath {
+                        kind: TreeNodeKind::Virtual,
+                        normalized: node.path().to_string_lossy().to_lowercase(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let searchable = Arc::make_mut(&mut self.searchable);
+        searchable.retain(|path, indexed| {
+            indexed.kind != TreeNodeKind::Virtual
+                || self.index.node(path).map(|node| node.kind()) == Some(TreeNodeKind::Virtual)
+        });
+        searchable.extend(virtual_entries);
+    }
+}
+
 /// Fully connected Files surface. Filesystem and VCS work is dispatched separately.
 #[derive(Debug)]
 pub struct FilesRuntime {
@@ -103,9 +215,12 @@ pub struct FilesRuntime {
     reload_pending: bool,
     filesystem_panic_retried: bool,
     filesystem_notice: Option<String>,
+    search_page_notice: Option<String>,
+    search_projection_notice: Option<String>,
     pane_input_notice: Option<String>,
     backend_notice: Option<String>,
     display_mode: DisplayMode,
+    search: Option<FileSearchState>,
 }
 
 impl FilesRuntime {
@@ -260,24 +375,36 @@ impl FilesRuntime {
             reload_pending: false,
             filesystem_panic_retried: false,
             filesystem_notice: None,
+            search_page_notice: None,
+            search_projection_notice: None,
             pane_input_notice: None,
             backend_notice: configured_vcs_missing.then(|| {
                 "configured VCS backend was not found; showing the filesystem only".to_owned()
             }),
             display_mode,
+            search: None,
         };
         runtime.rebuild_visible_rows();
         Ok(runtime)
     }
 
     pub fn render(&mut self, area: Rect, buffer: &mut Buffer) {
-        let has_notice = self.filesystem_notice.is_some()
+        let has_notice = self.search_page_notice.is_some()
+            || self.search_projection_notice.is_some()
+            || self.filesystem_notice.is_some()
             || self.backend_notice.is_some()
             || self.model.failure_notice().is_some()
             || self.model.status_is_stale();
+        let search_visible = self
+            .search
+            .as_ref()
+            .is_some_and(|search| search.editing || search.active());
         let notice_height = usize::from(has_notice);
-        self.viewport_y = area.y;
-        self.viewport_height = usize::from(area.height).saturating_sub(notice_height);
+        let search_height = usize::from(search_visible);
+        self.viewport_y = area.y.saturating_add(search_height as u16);
+        self.viewport_height = usize::from(area.height)
+            .saturating_sub(search_height)
+            .saturating_sub(notice_height);
         self.ensure_selection_visible();
         let end = self
             .viewport_offset
@@ -288,6 +415,8 @@ impl FilesRuntime {
         let runtime_notice = self
             .pane_input_notice
             .as_deref()
+            .or(self.search_page_notice.as_deref())
+            .or(self.search_projection_notice.as_deref())
             .or(self.filesystem_notice.as_deref())
             .or(self.backend_notice.as_deref());
         let notice = match (runtime_notice, self.model.failure_notice(), stale) {
@@ -301,27 +430,63 @@ impl FilesRuntime {
             )),
             (None, None, false) => None,
         };
-        FilesView::new(
-            self.model.tree(),
-            rows,
-            self.model.tree().selection(),
-            notice,
-        )
-        .with_expanded(&self.expanded)
-        .with_display_mode(self.display_mode)
-        .render(area, buffer);
+        let search_display = self.search.as_ref().and_then(|search| {
+            (search.editing || search.active()).then_some(FileSearchDisplay {
+                query: &search.query,
+                editing: search.editing,
+                matches: search.matches.len(),
+                scanning: search.scanning(),
+                truncated: search.truncated,
+                skipped_directories: search.skipped_directories,
+            })
+        });
+        let (tree, selected, expanded) = self
+            .search
+            .as_ref()
+            .filter(|search| search.active())
+            .map_or_else(
+                || {
+                    (
+                        self.model.tree(),
+                        self.model.tree().selection(),
+                        &self.expanded,
+                    )
+                },
+                |search| {
+                    (
+                        &search.index,
+                        search.index.selection(),
+                        &search.expanded_context,
+                    )
+                },
+            );
+        let mut view = FilesView::new(tree, rows, selected, notice)
+            .with_expanded(expanded)
+            .with_display_mode(self.display_mode);
+        if let Some(search) = search_display {
+            view = view.with_search(search);
+        }
+        view.render(area, buffer);
     }
 
     pub(crate) fn handle_intent(&mut self, intent: &Intent, workers: &mut WorkerRuntime) -> bool {
         match intent {
             Intent::SelectPrevious => self.move_selection(-1),
             Intent::SelectNext => self.move_selection(1),
-            Intent::SelectFirst => self.select_index(0),
-            Intent::SelectLast => self.select_index(self.visible_rows.len().saturating_sub(1)),
+            Intent::SelectFirst => self.select_navigable_index(0),
+            Intent::SelectLast => {
+                self.select_navigable_index(self.navigable_len().saturating_sub(1))
+            }
             Intent::ExpandOrDescend => self.expand_or_descend(workers),
             Intent::CollapseOrAscend => self.collapse_or_ascend(),
             Intent::ToggleSelected => self.toggle_selected(workers),
             Intent::Refresh => self.request_reload(workers),
+            Intent::BeginFileSearch => self.begin_search(workers),
+            Intent::FileSearchInput(value) => self.append_search_query(value, workers),
+            Intent::FileSearchBackspace => self.backspace_search_query(workers),
+            Intent::FileSearchClear => self.clear_search_query(true),
+            Intent::FileSearchCommit => self.commit_search(),
+            Intent::FileSearchCancel => self.clear_search_query(false),
             Intent::Pointer { row, action, .. } => match action {
                 PointerAction::Select => self.select_viewport_row(*row),
                 PointerAction::Toggle => self.toggle_viewport_row(*row, workers),
@@ -330,6 +495,94 @@ impl FilesRuntime {
             Intent::Resize => true,
             Intent::Quit | Intent::SwitchView(_) | Intent::NextView | Intent::PreviousView => false,
         }
+    }
+
+    pub(crate) fn search_editing(&self) -> bool {
+        self.search.as_ref().is_some_and(|search| search.editing)
+    }
+
+    pub(crate) fn search_query(&self) -> &str {
+        self.search
+            .as_ref()
+            .map_or("", |search| search.query.as_str())
+    }
+
+    pub(crate) fn has_search_filter(&self) -> bool {
+        self.search.as_ref().is_some_and(FileSearchState::active)
+    }
+
+    pub(crate) const fn finish_search_editing(&mut self) -> bool {
+        let Some(search) = &mut self.search else {
+            return false;
+        };
+        std::mem::replace(&mut search.editing, false)
+    }
+
+    fn begin_search(&mut self, workers: &mut WorkerRuntime) -> bool {
+        self.search_page_notice = None;
+        self.search_projection_notice = None;
+        let changed = if let Some(search) = &mut self.search {
+            !std::mem::replace(&mut search.editing, true)
+        } else {
+            let index = self.model.tree().search_index(MAX_INDEX_ENTRIES);
+            self.search = Some(FileSearchState::new(index));
+            true
+        };
+        self.start_next_search_page(workers);
+        changed
+    }
+
+    fn append_search_query(&mut self, value: &str, workers: &mut WorkerRuntime) -> bool {
+        let Some(search) = &mut self.search else {
+            return false;
+        };
+        let prior_len = search.query.len();
+        for character in value.chars().filter(|character| !character.is_control()) {
+            if search.query.len().saturating_add(character.len_utf8()) > MAX_QUERY_BYTES {
+                break;
+            }
+            search.query.push(character);
+        }
+        if search.query.len() == prior_len {
+            return false;
+        }
+        self.queue_search_projection(workers, true);
+        self.start_next_search_page(workers);
+        true
+    }
+
+    fn backspace_search_query(&mut self, workers: &mut WorkerRuntime) -> bool {
+        let Some(search) = &mut self.search else {
+            return false;
+        };
+        if search.query.pop().is_none() {
+            return false;
+        }
+        if search.query.is_empty() {
+            self.clear_search_projection();
+            self.rebuild_visible_rows();
+        } else {
+            self.queue_search_projection(workers, true);
+        }
+        true
+    }
+
+    fn clear_search_query(&mut self, keep_editing: bool) -> bool {
+        let Some(search) = &mut self.search else {
+            return false;
+        };
+        let changed = !search.query.is_empty() || search.editing != keep_editing;
+        search.query.clear();
+        search.editing = keep_editing;
+        if changed {
+            self.clear_search_projection();
+            self.rebuild_visible_rows();
+        }
+        changed
+    }
+
+    const fn commit_search(&mut self) -> bool {
+        self.finish_search_editing()
     }
 
     #[cfg(test)]
@@ -363,12 +616,20 @@ impl FilesRuntime {
 
     #[must_use]
     pub(crate) fn selection(&self) -> Option<&Path> {
-        self.model.tree().selection()
+        self.active_tree().selection()
+    }
+
+    fn active_tree(&self) -> &FilesTree {
+        self.search
+            .as_ref()
+            .filter(|search| search.active())
+            .map_or_else(|| self.model.tree(), |search| &search.index)
     }
 
     pub(crate) fn selected_file_reference(&self) -> Option<Result<String, &'static str>> {
-        let path = self.model.tree().selection()?;
-        let node = self.model.tree().node(path)?;
+        let tree = self.active_tree();
+        let path = tree.selection()?;
+        let node = tree.node(path)?;
         if node.kind() != TreeNodeKind::File {
             return None;
         }
@@ -409,32 +670,63 @@ impl FilesRuntime {
         )
     }
 
+    fn navigable_len(&self) -> usize {
+        self.visible_rows
+            .iter()
+            .filter(|path| self.path_is_navigable(path))
+            .count()
+    }
+
+    fn navigable_path(&self, index: usize) -> Option<PathBuf> {
+        self.visible_rows
+            .iter()
+            .filter(|path| self.path_is_navigable(path))
+            .nth(index)
+            .cloned()
+    }
+
+    fn path_is_navigable(&self, path: &Path) -> bool {
+        self.search
+            .as_ref()
+            .filter(|search| search.active())
+            .is_none_or(|search| search.matches.contains(path))
+    }
+
     fn move_selection(&mut self, delta: isize) -> bool {
-        let Some(current) = self
-            .model
-            .tree()
-            .selection()
-            .and_then(|selected| self.visible_rows.iter().position(|path| path == selected))
-        else {
-            return self.select_index(0);
+        let current = self.selection().and_then(|selected| {
+            self.visible_rows
+                .iter()
+                .filter(|path| self.path_is_navigable(path))
+                .position(|path| path == selected)
+        });
+        let Some(current) = current else {
+            return self.select_navigable_index(0);
         };
-        let last = self.visible_rows.len().saturating_sub(1);
+        let last = self.navigable_len().saturating_sub(1);
         let next = if delta.is_negative() {
             current.saturating_sub(delta.unsigned_abs())
         } else {
             current.saturating_add(delta as usize).min(last)
         };
-        self.select_index(next)
+        self.select_navigable_index(next)
     }
 
-    fn select_index(&mut self, index: usize) -> bool {
-        let Some(path) = self.visible_rows.get(index).cloned() else {
+    fn select_navigable_index(&mut self, index: usize) -> bool {
+        let Some(path) = self.navigable_path(index) else {
             return false;
         };
-        if self.model.tree().selection() == Some(path.as_path()) {
+        self.select_path(&path)
+    }
+
+    fn select_path(&mut self, path: &Path) -> bool {
+        if self.selection() == Some(path) {
             return false;
         }
-        let selected = self.model.select(&path);
+        let selected = if let Some(search) = self.search.as_mut().filter(|search| search.active()) {
+            search.index.select(path)
+        } else {
+            self.model.select(path)
+        };
         if selected {
             self.ensure_selection_visible();
         }
@@ -445,14 +737,26 @@ impl FilesRuntime {
         let Some(index) = self.viewport_index(terminal_row) else {
             return false;
         };
-        self.select_index(index)
+        let Some(path) = self.visible_rows.get(index).cloned() else {
+            return false;
+        };
+        if !self.path_is_navigable(&path) {
+            return false;
+        }
+        self.select_path(&path)
     }
 
     fn toggle_viewport_row(&mut self, terminal_row: u16, workers: &mut WorkerRuntime) -> bool {
         let Some(index) = self.viewport_index(terminal_row) else {
             return false;
         };
-        let selection_changed = self.select_index(index);
+        let Some(path) = self.visible_rows.get(index).cloned() else {
+            return false;
+        };
+        if !self.path_is_navigable(&path) {
+            return false;
+        }
+        let selection_changed = self.select_path(&path);
         self.toggle_selected(workers) || selection_changed
     }
 
@@ -466,6 +770,9 @@ impl FilesRuntime {
     }
 
     fn expand_or_descend(&mut self, workers: &mut WorkerRuntime) -> bool {
+        if self.has_search_filter() {
+            return false;
+        }
         let Some(path) = self.model.tree().selection().map(Path::to_path_buf) else {
             return false;
         };
@@ -489,6 +796,9 @@ impl FilesRuntime {
     }
 
     fn toggle_selected(&mut self, workers: &mut WorkerRuntime) -> bool {
+        if self.has_search_filter() {
+            return false;
+        }
         let Some(path) = self.model.tree().selection().map(Path::to_path_buf) else {
             return false;
         };
@@ -506,6 +816,9 @@ impl FilesRuntime {
     }
 
     fn collapse_or_ascend(&mut self) -> bool {
+        if self.has_search_filter() {
+            return false;
+        }
         let Some(path) = self.model.tree().selection().map(Path::to_path_buf) else {
             return false;
         };
@@ -553,6 +866,277 @@ impl FilesRuntime {
         self.reload_pending = true;
         self.start_next_filesystem(workers);
         self.request_vcs_refresh(workers);
+        true
+    }
+
+    fn restart_search_scan(&mut self) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        if let Some(cancel) = search.page_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        search.scan_epoch = search.scan_epoch.saturating_add(1);
+        search.running = None;
+        search.running_directories.clear();
+        search.pending_directories.clear();
+        search.pending_directories.push_back(PathBuf::new());
+        search.scanned_entries = search
+            .searchable
+            .values()
+            .filter(|indexed| indexed.kind == TreeNodeKind::Virtual)
+            .count();
+        search.examined_entries = 0;
+        search.skipped_directories = 0;
+        search.complete = false;
+        search.truncated = false;
+    }
+
+    fn start_next_search_page(&mut self, workers: &mut WorkerRuntime) {
+        if !self.background_active {
+            return;
+        }
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        if search.running.is_some() || !search.should_scan() || search.complete {
+            return;
+        }
+        if search.scanned_entries >= MAX_INDEX_ENTRIES
+            || search.examined_entries >= MAX_EXAMINED_ENTRIES
+        {
+            search.truncated = true;
+            search.complete = true;
+            search.pending_directories.clear();
+            return;
+        }
+        if search.pending_directories.is_empty() {
+            search.complete = true;
+            return;
+        }
+
+        let directories = search
+            .pending_directories
+            .iter()
+            .take(DIRECTORIES_PER_PAGE)
+            .cloned()
+            .collect::<Vec<_>>();
+        let index = search.index.clone();
+        let loader = index.directory_loader();
+        let searchable = Arc::clone(&search.searchable);
+        let remaining_entries = MAX_INDEX_ENTRIES.saturating_sub(search.scanned_entries);
+        let remaining_examined = MAX_EXAMINED_ENTRIES.saturating_sub(search.examined_entries);
+        let generation = search.job_generation.saturating_add(1);
+        let epoch = search.scan_epoch;
+        let page_cancel = Arc::new(AtomicBool::new(false));
+        let job_cancel = Arc::clone(&page_cancel);
+        let job_directories = directories.clone();
+        let job = Job::new(
+            JobKey::new(JobKind::FileSearch, &self.root),
+            generation,
+            Priority::Low,
+            move |cancelled| {
+                Box::new(RuntimeMessage::FileSearch {
+                    generation,
+                    epoch,
+                    page: prepare_page(
+                        &loader,
+                        SearchPageRequest {
+                            index,
+                            searchable,
+                            directories: job_directories,
+                            remaining_entries,
+                            remaining_examined,
+                        },
+                        cancelled,
+                        &job_cancel,
+                    ),
+                })
+            },
+        );
+        match workers.submit(job) {
+            SubmitStatus::Queued | SubmitStatus::Coalesced => {
+                for _ in 0..directories.len() {
+                    search.pending_directories.pop_front();
+                }
+                search.running = Some((generation, epoch));
+                search.running_directories = directories;
+                search.page_cancel = Some(page_cancel);
+                search.job_generation = generation;
+                self.search_page_notice = None;
+            }
+            SubmitStatus::RejectedStale
+            | SubmitStatus::Backpressure
+            | SubmitStatus::ShuttingDown => {
+                self.search_page_notice =
+                    Some("background file search queue is unavailable".to_owned());
+            }
+        }
+    }
+
+    fn complete_search_page(
+        &mut self,
+        generation: u64,
+        epoch: u64,
+        page: PreparedSearchPage,
+        workers: &mut WorkerRuntime,
+    ) -> bool {
+        let Some(search) = &mut self.search else {
+            return false;
+        };
+        if search.running != Some((generation, epoch)) {
+            return false;
+        }
+        search.running = None;
+        search.page_cancel = None;
+        let running_directories = std::mem::take(&mut search.running_directories);
+        if epoch != search.scan_epoch {
+            self.start_next_search_page(workers);
+            return false;
+        }
+        if page.cancelled {
+            for directory in running_directories.into_iter().rev() {
+                search.pending_directories.push_front(directory);
+            }
+            return false;
+        }
+
+        search.index = page.index;
+        search.searchable = page.searchable;
+        search
+            .pending_directories
+            .extend(page.discovered_directories);
+        search.scanned_entries = search.scanned_entries.saturating_add(page.scanned_entries);
+        search.examined_entries = search
+            .examined_entries
+            .saturating_add(page.examined_entries);
+        search.skipped_directories = search
+            .skipped_directories
+            .saturating_add(page.skipped_directories);
+        if page.truncated {
+            search.truncated = true;
+            search.complete = true;
+            search.pending_directories.clear();
+        } else if search.pending_directories.is_empty() {
+            search.complete = true;
+        }
+        let changed = search.editing || search.active();
+        let project = search.active();
+        self.search_page_notice = None;
+        if project {
+            self.queue_search_projection(workers, false);
+        }
+        self.start_next_search_page(workers);
+        changed
+    }
+
+    fn queue_search_projection(&mut self, workers: &mut WorkerRuntime, clear_rows: bool) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        if !search.active() {
+            return;
+        }
+        if let Some(cancel) = search.projection_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        search.projection_requested = search.projection_requested.saturating_add(1);
+        if clear_rows {
+            search.matches.clear();
+            search.expanded_context.clear();
+            self.visible_rows.clear();
+            self.viewport_offset = 0;
+        }
+        self.start_next_search_projection(workers);
+    }
+
+    fn clear_search_projection(&mut self) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        if let Some(cancel) = search.projection_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        search.projection_requested = search.projection_requested.saturating_add(1);
+        search.projection_applied = search.projection_requested;
+        search.matches.clear();
+        search.expanded_context.clear();
+    }
+
+    fn start_next_search_projection(&mut self, workers: &mut WorkerRuntime) {
+        if !self.background_active {
+            return;
+        }
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        if !search.active() || search.projection_submitted >= search.projection_requested {
+            return;
+        }
+        let generation = search.projection_requested;
+        let index = search.index.clone();
+        let searchable = Arc::clone(&search.searchable);
+        let query = search.query.clone();
+        let projection_cancel = Arc::new(AtomicBool::new(false));
+        let job_cancel = Arc::clone(&projection_cancel);
+        let job = Job::new(
+            JobKey::new(JobKind::FileSearchProjection, &self.root),
+            generation,
+            Priority::Low,
+            move |cancelled| {
+                Box::new(RuntimeMessage::FileSearchProjection {
+                    generation,
+                    projection: project(&index, &searchable, &query, cancelled, &job_cancel),
+                })
+            },
+        );
+        match workers.submit(job) {
+            SubmitStatus::Queued | SubmitStatus::Coalesced => {
+                search.projection_submitted = generation;
+                search.projection_cancel = Some(projection_cancel);
+                self.search_projection_notice = None;
+            }
+            SubmitStatus::RejectedStale
+            | SubmitStatus::Backpressure
+            | SubmitStatus::ShuttingDown => {
+                self.search_projection_notice =
+                    Some("background file search projection queue is unavailable".to_owned());
+            }
+        }
+    }
+
+    fn complete_search_projection(
+        &mut self,
+        generation: u64,
+        projection: Option<SearchProjection>,
+    ) -> bool {
+        let Some(search) = &mut self.search else {
+            return false;
+        };
+        if generation != search.projection_requested || !search.active() {
+            return false;
+        }
+        search.projection_cancel = None;
+        let Some(projection) = projection else {
+            return false;
+        };
+        search.projection_applied = generation;
+        if search
+            .index
+            .selection()
+            .is_none_or(|selected| !projection.matches.contains(selected))
+            && let Some(first) = projection
+                .rows
+                .iter()
+                .find(|path| projection.matches.contains(*path))
+        {
+            search.index.select(first);
+        }
+        search.matches = projection.matches;
+        search.expanded_context = projection.expanded_context;
+        self.visible_rows = projection.rows;
+        self.search_projection_notice = None;
+        self.ensure_selection_visible();
         true
     }
 
@@ -694,9 +1278,13 @@ impl FilesRuntime {
         }
         self.filesystem_notice = notice;
         if changed {
+            if reload {
+                self.restart_search_scan();
+            }
             self.rebuild_visible_rows();
         }
         self.start_next_filesystem(workers);
+        self.start_next_search_page(workers);
         true
     }
 
@@ -761,6 +1349,11 @@ impl FilesRuntime {
         let changed = self.model.complete_prepared_refresh(result);
         self.schedule_next_status_refresh(now, fingerprint, changed);
         if changed {
+            if let Some(search) = &mut self.search {
+                search.index.sync_status_overlay_from(self.model.tree());
+                search.sync_virtual_entries();
+            }
+            self.queue_search_projection(workers, false);
             self.rebuild_visible_rows();
         }
         self.start_next_vcs_refresh(workers);
@@ -814,6 +1407,10 @@ impl FilesRuntime {
     }
 
     fn rebuild_visible_rows(&mut self) {
+        if self.has_search_filter() {
+            self.ensure_selection_visible();
+            return;
+        }
         self.expanded.retain(|path| {
             self.model.tree().node(path).map(|node| node.kind()) == Some(TreeNodeKind::Directory)
         });
@@ -868,8 +1465,6 @@ impl FilesRuntime {
 
     fn ensure_selection_visible(&mut self) {
         let Some(index) = self
-            .model
-            .tree()
             .selection()
             .and_then(|selected| self.visible_rows.iter().position(|path| path == selected))
         else {
@@ -891,9 +1486,19 @@ impl FilesRuntime {
     pub(crate) fn has_pending_work(&self) -> bool {
         self.filesystem_running.is_some()
             || self.model.refresh_is_running()
+            || self
+                .search
+                .as_ref()
+                .is_some_and(|search| search.running.is_some())
             || (self.background_active
-                && (self.reload_pending || !self.pending_expansions.is_empty()))
+                && (self.reload_pending
+                    || !self.pending_expansions.is_empty()
+                    || self.search.as_ref().is_some_and(|search| {
+                        (search.should_scan() && !search.complete)
+                            || search.projection_applied < search.projection_requested
+                    })))
     }
+
     pub(crate) fn next_refresh_in(&self, now: Instant) -> Option<Duration> {
         self.background_active
             .then_some(self.next_status_refresh)
@@ -937,9 +1542,28 @@ impl FilesRuntime {
         true
     }
 
-    pub(crate) const fn pause_background(&mut self) {
+    pub(crate) fn pause_background(&mut self) {
         self.background_active = false;
         self.next_status_refresh = None;
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        if let Some(cancel) = search.page_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        if search.running.take().is_some() {
+            for directory in std::mem::take(&mut search.running_directories)
+                .into_iter()
+                .rev()
+            {
+                search.pending_directories.push_front(directory);
+            }
+            search.scan_epoch = search.scan_epoch.saturating_add(1);
+        }
+        if let Some(cancel) = search.projection_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+            search.projection_requested = search.projection_requested.saturating_add(1);
+        }
     }
 
     pub(crate) fn complete_background(
@@ -954,12 +1578,23 @@ impl FilesRuntime {
                 result,
             } => self.complete_filesystem(generation, expansions, result, workers),
             RuntimeMessage::Vcs(result) => self.complete_vcs_refresh(result, workers),
+            RuntimeMessage::FileSearch {
+                generation,
+                epoch,
+                page,
+            } => self.complete_search_page(generation, epoch, page, workers),
+            RuntimeMessage::FileSearchProjection {
+                generation,
+                projection,
+            } => self.complete_search_projection(generation, projection),
         }
     }
 
     pub(crate) fn retry_pending(&mut self, workers: &mut WorkerRuntime) {
         self.start_next_filesystem(workers);
         self.start_next_vcs_refresh(workers);
+        self.start_next_search_page(workers);
+        self.start_next_search_projection(workers);
     }
 
     pub(crate) fn fail_background(
@@ -998,6 +1633,32 @@ impl FilesRuntime {
                 self.filesystem_notice =
                     Some("background VCS worker stopped unexpectedly".to_owned());
             }
+            JobKind::FileSearch => {
+                if let Some(search) = &mut self.search
+                    && let Some((running_generation, running_epoch)) = search.running
+                    && running_generation == generation
+                {
+                    search.running = None;
+                    search.running_directories.clear();
+                    search.page_cancel = None;
+                    if running_epoch == search.scan_epoch {
+                        search.complete = true;
+                    }
+                    self.search_page_notice =
+                        Some("background file search worker stopped unexpectedly".to_owned());
+                }
+            }
+            JobKind::FileSearchProjection => {
+                if let Some(search) = &mut self.search
+                    && generation == search.projection_requested
+                {
+                    search.projection_cancel = None;
+                    search.projection_applied = generation;
+                    self.search_projection_notice = Some(
+                        "background file search projection worker stopped unexpectedly".to_owned(),
+                    );
+                }
+            }
             JobKind::Config
             | JobKind::Bootstrap
             | JobKind::ConversationDiscovery
@@ -1015,7 +1676,6 @@ impl FilesRuntime {
 
 type DirectoryLoadResult = (PathBuf, io::Result<DirectorySnapshot>);
 
-#[derive(Debug)]
 pub(crate) enum RuntimeMessage {
     Filesystem {
         generation: u64,
@@ -1023,6 +1683,15 @@ pub(crate) enum RuntimeMessage {
         result: Vec<DirectoryLoadResult>,
     },
     Vcs(PreparedRefreshResult),
+    FileSearch {
+        generation: u64,
+        epoch: u64,
+        page: PreparedSearchPage,
+    },
+    FileSearchProjection {
+        generation: u64,
+        projection: Option<SearchProjection>,
+    },
 }
 
 #[cfg(test)]
@@ -1071,6 +1740,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
     use crossterm::event::{
@@ -1080,9 +1750,10 @@ mod tests {
     use ratatui::layout::Rect;
     use tempfile::TempDir;
 
-    use super::{FilesRuntime, RuntimeMessage, VcsRefresh};
+    use super::{FileSearchState, FilesRuntime, RuntimeMessage, VcsRefresh};
     use crate::config::{DisplayMode, GitCadence, PluginConfig};
     use crate::host::LaunchContext;
+    use crate::intent::Intent;
     use crate::vcs::git::GitService;
     use crate::vcs::jj::{JjService, JujutsuMode};
     use crate::vcs::{
@@ -1922,5 +2593,124 @@ mod tests {
 
         runtime.pause_background();
         assert_eq!(runtime.next_refresh_in(now), None);
+    }
+
+    #[test]
+    fn file_search_finds_collapsed_descendants_and_restores_the_normal_tree() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join("src")).expect("src");
+        fs::write(temp.path().join("src/nested.rs"), []).expect("nested file");
+        fs::write(temp.path().join("root.txt"), []).expect("root file");
+        let mut runtime = runtime(&temp);
+        let mut workers = workers();
+
+        assert!(runtime.handle_intent(&Intent::BeginFileSearch, &mut workers));
+        assert!(runtime.handle_intent(&Intent::FileSearchInput("nested".to_owned()), &mut workers));
+        assert!(runtime.visible_rows.is_empty());
+        let search = runtime.search.as_ref().expect("search");
+        assert!(search.projection_applied < search.projection_requested);
+        while runtime
+            .search
+            .as_ref()
+            .is_some_and(FileSearchState::scanning)
+        {
+            let message = receive(&mut workers);
+            runtime.complete_background(message, &mut workers);
+        }
+
+        assert_eq!(
+            runtime.visible_rows,
+            [PathBuf::from("src"), PathBuf::from("src/nested.rs")]
+        );
+        assert_eq!(runtime.selection(), Some(Path::new("src/nested.rs")));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 5));
+        runtime.render(Rect::new(0, 0, 40, 5), &mut buffer);
+        let rendered = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Search > nested"));
+        assert!(rendered.contains("nested.rs"));
+
+        assert!(runtime.handle_intent(&Intent::FileSearchCommit, &mut workers));
+        assert_eq!(
+            runtime.selected_file_reference(),
+            Some(Ok("@src/nested.rs ".to_owned()))
+        );
+
+        fs::write(temp.path().join("src/another-nested.rs"), []).expect("new nested file");
+        assert!(runtime.handle_intent(&Intent::Refresh, &mut workers));
+        while runtime.has_pending_work() || workers.has_pending_work() {
+            let message = receive(&mut workers);
+            runtime.complete_background(message, &mut workers);
+        }
+        assert!(
+            runtime
+                .visible_rows
+                .contains(&PathBuf::from("src/another-nested.rs"))
+        );
+        assert!(runtime.handle_intent(&Intent::FileSearchCancel, &mut workers));
+        assert!(
+            !runtime
+                .visible_rows
+                .contains(&PathBuf::from("src/nested.rs"))
+        );
+        assert_eq!(runtime.selection(), Some(Path::new("src")));
+        workers.shutdown();
+    }
+
+    #[test]
+    fn empty_file_search_redraws_when_indexing_finishes() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("main.rs"), []).expect("file");
+        let mut runtime = runtime(&temp);
+        let mut workers = workers();
+
+        assert!(runtime.handle_intent(&Intent::BeginFileSearch, &mut workers));
+        let mut redrawn = false;
+        while runtime
+            .search
+            .as_ref()
+            .is_some_and(FileSearchState::scanning)
+        {
+            redrawn |= runtime.complete_background(receive(&mut workers), &mut workers);
+        }
+        assert!(redrawn);
+
+        let area = Rect::new(0, 0, 40, 3);
+        let mut buffer = Buffer::empty(area);
+        runtime.render(area, &mut buffer);
+        let first = (0..area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>();
+        assert!(first.contains("0 matches"));
+        assert!(!first.contains("scanning"));
+        workers.shutdown();
+    }
+
+    #[test]
+    fn pausing_files_cancels_and_requeues_the_active_search_page() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join("src")).expect("src");
+        let mut runtime = runtime(&temp);
+        let mut workers = workers();
+
+        assert!(runtime.handle_intent(&Intent::BeginFileSearch, &mut workers));
+        let cancellation = runtime
+            .search
+            .as_ref()
+            .and_then(|search| search.page_cancel.clone())
+            .expect("page cancellation");
+        runtime.pause_background();
+
+        let search = runtime.search.as_ref().expect("search");
+        assert!(cancellation.load(Ordering::Relaxed));
+        assert!(search.running.is_none());
+        assert_eq!(
+            search.pending_directories.front().map(PathBuf::as_path),
+            Some(Path::new(""))
+        );
+        workers.shutdown();
     }
 }

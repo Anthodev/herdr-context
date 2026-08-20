@@ -2,6 +2,7 @@
 
 pub mod ignore;
 pub mod refresh;
+pub(crate) mod search;
 pub mod tree;
 use std::hash::{DefaultHasher, Hash, Hasher};
 

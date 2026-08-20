@@ -12,6 +12,8 @@ use crate::model::UiGeometry;
 pub enum InputMode {
     #[default]
     Normal,
+    FileSearch,
+    FileSearchActive,
 }
 
 #[must_use]
@@ -28,7 +30,21 @@ pub fn map_event_with_keybindings(
 ) -> Option<Intent> {
     match event {
         Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-            keybindings.map_or_else(|| map_key(key, mode), |bindings| bindings.map_key(key))
+            match mode {
+                InputMode::Normal => {
+                    keybindings.map_or_else(|| map_key(key, mode), |bindings| bindings.map_key(key))
+                }
+                InputMode::FileSearchActive if key.code == KeyCode::Esc => {
+                    Some(Intent::FileSearchCancel)
+                }
+                InputMode::FileSearchActive => {
+                    keybindings.map_or_else(|| map_key(key, mode), |bindings| bindings.map_key(key))
+                }
+                InputMode::FileSearch => map_key(key, mode),
+            }
+        }
+        Event::Paste(value) if mode == InputMode::FileSearch => {
+            Some(Intent::FileSearchInput(value))
         }
         Event::Mouse(mouse) => {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -62,7 +78,8 @@ pub fn map_event_with_keybindings(
 
 fn map_key(key: KeyEvent, mode: InputMode) -> Option<Intent> {
     match mode {
-        InputMode::Normal => map_normal_key(key),
+        InputMode::Normal | InputMode::FileSearchActive => map_normal_key(key),
+        InputMode::FileSearch => map_file_search_key(key),
     }
 }
 
@@ -84,6 +101,91 @@ fn map_normal_key(key: KeyEvent) -> Option<Intent> {
         KeyCode::Left | KeyCode::Char('h') => Some(Intent::CollapseOrAscend),
         KeyCode::Enter | KeyCode::Char(' ') => Some(Intent::ToggleSelected),
         KeyCode::Char('r') => Some(Intent::Refresh),
+        KeyCode::Char('/') => Some(Intent::BeginFileSearch),
         _ => None,
+    }
+}
+
+fn map_file_search_key(key: KeyEvent) -> Option<Intent> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char('c') => Some(Intent::Quit),
+            KeyCode::Char('u') => Some(Intent::FileSearchClear),
+            _ => None,
+        };
+    }
+    match key.code {
+        KeyCode::Esc => Some(Intent::FileSearchCancel),
+        KeyCode::Enter => Some(Intent::FileSearchCommit),
+        KeyCode::Backspace => Some(Intent::FileSearchBackspace),
+        KeyCode::Tab => Some(Intent::NextView),
+        KeyCode::BackTab => Some(Intent::PreviousView),
+        KeyCode::Char(character) => Some(Intent::FileSearchInput(character.to_string())),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    use super::{InputMode, map_event};
+    use crate::intent::Intent;
+    use crate::model::UiGeometry;
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new(code, modifiers))
+    }
+
+    #[test]
+    fn file_search_mode_treats_printable_shortcuts_as_query_text() {
+        let geometry = UiGeometry::default();
+
+        assert_eq!(
+            map_event(
+                key(KeyCode::Char('q'), KeyModifiers::NONE),
+                InputMode::FileSearch,
+                &geometry,
+            ),
+            Some(Intent::FileSearchInput("q".to_owned()))
+        );
+        assert_eq!(
+            map_event(
+                key(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                InputMode::FileSearch,
+                &geometry,
+            ),
+            Some(Intent::FileSearchClear)
+        );
+        assert_eq!(
+            map_event(
+                Event::Paste("src/lib.rs".to_owned()),
+                InputMode::FileSearch,
+                &geometry
+            ),
+            Some(Intent::FileSearchInput("src/lib.rs".to_owned()))
+        );
+    }
+
+    #[test]
+    fn committed_file_search_uses_escape_to_clear_before_quitting() {
+        let geometry = UiGeometry::default();
+
+        assert_eq!(
+            map_event(
+                key(KeyCode::Esc, KeyModifiers::NONE),
+                InputMode::FileSearchActive,
+                &geometry,
+            ),
+            Some(Intent::FileSearchCancel)
+        );
+        assert_eq!(
+            map_event(
+                key(KeyCode::Char('q'), KeyModifiers::NONE),
+                InputMode::FileSearchActive,
+                &geometry,
+            ),
+            Some(Intent::Quit)
+        );
     }
 }

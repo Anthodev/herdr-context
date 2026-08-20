@@ -52,6 +52,25 @@ pub fn render_shell(model: &mut AppModel, area: Rect, buffer: &mut Buffer) {
             Span::styled(" Conversations ", tab_style(active == View::Conversations)),
         ])
         .render(Rect::new(area.x, area.y, area.width, 1), buffer);
+        let search_hint = model.search_hint();
+        let search_hint_width = u16::try_from(search_hint.chars().count()).unwrap_or(u16::MAX);
+        if active == View::Files
+            && !model.files().search_editing()
+            && model.files().filter().is_empty()
+            && !search_hint.is_empty()
+            && area.width >= 23_u16.saturating_add(search_hint_width)
+        {
+            Span::styled(search_hint, theme::inactive()).render(
+                Rect::new(
+                    area.x
+                        .saturating_add(area.width.saturating_sub(search_hint_width)),
+                    area.y,
+                    search_hint_width,
+                    1,
+                ),
+                buffer,
+            );
+        }
     }
     if warning_height != 0 {
         let warnings = model.config_warnings();
