@@ -16,7 +16,7 @@ upstream Herdr, and keeps the plugin independently installable.
 
 ## Install a packaged release
 
-Version `0.11.0` supports these release targets:
+Version `0.12.0` supports these release targets:
 
 | Platform | Architecture | Artifact target |
 |---|---|---|
@@ -31,18 +31,18 @@ status needs `jj` `0.37` or newer. Missing optional VCS tools degrade the
 affected status view without closing the dock.
 
 Download the archive and adjacent `.sha256` file for the host target from the
-`v0.11.0` GitHub release, then verify and install it:
+`v0.12.0` GitHub release, then verify and install it:
 
 ```sh
 target=x86_64-unknown-linux-gnu # choose a target from the table
 
 # Linux checksum tool:
-sha256sum -c "herdr-context-v0.11.0-$target.tar.gz.sha256"
+sha256sum -c "herdr-context-v0.12.0-$target.tar.gz.sha256"
 # macOS checksum tool:
-shasum -a 256 -c "herdr-context-v0.11.0-$target.tar.gz.sha256"
+shasum -a 256 -c "herdr-context-v0.12.0-$target.tar.gz.sha256"
 
-tar -xzf "herdr-context-v0.11.0-$target.tar.gz"
-cd "herdr-context-v0.11.0-$target"
+tar -xzf "herdr-context-v0.12.0-$target.tar.gz"
+cd "herdr-context-v0.12.0-$target"
 ./install.sh
 ```
 
@@ -112,6 +112,9 @@ see the retained performance evidence below.
 - support both Git and Jujutsu (`jj`) workspaces;
 - normalize VCS states such as added, modified, deleted, renamed, copied,
   untracked, and conflicted;
+- color file and directory icons/names from normalized status: added is green,
+  modified is yellow or yellow-orange, and deleted is red; directories inherit
+  the highest-priority status of their descendants;
 - represent deleted files even though they no longer exist on disk;
 - never intentionally modify project files or VCS history.
 
@@ -149,6 +152,9 @@ require a dedicated adapter and cannot be inferred safely.
 - one shortcut toggles between open, focus, and close;
 - each view preserves its selection and scroll position across tab switches;
   Conversations also preserves collapsed provider groups across refreshes;
+- general UI colors use semantic ANSI slots resolved by Herdr's active user
+  theme; primary VCS colors use deterministic truecolor overrides so terminal
+  palette remapping cannot turn green/yellow/red states into unrelated colors;
 - the project context is captured from the originating terminal before the
   plugin receives focus.
 
@@ -223,12 +229,15 @@ instead of persisting external metadata.
 
 The plugin reads `config.toml` from `HERDR_PLUGIN_CONFIG_DIR`. Loading is
 read-only, byte-bounded, and performed on a worker after the first frame.
-Missing or malformed files use safe defaults. Invalid fields fall back
-independently and produce a sanitized warning in the dock.
+An absent file silently uses safe defaults. Malformed files and invalid fields
+fall back independently and produce a sanitized warning in the dock.
 
 ```toml
 [dock]
 initial_width = 40       # 24..60
+
+[ui]
+display_mode = "ascii" # ascii, unicode, or nerd
 
 [files]
 show_hidden = false
@@ -269,6 +278,22 @@ canonical-project, and metadata bounds. Extra project roots are
 project-relative; extra external roots are absolute. Unsupported or unreadable
 roots are isolated so healthy sources and cached metadata remain visible.
 
+`ui.display_mode` controls glyphs in both Files and Conversations:
+
+- `ascii` is the compact terminal-safe default. Files uses ASCII tree
+  connectors with `+` / `-` directories and `f` files; Conversations uses
+  `+` / `-` provider groups and `*` / `-` / `?` session states;
+- `unicode` uses `├──` / `└──` Files connectors, `▸` / `▾` expandable groups,
+  and Unicode file/session bullets;
+- `nerd` keeps the Unicode Files tree and uses Nerd Font folder, typed-file,
+  provider-group, live-session, and history glyphs. Common source,
+  configuration, document, archive, image, and database extensions get a
+  type-specific file icon; unknown files use a generic icon. This mode requires
+  a Nerd Font in the terminal rendering Herdr.
+
+All three modes reuse cached state. Changing glyphs adds no filesystem reads,
+conversation discovery, or eager traversal.
+
 Files and VCS refresh immediately when the Files view is activated or `refresh`
 is invoked. Adaptive Git polling starts at the configured minimum, doubles
 while status is unchanged up to the maximum, and resets when status changes.
@@ -295,7 +320,7 @@ renders status as potentially stale.
 
 ## Release status
 
-Version `0.11.0` is the V1 packaging contract. Tag `v0.11.0`, Cargo metadata,
+Version `0.12.0` is the V1 packaging contract. Tag `v0.12.0`, Cargo metadata,
 the source and packaged manifests, binary name, minimum Herdr version, archive
 names, and checksums are validated together. CI builds from `Cargo.lock` and
 blocks publication on formatting, Clippy, tests, release build, manifest,

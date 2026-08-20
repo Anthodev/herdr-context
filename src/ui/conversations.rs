@@ -2,17 +2,22 @@ use std::time::UNIX_EPOCH;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 use time::OffsetDateTime;
 
+use crate::config::DisplayMode;
 use crate::conversations::{Conversation, ConversationState, ProvenanceKind, ResumeCapability};
 use crate::model::ConversationsViewState;
 
-use super::sanitize_terminal_text;
+use super::{conversation_display, sanitize_terminal_text, theme};
 
-pub(crate) fn render(state: &ConversationsViewState, area: Rect, buffer: &mut Buffer) {
+pub(crate) fn render(
+    state: &ConversationsViewState,
+    display_mode: DisplayMode,
+    area: Rect,
+    buffer: &mut Buffer,
+) {
     if area.is_empty() {
         return;
     }
@@ -33,14 +38,14 @@ pub(crate) fn render(state: &ConversationsViewState, area: Rect, buffer: &mut Bu
         }
         let collapsed = state.provider_is_collapsed(provider);
         if absolute_row >= state.scroll() && rendered_rows < area.height {
-            let marker = if collapsed { "▸ " } else { "▾ " };
             let mut header = Line::from(vec![
-                Span::raw(marker),
+                Span::raw(conversation_display::provider(display_mode, collapsed)),
+                Span::raw(" "),
                 Span::raw(sanitize_terminal_text(provider)),
                 Span::raw(format!(" ({})", state.provider_count(provider))),
             ]);
             if state.selected_provider() == Some(provider.as_str()) {
-                header = header.style(Style::new().add_modifier(Modifier::REVERSED));
+                header = header.style(theme::selected());
             }
             header.render(
                 Rect::new(area.x, area.y.saturating_add(rendered_rows), area.width, 1),
@@ -60,9 +65,9 @@ pub(crate) fn render(state: &ConversationsViewState, area: Rect, buffer: &mut Bu
                 return;
             }
             if absolute_row >= state.scroll() {
-                let mut line = conversation_line(conversation, area.width >= 96);
+                let mut line = conversation_line(conversation, display_mode, area.width >= 96);
                 if state.selection() == Some(conversation.session_reference()) {
-                    line = line.style(Style::new().add_modifier(Modifier::REVERSED));
+                    line = line.style(theme::selected());
                 }
                 line.render(
                     Rect::new(area.x, area.y.saturating_add(rendered_rows), area.width, 1),
@@ -78,7 +83,11 @@ pub(crate) fn render(state: &ConversationsViewState, area: Rect, buffer: &mut Bu
     }
 }
 
-fn conversation_line(conversation: &Conversation, wide: bool) -> Line<'static> {
+fn conversation_line(
+    conversation: &Conversation,
+    display_mode: DisplayMode,
+    wide: bool,
+) -> Line<'static> {
     let title = sanitize_terminal_text(
         conversation
             .title()
@@ -92,7 +101,8 @@ fn conversation_line(conversation: &Conversation, wide: bool) -> Line<'static> {
         conversation.resume_capability(),
         ResumeCapability::Supported(_)
     );
-    let state = match conversation.state() {
+    let conversation_state = conversation.state();
+    let state = match conversation_state {
         ConversationState::Live => "live",
         ConversationState::Archived => "archived",
         ConversationState::Unknown => "unknown",
@@ -112,8 +122,13 @@ fn conversation_line(conversation: &Conversation, wide: bool) -> Line<'static> {
     };
     Line::from(vec![
         Span::raw("  "),
+        Span::raw(conversation_display::conversation(
+            display_mode,
+            conversation_state,
+        )),
+        Span::raw(" "),
         Span::raw(title),
-        Span::styled(metadata, Style::new().fg(Color::DarkGray)),
+        Span::styled(metadata, theme::inactive()),
     ])
 }
 

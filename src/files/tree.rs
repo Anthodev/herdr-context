@@ -204,7 +204,7 @@ impl FilesTree {
                 && self.loader.ignore.is_visible(path)
             {
                 let path = path.to_path_buf();
-                insert_preferred_status(&mut statuses, path.clone(), entry.kind());
+                insert_status_with_ancestors(&mut statuses, &path, entry.kind());
                 if entry.kind() == VcsStatusKind::Deleted
                     || entry.index_state() == Some(VcsStatusKind::Deleted)
                     || entry.worktree_state() == Some(VcsStatusKind::Deleted)
@@ -225,6 +225,7 @@ impl FilesTree {
             match self.loader.ignore.symlink_metadata(&path) {
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    insert_status_with_ancestors(&mut statuses, &path, status);
                     virtual_nodes.push(TreeNode {
                         path,
                         kind: TreeNodeKind::Virtual,
@@ -290,6 +291,36 @@ impl FilesTree {
         self.nodes.get(path).map(|node| self.display_parent(node))
     }
 
+    #[must_use]
+    pub(crate) fn display_path<'a>(&self, path: &'a Path) -> &'a Path {
+        self.display_parent_of(path)
+            .and_then(|parent| path.strip_prefix(parent).ok())
+            .filter(|relative| !relative.as_os_str().is_empty())
+            .unwrap_or(path)
+    }
+
+    #[must_use]
+    pub(crate) fn display_depth(&self, path: &Path) -> usize {
+        let mut depth = 0_usize;
+        let mut current = path;
+        while let Some(parent) = self.display_parent_of(current) {
+            if parent.as_os_str().is_empty() {
+                break;
+            }
+            depth = depth.saturating_add(1);
+            current = parent;
+        }
+        depth
+    }
+
+    #[must_use]
+    pub(crate) fn is_last_display_child(&self, path: &Path) -> bool {
+        self.display_parent_of(path)
+            .and_then(|parent| self.children.get(parent))
+            .and_then(|children| children.last())
+            .is_some_and(|last| last == path)
+    }
+
     fn display_parent<'a>(&'a self, node: &'a TreeNode) -> &'a Path {
         if node.kind != TreeNodeKind::Virtual {
             return parent_path(&node.path);
@@ -353,6 +384,19 @@ impl FilesTree {
 
 fn parent_path(path: &Path) -> &Path {
     path.parent().unwrap_or_else(|| Path::new(""))
+}
+
+fn insert_status_with_ancestors(
+    statuses: &mut BTreeMap<PathBuf, VcsStatusKind>,
+    path: &Path,
+    status: VcsStatusKind,
+) {
+    for affected in path
+        .ancestors()
+        .take_while(|path| !path.as_os_str().is_empty())
+    {
+        insert_preferred_status(statuses, affected.to_path_buf(), status);
+    }
 }
 
 fn insert_preferred_status(
@@ -455,6 +499,41 @@ mod tests {
                 .expect("target")
                 .status(),
             Some(VcsStatusKind::Renamed)
+        );
+    }
+
+    #[test]
+    fn aggregates_preferred_descendant_status_onto_lazy_directories() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join("src/nested")).expect("directories");
+        fs::write(temp.path().join("src/modified.rs"), []).expect("modified file");
+        fs::write(temp.path().join("src/nested/conflicted.rs"), []).expect("conflicted file");
+        let mut tree = FilesTree::new(temp.path().to_path_buf()).expect("tree");
+        tree.load_directory(Path::new("")).expect("root");
+
+        tree.merge_status(&VcsStatusSnapshot::new(
+            vec![
+                status("src/modified.rs", None, VcsStatusKind::Modified),
+                status("src/nested/conflicted.rs", None, VcsStatusKind::Conflicted),
+            ],
+            false,
+        ))
+        .expect("merge status");
+
+        assert_eq!(
+            tree.node(Path::new("src")).expect("src").status(),
+            Some(VcsStatusKind::Conflicted)
+        );
+        tree.load_directory(Path::new("src")).expect("src");
+        assert_eq!(
+            tree.node(Path::new("src/nested")).expect("nested").status(),
+            Some(VcsStatusKind::Conflicted)
+        );
+        assert_eq!(
+            tree.node(Path::new("src/modified.rs"))
+                .expect("modified")
+                .status(),
+            Some(VcsStatusKind::Modified)
         );
     }
 
@@ -627,6 +706,35 @@ mod tests {
             tree.node(Path::new("renamed-target"))
                 .expect("rename target")
                 .status(),
+            Some(VcsStatusKind::Renamed)
+        );
+    }
+
+    #[test]
+    fn aggregates_missing_rename_source_status_onto_its_directory() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join("old")).expect("old directory");
+        fs::create_dir(temp.path().join("new")).expect("new directory");
+        fs::write(temp.path().join("new/current.rs"), []).expect("rename target");
+        let mut tree = FilesTree::new(temp.path().to_path_buf()).expect("tree");
+        tree.load_directory(Path::new("")).expect("root");
+
+        tree.merge_status(&VcsStatusSnapshot::new(
+            vec![status(
+                "new/current.rs",
+                Some("old/missing.rs"),
+                VcsStatusKind::Renamed,
+            )],
+            false,
+        ))
+        .expect("merge status");
+
+        assert_eq!(
+            tree.node(Path::new("old")).expect("old directory").status(),
+            Some(VcsStatusKind::Renamed)
+        );
+        assert_eq!(
+            tree.node(Path::new("new")).expect("new directory").status(),
             Some(VcsStatusKind::Renamed)
         );
     }

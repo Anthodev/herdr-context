@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::config::{FilesConfig, GitCadence, PluginConfig, RefreshPolicy, VcsBackendSelection};
+use crate::config::{
+    DisplayMode, FilesConfig, GitCadence, PluginConfig, RefreshPolicy, VcsBackendSelection,
+};
 use crate::files::ignore::ConfiguredVisibilityPolicy;
 use crate::files::tree::{DirectorySnapshot, TreeNodeKind};
 use crate::files::{FilesModel, PreparedRefreshResult};
@@ -100,6 +102,7 @@ pub struct FilesRuntime {
     filesystem_panic_retried: bool,
     filesystem_notice: Option<String>,
     backend_notice: Option<String>,
+    display_mode: DisplayMode,
 }
 
 impl FilesRuntime {
@@ -112,6 +115,7 @@ impl FilesRuntime {
             config.vcs().backend(),
             config.vcs().jujutsu_mode(),
             config.vcs().refresh(),
+            config.ui().display_mode(),
             config.files(),
             &NOT_CANCELLED,
         )
@@ -129,6 +133,7 @@ impl FilesRuntime {
             config.vcs().backend(),
             jujutsu_mode,
             config.vcs().refresh(),
+            config.ui().display_mode(),
             config.files(),
             &NOT_CANCELLED,
         )
@@ -153,6 +158,7 @@ impl FilesRuntime {
             config.vcs().backend(),
             config.vcs().jujutsu_mode(),
             config.vcs().refresh(),
+            config.ui().display_mode(),
             config.files(),
             cancelled,
         )
@@ -163,6 +169,7 @@ impl FilesRuntime {
         backend: VcsBackendSelection,
         jujutsu_mode: JujutsuMode,
         refresh_policy: RefreshPolicy,
+        display_mode: DisplayMode,
         files_config: &FilesConfig,
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> Result<Self, FilesRuntimeError> {
@@ -253,6 +260,7 @@ impl FilesRuntime {
             backend_notice: configured_vcs_missing.then(|| {
                 "configured VCS backend was not found; showing the filesystem only".to_owned()
             }),
+            display_mode,
         };
         runtime.rebuild_visible_rows();
         Ok(runtime)
@@ -294,6 +302,8 @@ impl FilesRuntime {
             self.model.tree().selection(),
             notice,
         )
+        .with_expanded(&self.expanded)
+        .with_display_mode(self.display_mode)
         .render(area, buffer);
     }
 
@@ -1034,7 +1044,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{FilesRuntime, RuntimeMessage, VcsRefresh};
-    use crate::config::{GitCadence, PluginConfig};
+    use crate::config::{DisplayMode, GitCadence, PluginConfig};
     use crate::host::LaunchContext;
     use crate::vcs::git::GitService;
     use crate::vcs::jj::{JjService, JujutsuMode};
@@ -1070,6 +1080,38 @@ mod tests {
             .downcast::<RuntimeMessage>()
             .map(|message| *message)
             .expect("Files runtime message")
+    }
+
+    #[test]
+    fn configured_display_mode_reaches_the_files_renderer() {
+        let project = TempDir::new().expect("project");
+        fs::write(project.path().join("main.rs"), []).expect("Rust file");
+        let config_dir = TempDir::new().expect("config");
+        fs::write(
+            config_dir.path().join("config.toml"),
+            "[ui]\ndisplay_mode = \"unicode\"\n",
+        )
+        .expect("config file");
+        let config = PluginConfig::load_from_dir(config_dir.path()).into_config();
+        let context = LaunchContext::from_vars([(
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            format!(
+                r#"{{"workspace_id":"workspace","tab_id":"tab","pane_id":"pane","cwd":"{}"}}"#,
+                project.path().display()
+            ),
+        )])
+        .expect("context");
+        let mut runtime = FilesRuntime::bootstrap_with_config(&context, &config).expect("runtime");
+        let area = Rect::new(0, 0, 40, 1);
+        let mut buffer = Buffer::empty(area);
+
+        runtime.render(area, &mut buffer);
+
+        let rendered = (0..area.width)
+            .map(|column| buffer[(column, 0)].symbol())
+            .collect::<String>();
+        assert!(rendered.starts_with("  └── • main.rs"));
+        assert_eq!(runtime.display_mode, DisplayMode::Unicode);
     }
 
     #[cfg(unix)]

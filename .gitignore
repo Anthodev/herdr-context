@@ -1,5 +1,10 @@
 /target/
 
-docs/
+AGENTS.md
 .pi
+.claude
+.mcp.json
 TODO.md
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+graft/
