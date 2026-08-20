@@ -57,6 +57,14 @@ case "$*" in
     : > '{}'
     printf '%s\n' '{{"id":"test","result":{{"type":"pane_resize","resize":{{"changed":true}}}}}}'
     ;;
+  "pane send-text origin @src/file.tmp ")
+    ;;
+  "pane focus --direction left --pane opened")
+    printf '%s\n' '{{"id":"test","result":{{"type":"pane_focus_direction","focus":{{"changed":true,"focused_pane_id":"middle","source_pane_id":"opened"}}}}}}'
+    ;;
+  "pane focus --direction left --pane middle")
+    printf '%s\n' '{{"id":"test","result":{{"type":"pane_focus_direction","focus":{{"changed":true,"focused_pane_id":"origin","source_pane_id":"middle"}}}}}}'
+    ;;
   *)
     printf '%s\n' '{{"error":{{"code":"operation_failed","message":"unexpected argv"}},"id":"test"}}'
     exit 1
@@ -101,14 +109,19 @@ esac
     client.resize_pane(&opened, DockWidth::clamped(40))?;
     client.focus_pane(&opened)?;
     client.close_pane(&opened)?;
+    client.send_text(&PaneId::new("origin")?, "@src/file.tmp ")?;
+    client.focus_origin_pane(&opened, &PaneId::new("origin")?)?;
 
     let argv = fs::read_to_string(log)?;
     assert!(argv.contains("pane list --workspace workspace"));
-    assert!(argv.contains("plugin pane open --plugin herdr-context --entrypoint dock --placement split --target-pane origin --direction right --cwd /plugin root --env HERDR_CONTEXT_ORIGIN_CWD=/project with space --focus"));
+    assert!(argv.contains("plugin pane open --plugin herdr-context --entrypoint dock --placement split --target-pane origin --direction right --cwd /plugin root --env HERDR_CONTEXT_ORIGIN_CWD=/project with space --env HERDR_CONTEXT_ORIGIN_PANE_ID=origin --focus"));
     assert!(argv.contains("pane swap --direction right --pane opened"));
     assert!(argv.contains("pane resize --direction right"));
     assert!(argv.contains("plugin pane focus opened"));
     assert!(argv.contains("plugin pane close opened"));
+    assert!(argv.contains("pane send-text origin @src/file.tmp \n"));
+    assert!(argv.contains("pane focus --direction left --pane opened"));
+    assert!(argv.contains("pane focus --direction left --pane middle"));
     Ok(())
 }
 

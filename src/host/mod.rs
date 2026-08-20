@@ -42,6 +42,7 @@ pub struct LaunchContext {
     workspace_id: WorkspaceId,
     tab_id: TabId,
     focused_pane_id: PaneId,
+    runtime_pane_id: PaneId,
     cwd: PathBuf,
     foreground_cwd: Option<PathBuf>,
 }
@@ -101,7 +102,7 @@ impl LaunchContext {
             "HERDR_TAB_ID",
             TabId::new,
         )?;
-        let focused_pane_id = authoritative_id(
+        let runtime_pane_id = authoritative_id(
             lookup("HERDR_PANE_ID")?,
             &context,
             &[
@@ -115,6 +116,10 @@ impl LaunchContext {
             "HERDR_PANE_ID",
             PaneId::new,
         )?;
+        let focused_pane_id = match lookup("HERDR_CONTEXT_ORIGIN_PANE_ID")? {
+            Some(pane_id) => PaneId::new(pane_id)?,
+            None => runtime_pane_id.clone(),
+        };
         let origin_cwd = lookup("HERDR_CONTEXT_ORIGIN_CWD")?;
         let (cwd, foreground_cwd) = if let Some(origin_cwd) = origin_cwd {
             (absolute_path(origin_cwd, "HERDR_CONTEXT_ORIGIN_CWD")?, None)
@@ -147,6 +152,7 @@ impl LaunchContext {
             workspace_id,
             tab_id,
             focused_pane_id,
+            runtime_pane_id,
             cwd,
             foreground_cwd,
         })
@@ -165,6 +171,11 @@ impl LaunchContext {
     #[must_use]
     pub const fn focused_pane_id(&self) -> &PaneId {
         &self.focused_pane_id
+    }
+
+    #[must_use]
+    pub const fn runtime_pane_id(&self) -> &PaneId {
+        &self.runtime_pane_id
     }
 
     #[must_use]
@@ -527,6 +538,12 @@ pub trait HostClient: Send {
         tab_id: &TabId,
     ) -> Result<Vec<HostPane>, HostError>;
     fn live_sessions(&self) -> Result<Vec<HostAgentSession>, HostError>;
+    fn send_text(&self, pane_id: &PaneId, text: &str) -> Result<(), HostError>;
+    fn focus_origin_pane(
+        &self,
+        dock_pane_id: &PaneId,
+        origin_pane_id: &PaneId,
+    ) -> Result<(), HostError>;
     fn verified_dock_identity(
         &mut self,
         pane: &HostPane,
@@ -636,6 +653,7 @@ mod tests {
         assert_eq!(context.workspace_id().as_str(), "env-workspace");
         assert_eq!(context.tab_id().as_str(), "env-tab");
         assert_eq!(context.focused_pane_id().as_str(), "env-pane");
+        assert_eq!(context.runtime_pane_id().as_str(), "env-pane");
         assert_eq!(context.cwd().to_string_lossy(), "/project");
         assert_eq!(
             context.foreground_cwd().map(Path::to_string_lossy),
@@ -649,8 +667,11 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut vars = valid_vars();
         vars.push(("HERDR_CONTEXT_ORIGIN_CWD", "/original/project"));
+        vars.push(("HERDR_CONTEXT_ORIGIN_PANE_ID", "origin-pane"));
         let context = LaunchContext::from_vars(vars)?;
 
+        assert_eq!(context.focused_pane_id().as_str(), "origin-pane");
+        assert_eq!(context.runtime_pane_id().as_str(), "env-pane");
         assert_eq!(context.cwd(), Path::new("/original/project"));
         assert_eq!(context.foreground_cwd(), None);
         Ok(())

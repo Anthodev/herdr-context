@@ -40,6 +40,18 @@ impl HostClient for FakeHost {
         Ok(Vec::new())
     }
 
+    fn send_text(&self, _pane_id: &PaneId, _text: &str) -> Result<(), HostError> {
+        Ok(())
+    }
+
+    fn focus_origin_pane(
+        &self,
+        _dock_pane_id: &PaneId,
+        _origin_pane_id: &PaneId,
+    ) -> Result<(), HostError> {
+        Ok(())
+    }
+
     fn verified_dock_identity(
         &mut self,
         pane: &HostPane,

@@ -24,6 +24,8 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
+const MAX_FILE_REFERENCE_BYTES: usize = 4_096;
+
 #[derive(Clone, Debug)]
 enum VcsRefresh {
     Git {
@@ -101,6 +103,7 @@ pub struct FilesRuntime {
     reload_pending: bool,
     filesystem_panic_retried: bool,
     filesystem_notice: Option<String>,
+    pane_input_notice: Option<String>,
     backend_notice: Option<String>,
     display_mode: DisplayMode,
 }
@@ -257,6 +260,7 @@ impl FilesRuntime {
             reload_pending: false,
             filesystem_panic_retried: false,
             filesystem_notice: None,
+            pane_input_notice: None,
             backend_notice: configured_vcs_missing.then(|| {
                 "configured VCS backend was not found; showing the filesystem only".to_owned()
             }),
@@ -282,8 +286,9 @@ impl FilesRuntime {
         let rows = &self.visible_rows[self.viewport_offset.min(end)..end];
         let stale = self.model.status_is_stale();
         let runtime_notice = self
-            .filesystem_notice
+            .pane_input_notice
             .as_deref()
+            .or(self.filesystem_notice.as_deref())
             .or(self.backend_notice.as_deref());
         let notice = match (runtime_notice, self.model.failure_notice(), stale) {
             (Some(message), _, true) => Some(("Files / VCS stale", message)),
@@ -359,6 +364,36 @@ impl FilesRuntime {
     #[must_use]
     pub(crate) fn selection(&self) -> Option<&Path> {
         self.model.tree().selection()
+    }
+
+    pub(crate) fn selected_file_reference(&self) -> Option<Result<String, &'static str>> {
+        let path = self.model.tree().selection()?;
+        let node = self.model.tree().node(path)?;
+        if node.kind() != TreeNodeKind::File {
+            return None;
+        }
+        let Some(path) = path.to_str() else {
+            return Some(Err("selected file path is not valid UTF-8"));
+        };
+        if path.is_empty()
+            || path.len().saturating_add(2) > MAX_FILE_REFERENCE_BYTES
+            || path.chars().any(char::is_control)
+        {
+            return Some(Err("selected file path cannot be inserted safely"));
+        }
+        let mut reference = String::with_capacity(path.len().saturating_add(2));
+        reference.push('@');
+        reference.push_str(path);
+        reference.push(' ');
+        Some(Ok(reference))
+    }
+
+    pub(crate) fn set_pane_input_notice(&mut self, notice: Option<String>) -> bool {
+        if self.pane_input_notice == notice {
+            return false;
+        }
+        self.pane_input_notice = notice;
+        true
     }
 
     #[must_use]
@@ -967,6 +1002,7 @@ impl FilesRuntime {
             | JobKind::Bootstrap
             | JobKind::ConversationDiscovery
             | JobKind::ConversationLive
+            | JobKind::PaneInput
             | JobKind::Process
             | JobKind::Filesystem => {}
         }
@@ -1032,7 +1068,7 @@ mod tests {
     use std::fs;
     use std::io;
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
@@ -1112,6 +1148,52 @@ mod tests {
             .collect::<String>();
         assert!(rendered.starts_with("  └── • main.rs"));
         assert_eq!(runtime.display_mode, DisplayMode::Unicode);
+    }
+
+    #[test]
+    fn selected_file_reference_is_relative_to_the_project_root() {
+        let project = TempDir::new().expect("project");
+        fs::create_dir(project.path().join("src")).expect("src");
+        fs::write(project.path().join("src/file.tmp"), []).expect("file");
+        let mut runtime = runtime(&project);
+
+        assert_eq!(runtime.selected_file_reference(), None);
+        runtime
+            .model
+            .load_directory(Path::new("src"))
+            .expect("load src");
+        assert!(runtime.model.select(Path::new("src/file.tmp")));
+
+        assert_eq!(
+            runtime.selected_file_reference(),
+            Some(Ok("@src/file.tmp ".to_owned()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_file_reference_rejects_terminal_control_characters() {
+        let project = TempDir::new().expect("project");
+        fs::write(project.path().join("unsafe\nfile"), []).expect("file");
+        let runtime = runtime(&project);
+
+        assert!(matches!(
+            runtime.selected_file_reference(),
+            Some(Err("selected file path cannot be inserted safely"))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_symlink_never_inserts_a_file_reference() {
+        let project = TempDir::new().expect("project");
+        let outside = TempDir::new().expect("outside");
+        let target = outside.path().join("outside.txt");
+        fs::write(&target, []).expect("outside file");
+        symlink(target, project.path().join("link.txt")).expect("symlink");
+        let runtime = runtime(&project);
+
+        assert_eq!(runtime.selected_file_reference(), None);
     }
 
     #[cfg(unix)]
