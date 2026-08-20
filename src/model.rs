@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use ratatui::layout::Rect;
 
+use crate::config::DisplayMode;
 use crate::conversations::{Conversation, SessionReference};
 use crate::host::LaunchContext;
 use crate::intent::{Intent, PointerAction, View};
@@ -673,6 +674,7 @@ pub struct AppModel {
     files: FilesViewState,
     conversations: ConversationsViewState,
     config_warnings: Vec<String>,
+    display_mode: DisplayMode,
 }
 
 impl AppModel {
@@ -685,6 +687,7 @@ impl AppModel {
             files: FilesViewState::default(),
             conversations: ConversationsViewState::default(),
             config_warnings: Vec::new(),
+            display_mode: DisplayMode::Ascii,
         }
     }
 
@@ -718,6 +721,15 @@ impl AppModel {
 
     pub(crate) fn set_config_warnings(&mut self, warnings: Vec<String>) {
         self.config_warnings = warnings;
+    }
+
+    #[must_use]
+    pub const fn display_mode(&self) -> DisplayMode {
+        self.display_mode
+    }
+
+    pub const fn set_display_mode(&mut self, display_mode: DisplayMode) {
+        self.display_mode = display_mode;
     }
 
     #[must_use]

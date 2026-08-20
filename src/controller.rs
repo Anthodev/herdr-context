@@ -188,6 +188,7 @@ impl Controller {
     fn apply_config_load(&mut self, load: ConfigLoad, workers: &mut WorkerRuntime) {
         let (config, warnings) = load.into_parts();
         self.config = config;
+        self.model.set_display_mode(self.config.ui().display_mode());
         self.model.set_config_warnings(warnings);
         self.start_subsystems(workers);
     }
@@ -1138,10 +1139,10 @@ mod tests {
         );
         let mut buffer = Buffer::empty(area);
         controller.render(area, &mut buffer);
-        assert!(rendered_line(&buffer, 1).starts_with("▾ codex-cli (2)"));
-        assert!(rendered_line(&buffer, 2).starts_with("  codex-new"));
-        assert!(rendered_line(&buffer, 3).starts_with("  codex-old"));
-        assert!(rendered_line(&buffer, 4).starts_with("▸ pi (1)"));
+        assert!(rendered_line(&buffer, 1).starts_with("- codex-cli (2)"));
+        assert!(rendered_line(&buffer, 2).starts_with("  ? codex-new"));
+        assert!(rendered_line(&buffer, 3).starts_with("  ? codex-old"));
+        assert!(rendered_line(&buffer, 4).starts_with("+ pi (1)"));
         workers.shutdown();
     }
 
@@ -1182,18 +1183,18 @@ mod tests {
             .replace_items(next_page, 2);
         let mut paged = Buffer::empty(small);
         controller.render(small, &mut paged);
-        assert!((1..small.height).any(|row| rendered_line(&paged, row).starts_with("▾ pi (1)")));
+        assert!((1..small.height).any(|row| rendered_line(&paged, row).starts_with("- pi (1)")));
 
         let large = Rect::new(0, 0, 40, 15);
         let mut grown = Buffer::empty(large);
         controller.render(large, &mut grown);
         assert_eq!(controller.model.conversations().scroll(), 0);
-        assert!((1..large.height).any(|row| rendered_line(&grown, row).starts_with("▾ pi (1)")));
+        assert!((1..large.height).any(|row| rendered_line(&grown, row).starts_with("- pi (1)")));
 
         let one_row = Rect::new(0, 0, 40, 2);
         let mut shrunk = Buffer::empty(one_row);
         controller.render(one_row, &mut shrunk);
-        assert!(rendered_line(&shrunk, 1).starts_with("▾ pi (1)"));
+        assert!(rendered_line(&shrunk, 1).starts_with("- pi (1)"));
         workers.shutdown();
     }
 
@@ -1354,7 +1355,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("src/child"));
+        assert!(rendered.contains("  |  `- f child"));
     }
     #[test]
     fn low_priority_orchestration_loads_project_local_conversations() {
@@ -1695,6 +1696,27 @@ mod tests {
             configured_external_source_id(&single.config().conversations().external_roots()[0]);
 
         assert_eq!(second_with_sibling, second_alone);
+    }
+
+    #[test]
+    fn missing_optional_configuration_does_not_render_a_warning_row() {
+        let temp = TempDir::new().expect("tempdir");
+        let load = PluginConfig::load_from_dir(temp.path());
+        let mut controller = controller(&temp);
+        let mut workers = WorkerRuntime::with_capacities(2, 1);
+
+        controller.apply_config_load(load, &mut workers);
+        let area = Rect::new(0, 0, 80, 5);
+        let mut buffer = Buffer::empty(area);
+        controller.render(area, &mut buffer);
+        let rendered = (0..area.height)
+            .map(|row| rendered_line(&buffer, row))
+            .collect::<String>();
+
+        assert!(!rendered.contains("Config:"));
+        assert_eq!(controller.model.geometry().content().y, 1);
+        assert!(workers.has_pending_work());
+        workers.shutdown();
     }
 
     #[test]

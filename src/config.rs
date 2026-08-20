@@ -49,6 +49,7 @@ const EXTERNAL_SOURCE_IDS: [&str; 5] = ["claude-code", "codex-cli", "omp", "open
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PluginConfig {
     dock: DockConfig,
+    ui: UiConfig,
     files: FilesConfig,
     conversations: ConversationsConfig,
     vcs: VcsConfig,
@@ -75,10 +76,10 @@ impl PluginConfig {
         let bytes = match read_bounded_regular_file(&path) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
-                return ConfigLoad::with_warning(
-                    Self::default(),
-                    "Config: config.toml is missing; using defaults",
-                );
+                return ConfigLoad {
+                    config: Self::default(),
+                    warnings: Vec::new(),
+                };
             }
             Err(_) => {
                 return ConfigLoad::with_warning(
@@ -105,6 +106,11 @@ impl PluginConfig {
     #[must_use]
     pub const fn dock(&self) -> &DockConfig {
         &self.dock
+    }
+
+    #[must_use]
+    pub const fn ui(&self) -> &UiConfig {
+        &self.ui
     }
 
     #[must_use]
@@ -183,6 +189,26 @@ impl Default for DockConfig {
         Self {
             initial_width: DEFAULT_DOCK_WIDTH,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DisplayMode {
+    #[default]
+    Ascii,
+    Unicode,
+    Nerd,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UiConfig {
+    display_mode: DisplayMode,
+}
+
+impl UiConfig {
+    #[must_use]
+    pub const fn display_mode(self) -> DisplayMode {
+        self.display_mode
     }
 }
 
@@ -581,7 +607,7 @@ fn parse_config(value: &toml::Value) -> ConfigLoad {
     };
     warn_unknown_fields(
         root,
-        &["dock", "files", "conversations", "vcs", "keybindings"],
+        &["dock", "ui", "files", "conversations", "vcs", "keybindings"],
         "root.unknown_field",
         &mut warnings,
     );
@@ -601,6 +627,23 @@ fn parse_config(value: &toml::Value) -> ConfigLoad {
             &mut warnings,
         )
         .unwrap_or(DEFAULT_DOCK_WIDTH);
+    }
+
+    if let Some(table) = optional_table(root, "ui", &mut warnings) {
+        warn_unknown_fields(table, &["display_mode"], "ui.unknown_field", &mut warnings);
+        config.ui.display_mode = table
+            .get("display_mode")
+            .map_or(DisplayMode::Ascii, |value| {
+                match parse_string(Some(value)) {
+                    Some("ascii") => DisplayMode::Ascii,
+                    Some("unicode") => DisplayMode::Unicode,
+                    Some("nerd") => DisplayMode::Nerd,
+                    Some(_) | None => {
+                        invalid("ui.display_mode", &mut warnings);
+                        DisplayMode::Ascii
+                    }
+                }
+            });
     }
 
     if let Some(table) = optional_table(root, "files", &mut warnings) {

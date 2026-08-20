@@ -4,7 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use herdr_context::config::{GitCadence, KeyAction, PluginConfig, VcsBackendSelection};
+use herdr_context::config::{
+    DisplayMode, GitCadence, KeyAction, PluginConfig, VcsBackendSelection,
+};
 use herdr_context::intent::Intent;
 use herdr_context::vcs::jj::JujutsuMode;
 use tempfile::TempDir;
@@ -27,10 +29,8 @@ fn missing_and_malformed_config_fall_back_without_failing() {
     let missing = PluginConfig::load_from_dir(missing.path());
     assert_eq!(missing.config(), &PluginConfig::default());
     assert!(
-        missing
-            .warnings()
-            .iter()
-            .any(|warning| warning.contains("missing"))
+        missing.warnings().is_empty(),
+        "an absent optional config must silently use defaults"
     );
 
     let malformed = load("[dock\ninitial_width = 50");
@@ -41,6 +41,19 @@ fn missing_and_malformed_config_fall_back_without_failing() {
             .iter()
             .any(|warning| warning.contains("malformed"))
     );
+}
+
+#[test]
+fn accepts_every_display_mode() {
+    for (value, expected) in [
+        ("ascii", DisplayMode::Ascii),
+        ("unicode", DisplayMode::Unicode),
+        ("nerd", DisplayMode::Nerd),
+    ] {
+        let loaded = load(&format!("[ui]\ndisplay_mode = \"{value}\"\n"));
+        assert_eq!(loaded.config().ui().display_mode(), expected);
+        assert!(loaded.warnings().is_empty());
+    }
 }
 
 #[test]
@@ -149,9 +162,13 @@ fn valid_fields_survive_invalid_neighbors_and_limits_are_bounded() {
 [dock]
 initial_width = 52
 
+[ui]
+display_mode = "nerd"
+
 [files]
 show_hidden = true
 exclusions = ["target", "generated/cache"]
+
 
 [conversations]
 enabled_sources = ["codex-cli", "project-local-generic-jsonl"]
@@ -179,6 +196,7 @@ passive_jujutsu_interval_ms = 2000
         config.files().exclusions(),
         [PathBuf::from("target"), PathBuf::from("generated/cache")]
     );
+    assert_eq!(config.ui().display_mode(), DisplayMode::Nerd);
     assert_eq!(
         config.conversations().enabled_sources(),
         &["codex-cli", "project-local-generic-jsonl"]
@@ -235,9 +253,13 @@ fn invalid_fields_fall_back_independently_and_warnings_never_echo_values() {
 [dock]
 initial_width = "bad\u001b[2J"
 
+[ui]
+display_mode = "emoji\u001b"
+
 [files]
 show_hidden = false
 exclusions = ["../escape", "/absolute", "valid"]
+
 
 [conversations]
 enabled_sources = ["unknown\u001b-source", "pi"]
@@ -255,6 +277,7 @@ jujutsu_mode = "fresh"
     let config = loaded.config();
     assert_eq!(config.dock().initial_width(), 40);
     assert_eq!(config.files().exclusions(), [PathBuf::from("valid")]);
+    assert_eq!(config.ui().display_mode(), DisplayMode::Ascii);
     assert_eq!(
         config.conversations().enabled_sources(),
         &std::iter::once(String::from("pi")).collect::<BTreeSet<_>>()
@@ -265,6 +288,12 @@ jujutsu_mode = "fresh"
     );
     assert_eq!(config.conversations().external_roots().len(), 1);
     assert_eq!(config.vcs().backend(), VcsBackendSelection::Auto);
+    assert!(
+        loaded
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("ui.display_mode"))
+    );
     assert!(loaded.warnings().len() >= 5);
     assert!(
         loaded

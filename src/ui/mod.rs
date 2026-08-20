@@ -4,15 +4,19 @@ use std::borrow::Cow;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
+use crate::config::DisplayMode;
 use crate::intent::View;
 use crate::model::{AppModel, ConversationsViewState, LoadingState, UiGeometry};
 
+mod conversation_display;
 pub mod conversations;
+mod file_display;
 pub mod files;
+mod theme;
 
 pub fn render_shell(model: &mut AppModel, area: Rect, buffer: &mut Buffer) {
     let header_height = area.height.min(1);
@@ -59,9 +63,9 @@ pub fn render_shell(model: &mut AppModel, area: Rect, buffer: &mut Buffer) {
         };
         let warning_text = warnings[0].strip_prefix("Config: ").unwrap_or(&warnings[0]);
         Paragraph::new(Line::from(vec![
-            Span::styled("Config: ", Style::new().add_modifier(Modifier::BOLD)),
-            Span::raw(count),
-            Span::raw(sanitize_terminal_text(warning_text)),
+            Span::styled("Config: ", theme::warning().bold()),
+            Span::styled(count, theme::warning()),
+            Span::styled(sanitize_terminal_text(warning_text), theme::warning()),
         ]))
         .render(warning, buffer);
     }
@@ -69,6 +73,7 @@ pub fn render_shell(model: &mut AppModel, area: Rect, buffer: &mut Buffer) {
         return;
     }
 
+    let display_mode = model.display_mode();
     match model.active_view() {
         View::Files => match model.files().loading() {
             LoadingState::Loading => render_message("Loading Files…", content, buffer),
@@ -82,7 +87,12 @@ pub fn render_shell(model: &mut AppModel, area: Rect, buffer: &mut Buffer) {
                     render_message("Loading conversations…", content, buffer);
                 }
                 LoadingState::Ready => {
-                    render_conversations_state(model.conversations_mut(), content, buffer);
+                    render_conversations_state(
+                        model.conversations_mut(),
+                        display_mode,
+                        content,
+                        buffer,
+                    );
                 }
                 LoadingState::Error(error) => render_error(&error, content, buffer),
             }
@@ -92,9 +102,9 @@ pub fn render_shell(model: &mut AppModel, area: Rect, buffer: &mut Buffer) {
 
 const fn tab_style(active: bool) -> Style {
     if active {
-        Style::new().add_modifier(Modifier::REVERSED)
+        theme::selected()
     } else {
-        Style::new()
+        theme::inactive()
     }
 }
 
@@ -104,13 +114,18 @@ fn render_message(message: &str, area: Rect, buffer: &mut Buffer) {
 
 fn render_error(error: &str, area: Rect, buffer: &mut Buffer) {
     Paragraph::new(Line::from(vec![
-        Span::styled("Error: ", Style::new().add_modifier(Modifier::BOLD)),
-        Span::raw(sanitize_terminal_text(error)),
+        Span::styled("Error: ", theme::error().bold()),
+        Span::styled(sanitize_terminal_text(error), theme::error()),
     ]))
     .render(area, buffer);
 }
 
-fn render_conversations_state(state: &mut ConversationsViewState, area: Rect, buffer: &mut Buffer) {
+fn render_conversations_state(
+    state: &mut ConversationsViewState,
+    display_mode: DisplayMode,
+    area: Rect,
+    buffer: &mut Buffer,
+) {
     state.reconcile_viewport(area);
     let errors = state.visible_errors();
     let content = if let Some(error) = errors.first() {
@@ -121,9 +136,9 @@ fn render_conversations_state(state: &mut ConversationsViewState, area: Rect, bu
             String::new()
         };
         Paragraph::new(Line::from(vec![
-            Span::styled("Warning: ", Style::new().add_modifier(Modifier::BOLD)),
-            Span::raw(count),
-            Span::raw(sanitize_terminal_text(error)),
+            Span::styled("Warning: ", theme::warning().bold()),
+            Span::styled(count, theme::warning()),
+            Span::styled(sanitize_terminal_text(error), theme::warning()),
         ]))
         .render(Rect::new(area.x, area.y, area.width, 1), buffer);
         Rect::new(
@@ -153,7 +168,7 @@ fn render_conversations_state(state: &mut ConversationsViewState, area: Rect, bu
     if state.items().is_empty() {
         render_message("No conversations", content, buffer);
     } else {
-        conversations::render(state, content, buffer);
+        conversations::render(state, display_mode, content, buffer);
     }
 }
 

@@ -3,6 +3,7 @@ use crossterm::event::{
 };
 use std::time::{Duration, UNIX_EPOCH};
 
+use herdr_context::config::DisplayMode;
 use herdr_context::conversations::{
     Conversation, ConversationProvenance, ConversationState, ProvenanceKind, ResumeCapability,
     ResumeReference, SessionReference, SourceId, ToolIdentity,
@@ -15,6 +16,7 @@ use herdr_context::project::ProjectIdentity;
 use herdr_context::ui::{render_shell, sanitize_terminal_text};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier};
 use tempfile::TempDir;
 
 fn context() -> LaunchContext {
@@ -37,6 +39,22 @@ fn conversation(
     session_id: &str,
     updated_seconds: u64,
 ) -> Conversation {
+    conversation_with_state(
+        project,
+        tool,
+        session_id,
+        updated_seconds,
+        ConversationState::Unknown,
+    )
+}
+
+fn conversation_with_state(
+    project: &ProjectIdentity,
+    tool: &str,
+    session_id: &str,
+    updated_seconds: u64,
+    state: ConversationState,
+) -> Conversation {
     Conversation::new(
         ToolIdentity::new(tool).expect("tool"),
         SessionReference::new(tool, session_id).expect("session"),
@@ -45,7 +63,7 @@ fn conversation(
         Some(UNIX_EPOCH + Duration::from_secs(updated_seconds)),
         None,
         UNIX_EPOCH + Duration::from_secs(updated_seconds),
-        ConversationState::Unknown,
+        state,
         vec![ConversationProvenance::new(
             SourceId::new(tool).expect("source"),
             ProvenanceKind::ExternalLocal,
@@ -76,11 +94,58 @@ fn conversations_are_grouped_by_provider_with_expandable_headers() {
 
     render_shell(&mut model, area, &mut buffer);
 
-    assert!(line(&buffer, 1).starts_with("▾ codex-cli (2)"));
-    assert!(line(&buffer, 2).starts_with("  codex-new"));
-    assert!(line(&buffer, 3).starts_with("  codex-old"));
-    assert!(line(&buffer, 4).starts_with("▾ pi (1)"));
-    assert!(line(&buffer, 5).starts_with("  pi-session"));
+    assert!(line(&buffer, 1).starts_with("- codex-cli (2)"));
+    assert!(line(&buffer, 2).starts_with("  ? codex-new"));
+    assert!(line(&buffer, 3).starts_with("  ? codex-old"));
+    assert!(line(&buffer, 4).starts_with("- pi (1)"));
+    assert!(line(&buffer, 5).starts_with("  ? pi-session"));
+    assert_eq!(buffer[(0, 1)].fg, Color::Magenta);
+    assert!(buffer[(0, 1)].modifier.contains(Modifier::REVERSED));
+    assert_eq!(buffer[(13, 2)].fg, Color::DarkGray);
+}
+
+#[test]
+fn conversations_render_ascii_unicode_and_nerd_glyphs() {
+    let project_dir = TempDir::new().expect("project");
+    let project = ProjectIdentity::from_canonical_root(project_dir.path().to_path_buf())
+        .expect("project identity");
+    let mut model = AppModel::new(context());
+    model.set_active_view(View::Conversations);
+    model.conversations_mut().replace_items(
+        vec![
+            conversation_with_state(&project, "omp", "live", 30, ConversationState::Live),
+            conversation_with_state(&project, "omp", "archived", 20, ConversationState::Archived),
+            conversation_with_state(&project, "omp", "unknown", 10, ConversationState::Unknown),
+        ],
+        1,
+    );
+    let area = Rect::new(0, 0, 48, 5);
+    let render = |model: &mut AppModel, mode| {
+        model.set_display_mode(mode);
+        let mut buffer = Buffer::empty(area);
+        render_shell(model, area, &mut buffer);
+        (0..area.height)
+            .map(|row| line(&buffer, row))
+            .collect::<Vec<_>>()
+    };
+
+    let ascii = render(&mut model, DisplayMode::Ascii);
+    assert!(ascii[1].starts_with("- omp (3)"));
+    assert!(ascii[2].starts_with("  * live"));
+    assert!(ascii[3].starts_with("  - archived"));
+    assert!(ascii[4].starts_with("  ? unknown"));
+
+    let unicode = render(&mut model, DisplayMode::Unicode);
+    assert!(unicode[1].starts_with("▾ omp (3)"));
+    assert!(unicode[2].starts_with("  ● live"));
+    assert!(unicode[3].starts_with("  ○ archived"));
+    assert!(unicode[4].starts_with("  • unknown"));
+
+    let nerd = render(&mut model, DisplayMode::Nerd);
+    assert!(nerd[1].starts_with(" omp (3)"));
+    assert!(nerd[2].starts_with("   live"));
+    assert!(nerd[3].starts_with("   archived"));
+    assert!(nerd[4].starts_with("   unknown"));
 }
 
 #[test]
@@ -93,6 +158,9 @@ fn tabs_and_compact_states_render_in_wide_and_narrow_areas() {
     assert!(line(&buffer, 0).contains("Files"));
     assert!(line(&buffer, 0).contains("Conversations"));
     assert!(line(&buffer, 1).contains("Loading Files"));
+    assert_eq!(buffer[(0, 0)].fg, Color::Magenta);
+    assert!(buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
+    assert_eq!(buffer[(7, 0)].fg, Color::DarkGray);
 
     model.set_active_view(View::Conversations);
     model.conversations_mut().set_loading(LoadingState::Ready);
@@ -109,6 +177,7 @@ fn tabs_and_compact_states_render_in_wide_and_narrow_areas() {
     render_shell(&mut model, wide, &mut warning_buffer);
     assert!(line(&warning_buffer, 1).contains("Warning"));
     assert!(line(&warning_buffer, 1).contains("(+1 more)"));
+    assert_eq!(warning_buffer[(0, 1)].fg, Color::Yellow);
 }
 
 #[test]
