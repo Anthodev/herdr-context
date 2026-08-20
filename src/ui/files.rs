@@ -13,6 +13,16 @@ use crate::vcs::VcsStatusKind;
 
 use super::{file_display, sanitize_terminal_cow, sanitize_terminal_text, theme};
 
+#[derive(Clone, Copy, Debug)]
+pub struct FileSearchDisplay<'a> {
+    pub query: &'a str,
+    pub editing: bool,
+    pub matches: usize,
+    pub scanning: bool,
+    pub truncated: bool,
+    pub skipped_directories: usize,
+}
+
 /// Renders a caller-provided viewport slice; it never scans or indexes the tree.
 pub struct FilesView<'a> {
     tree: &'a FilesTree,
@@ -20,6 +30,7 @@ pub struct FilesView<'a> {
     selected: Option<&'a Path>,
     notice: Option<(&'a str, &'a str)>,
     expanded: Option<&'a BTreeSet<PathBuf>>,
+    search: Option<FileSearchDisplay<'a>>,
     display_mode: DisplayMode,
 }
 
@@ -37,6 +48,7 @@ impl<'a> FilesView<'a> {
             selected,
             notice,
             expanded: None,
+            search: None,
             display_mode: DisplayMode::Ascii,
         }
     }
@@ -44,6 +56,12 @@ impl<'a> FilesView<'a> {
     #[must_use]
     pub const fn with_expanded(mut self, expanded: &'a BTreeSet<PathBuf>) -> Self {
         self.expanded = Some(expanded);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_search(mut self, search: FileSearchDisplay<'a>) -> Self {
+        self.search = Some(search);
         self
     }
 
@@ -59,8 +77,35 @@ impl Widget for FilesView<'_> {
         if area.is_empty() {
             return;
         }
+        let search_height = u16::from(self.search.is_some());
         let notice_height = u16::from(self.notice.is_some());
-        let row_limit = area.height.saturating_sub(notice_height) as usize;
+        let row_limit = area
+            .height
+            .saturating_sub(search_height)
+            .saturating_sub(notice_height) as usize;
+        if let Some(search) = self.search {
+            render_search(search, Rect::new(area.x, area.y, area.width, 1), buffer);
+        }
+        if let Some(search) = self.search
+            && !search.query.is_empty()
+            && search.matches == 0
+            && row_limit != 0
+        {
+            let message = if search.scanning {
+                "No matches yet".to_owned()
+            } else if search.truncated || search.skipped_directories != 0 {
+                "No matches in searched paths".to_owned()
+            } else {
+                format!(
+                    "No files match \"{}\"",
+                    sanitize_terminal_text(search.query)
+                )
+            };
+            Span::styled(message, theme::inactive()).render(
+                Rect::new(area.x, area.y.saturating_add(search_height), area.width, 1),
+                buffer,
+            );
+        }
         for (offset, node) in self
             .rows
             .iter()
@@ -68,7 +113,10 @@ impl Widget for FilesView<'_> {
             .take(row_limit)
             .enumerate()
         {
-            let y = area.y.saturating_add(offset as u16);
+            let y = area
+                .y
+                .saturating_add(search_height)
+                .saturating_add(offset as u16);
             let (marker, marker_style) = status_marker(node.status());
             let expanded = self
                 .expanded
@@ -113,6 +161,76 @@ impl Widget for FilesView<'_> {
             );
         }
     }
+}
+
+fn render_search(search: FileSearchDisplay<'_>, area: Rect, buffer: &mut Buffer) {
+    if area.is_empty() {
+        return;
+    }
+    let status = if search.scanning {
+        format!("{} scanning…", search.matches)
+    } else if search.skipped_directories != 0 {
+        format!(
+            "{} partial, {} skipped",
+            search.matches, search.skipped_directories
+        )
+    } else if search.truncated {
+        format!("{} partial", search.matches)
+    } else {
+        format!(
+            "{} match{}",
+            search.matches,
+            if search.matches == 1 { "" } else { "es" }
+        )
+    };
+    let status_width = status.chars().count().min(usize::from(area.width) / 2);
+    let left_width = usize::from(area.width)
+        .saturating_sub(status_width)
+        .saturating_sub(1);
+    let prefix = "Search > ";
+    let cursor_width = usize::from(search.editing);
+    let query_width = left_width
+        .saturating_sub(prefix.chars().count())
+        .saturating_sub(cursor_width);
+    let query_chars = search.query.chars().collect::<Vec<_>>();
+    let display_query = if query_chars.len() <= query_width {
+        search.query.to_owned()
+    } else if query_width == 0 {
+        String::new()
+    } else {
+        let tail = query_chars
+            .iter()
+            .skip(
+                query_chars
+                    .len()
+                    .saturating_sub(query_width.saturating_sub(1)),
+            )
+            .collect::<String>();
+        format!("…{tail}")
+    };
+    let mut left = vec![
+        Span::styled(prefix, theme::inactive()),
+        Span::raw(sanitize_terminal_text(&display_query).into_owned()),
+    ];
+    if search.editing {
+        left.push(Span::styled(" ", theme::selected()));
+    }
+    Line::from(left).render(Rect::new(area.x, area.y, left_width as u16, 1), buffer);
+    let status_style = if search.truncated || search.skipped_directories != 0 {
+        theme::warning()
+    } else {
+        theme::inactive()
+    };
+    Span::styled(status, status_style).render(
+        Rect::new(
+            area.x
+                .saturating_add(area.width.saturating_sub(status_width as u16)),
+            area.y,
+            status_width as u16,
+            1,
+        ),
+        buffer,
+    );
 }
 
 fn push_tree_prefix<'a>(
@@ -167,7 +285,7 @@ mod tests {
     use ratatui::style::Color;
     use ratatui::widgets::Widget;
 
-    use super::FilesView;
+    use super::{FileSearchDisplay, FilesView};
     use crate::config::DisplayMode;
     use crate::files::tree::FilesTree;
     use crate::vcs::{VcsEntryStatus, VcsStatusKind, VcsStatusSnapshot};
@@ -402,5 +520,34 @@ mod tests {
         assert_eq!(buffer[(10, 1)].fg, Color::Rgb(210, 153, 34));
         assert_eq!(buffer[(5, 2)].fg, Color::Rgb(63, 185, 80));
         assert_eq!(buffer[(7, 2)].fg, Color::Rgb(63, 185, 80));
+    }
+
+    #[test]
+    fn renders_search_status_and_empty_result_message_in_the_files_view() {
+        let temp = TempDir::new().expect("tempdir");
+        let tree = FilesTree::new(temp.path().to_path_buf()).expect("tree");
+        let area = Rect::new(0, 0, 40, 2);
+        let mut buffer = Buffer::empty(area);
+
+        FilesView::new(&tree, &[], None, None)
+            .with_search(FileSearchDisplay {
+                query: "auth",
+                editing: true,
+                matches: 0,
+                scanning: false,
+                truncated: false,
+                skipped_directories: 2,
+            })
+            .render(area, &mut buffer);
+
+        let first = (0..area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>();
+        let second = (0..area.width)
+            .map(|x| buffer[(x, 1)].symbol())
+            .collect::<String>();
+        assert!(first.contains("Search > auth"));
+        assert!(first.ends_with("0 partial, 2 skipped"));
+        assert!(second.starts_with("No matches in searched paths"));
     }
 }

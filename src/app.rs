@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use crate::controller::Controller;
 use crate::host::LaunchContext;
-use crate::input::{InputMode, map_event_with_keybindings};
+use crate::input::map_event_with_keybindings;
 use crate::model::AppModel;
 use crate::worker::WorkerRuntime;
 
@@ -55,7 +55,7 @@ impl App {
             let quit = if let Some(input) = input
                 && let Some(intent) = map_event_with_keybindings(
                     input,
-                    InputMode::Normal,
+                    self.controller.input_mode(),
                     self.controller.model().geometry(),
                     Some(self.controller.keybindings()),
                 ) {

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
-use crate::config::{ConfigLoad, ExternalHistoryRoot, KeyBindings, PluginConfig};
+use crate::config::{ConfigLoad, ExternalHistoryRoot, KeyAction, KeyBindings, PluginConfig};
 use crate::conversations::active::{
     FilesystemConversationSnapshot, LiveConversationSnapshot, merge_filesystem_snapshots,
     merge_prepared_live_sessions, prepare_filesystem_conversations, prepare_live_conversations,
@@ -24,6 +24,7 @@ use crate::conversations::sources::{
 use crate::conversations::{Conversation, ResumeCapability};
 use crate::host::client::CommandHostClient;
 use crate::host::{AgentHarness, HostClient, LaunchContext, ResumeConversationRequest};
+use crate::input::InputMode;
 use crate::intent::{Intent, View};
 use crate::model::{AppModel, LoadingState};
 use crate::project::{ProjectIdentity, resolve_project_context_with_backend};
@@ -208,6 +209,13 @@ impl Controller {
         let (config, warnings) = load.into_parts();
         self.config = config;
         self.model.set_display_mode(self.config.ui().display_mode());
+        let search_hint = self
+            .config
+            .keybindings()
+            .bindings_for(KeyAction::Search)
+            .first()
+            .map_or_else(String::new, |binding| format!("{binding} search"));
+        self.model.set_search_hint(search_hint);
         self.model.set_config_warnings(warnings);
         self.start_subsystems(workers);
     }
@@ -505,6 +513,7 @@ impl Controller {
             if view == View::Files {
                 files.start_background(workers);
             } else {
+                files.finish_search_editing();
                 files.pause_background();
             }
         }
@@ -528,8 +537,13 @@ impl Controller {
                 );
                 return true;
             }
-            if matches!(kind, JobKind::Filesystem | JobKind::Vcs)
-                && let Some(files) = &mut self.files
+            if matches!(
+                kind,
+                JobKind::Filesystem
+                    | JobKind::FileSearch
+                    | JobKind::FileSearchProjection
+                    | JobKind::Vcs
+            ) && let Some(files) = &mut self.files
             {
                 files.fail_background(kind, generation, workers);
             } else if kind == JobKind::ConversationLive {
@@ -746,7 +760,10 @@ impl Controller {
                     .is_some_and(|files| files.set_pane_input_notice(notice));
                 self.start_next_pane_input(workers) || changed
             }
-            JobKind::Filesystem | JobKind::Vcs => {
+            JobKind::Filesystem
+            | JobKind::FileSearch
+            | JobKind::FileSearchProjection
+            | JobKind::Vcs => {
                 let Ok(message) = result.downcast::<RuntimeMessage>() else {
                     self.model.files_mut().set_loading(LoadingState::Error(
                         "invalid Files worker result".to_owned(),
@@ -796,7 +813,12 @@ impl Controller {
                     ));
                 }
             }
-            JobKind::Bootstrap | JobKind::Filesystem | JobKind::Vcs | JobKind::Process => {
+            JobKind::Bootstrap
+            | JobKind::Filesystem
+            | JobKind::FileSearch
+            | JobKind::FileSearchProjection
+            | JobKind::Vcs
+            | JobKind::Process => {
                 self.model.files_mut().set_loading(state);
             }
         }
@@ -835,6 +857,10 @@ impl Controller {
         self.model.files_mut().set_scroll(files.scroll());
         let (requested, applied) = files.generations();
         self.model.files_mut().set_generations(requested, applied);
+        self.model.files_mut().set_filter(files.search_query());
+        self.model
+            .files_mut()
+            .set_search_editing(files.search_editing());
     }
 
     pub(super) fn render(&mut self, area: Rect, buffer: &mut Buffer) {
@@ -850,6 +876,21 @@ impl Controller {
 
     pub(super) const fn keybindings(&self) -> &KeyBindings {
         self.config.keybindings()
+    }
+
+    pub(super) fn input_mode(&self) -> InputMode {
+        if self.model.active_view() != View::Files {
+            return InputMode::Normal;
+        }
+        self.files.as_ref().map_or(InputMode::Normal, |files| {
+            if files.search_editing() {
+                InputMode::FileSearch
+            } else if files.has_search_filter() {
+                InputMode::FileSearchActive
+            } else {
+                InputMode::Normal
+            }
+        })
     }
 
     pub(super) const fn model(&self) -> &AppModel {
@@ -1226,6 +1267,7 @@ mod tests {
         ResumeReference, SessionReference, SourceId, ToolIdentity,
     };
     use crate::host::LaunchContext;
+    use crate::input::InputMode;
     use crate::intent::{Intent, PointerAction, View};
     use crate::model::LoadingState;
     use crate::project::ProjectIdentity;
@@ -2439,6 +2481,55 @@ esac
                 .map(SessionReference::id),
             Some("visible")
         );
+        workers.shutdown();
+    }
+
+    #[test]
+    fn file_search_mode_and_query_survive_view_switches() {
+        let project = TempDir::new().expect("project");
+        fs::write(project.path().join("main.rs"), []).expect("file");
+        let mut controller = controller(&project);
+        controller.files = Some(
+            FilesRuntime::bootstrap(controller.model.launch_context()).expect("Files runtime"),
+        );
+        controller
+            .model
+            .files_mut()
+            .set_loading(LoadingState::Ready);
+        let mut workers = WorkerRuntime::with_capacities(2, 2);
+
+        assert!(
+            controller
+                .apply(Intent::BeginFileSearch, &mut workers)
+                .dirty
+        );
+        assert_eq!(controller.input_mode(), InputMode::FileSearch);
+        assert!(
+            controller
+                .apply(Intent::FileSearchInput("main".to_owned()), &mut workers)
+                .dirty
+        );
+        assert_eq!(controller.model.files().filter(), "main");
+        assert!(
+            controller
+                .apply(Intent::FileSearchCommit, &mut workers)
+                .dirty
+        );
+        assert_eq!(controller.input_mode(), InputMode::FileSearchActive);
+
+        assert!(
+            controller
+                .apply(Intent::SwitchView(View::Conversations), &mut workers)
+                .dirty
+        );
+        assert_eq!(controller.input_mode(), InputMode::Normal);
+        assert!(
+            controller
+                .apply(Intent::SwitchView(View::Files), &mut workers)
+                .dirty
+        );
+        assert_eq!(controller.input_mode(), InputMode::FileSearchActive);
+        assert_eq!(controller.model.files().filter(), "main");
         workers.shutdown();
     }
 }

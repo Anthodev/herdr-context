@@ -315,6 +315,7 @@ fn configured_keybindings_match_runtime_events_and_replace_the_default_action_bi
         r#"
 [keybindings]
 refresh = ["x"]
+search = ["ctrl+f"]
 "#,
     );
     let keymap = loaded.config().keybindings();
@@ -324,7 +325,15 @@ refresh = ["x"]
         Some(Intent::Refresh)
     );
     assert_eq!(
+        keymap.map_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+        Some(Intent::BeginFileSearch)
+    );
+    assert_eq!(
         keymap.map_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+        None
+    );
+    assert_eq!(
+        keymap.map_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)),
         None
     );
 }

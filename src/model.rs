@@ -75,6 +75,7 @@ pub struct FilesViewState {
     selection: Option<PathBuf>,
     scroll: usize,
     filter: String,
+    search_editing: bool,
     loading: LoadingState,
     requested_generation: u64,
     applied_generation: u64,
@@ -86,6 +87,7 @@ impl Default for FilesViewState {
             selection: None,
             scroll: 0,
             filter: String::new(),
+            search_editing: false,
             loading: LoadingState::Loading,
             requested_generation: 0,
             applied_generation: 0,
@@ -119,6 +121,15 @@ impl FilesViewState {
 
     pub fn set_filter(&mut self, filter: impl Into<String>) {
         self.filter = filter.into();
+    }
+
+    #[must_use]
+    pub const fn search_editing(&self) -> bool {
+        self.search_editing
+    }
+
+    pub const fn set_search_editing(&mut self, editing: bool) {
+        self.search_editing = editing;
     }
 
     #[must_use]
@@ -398,6 +409,12 @@ impl ConversationsViewState {
             | Intent::NextView
             | Intent::PreviousView
             | Intent::Refresh
+            | Intent::BeginFileSearch
+            | Intent::FileSearchInput(_)
+            | Intent::FileSearchBackspace
+            | Intent::FileSearchClear
+            | Intent::FileSearchCommit
+            | Intent::FileSearchCancel
             | Intent::Resize => false,
         }
     }
@@ -690,6 +707,7 @@ pub struct AppModel {
     conversations: ConversationsViewState,
     config_warnings: Vec<String>,
     display_mode: DisplayMode,
+    search_hint: String,
 }
 
 impl AppModel {
@@ -703,6 +721,7 @@ impl AppModel {
             conversations: ConversationsViewState::default(),
             config_warnings: Vec::new(),
             display_mode: DisplayMode::Ascii,
+            search_hint: "/ search".to_owned(),
         }
     }
 
@@ -745,6 +764,15 @@ impl AppModel {
 
     pub const fn set_display_mode(&mut self, display_mode: DisplayMode) {
         self.display_mode = display_mode;
+    }
+
+    #[must_use]
+    pub fn search_hint(&self) -> &str {
+        &self.search_hint
+    }
+
+    pub fn set_search_hint(&mut self, hint: String) {
+        self.search_hint = hint;
     }
 
     #[must_use]
