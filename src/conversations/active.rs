@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::host::{HostAgentSession, HostSessionReference};
+use crate::host::{HostAgentSession, HostAgentStatus, HostSessionReference};
 use crate::project::{ProjectIdentity, path_is_within};
 
 use super::{
@@ -107,6 +107,7 @@ struct NormalizedLiveSession {
     provenance: ConversationProvenance,
     title: Option<String>,
     pane_id: String,
+    status: HostAgentStatus,
 }
 
 pub(crate) struct FilesystemConversationSnapshot {
@@ -149,6 +150,31 @@ pub(crate) fn merge_filesystem_snapshots(
 #[derive(Clone)]
 pub(crate) struct LiveConversationSnapshot(Vec<NormalizedLiveSession>);
 
+impl LiveConversationSnapshot {
+    /// Stable digest of every visible live-session attribute, in sorted order.
+    #[must_use]
+    pub(crate) fn fingerprint(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for session in &self.0 {
+            session.pane_id.hash(&mut hasher);
+            session.tool.as_str().hash(&mut hasher);
+            session.provenance.source_id().as_str().hash(&mut hasher);
+            session.stable_reference.id().hash(&mut hasher);
+            session.title.as_deref().hash(&mut hasher);
+            session.status.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Per-pane stable reference identifiers used to detect new or switched sessions.
+    #[must_use]
+    pub(crate) fn pane_references(&self) -> BTreeMap<&str, &str> {
+        self.0
+            .iter()
+            .map(|session| (session.pane_id.as_str(), session.stable_reference.id()))
+            .collect()
+    }
+}
 /// Merges bounded live Herdr metadata into filesystem-owned conversations.
 ///
 /// Matching precedence is native tool/session identity, exact canonical transcript
@@ -318,6 +344,7 @@ fn normalize_live_session(
         provenance: ConversationProvenance::new(source, ProvenanceKind::HostRuntime, path),
         title,
         pane_id,
+        status: session.status(),
     })
 }
 
