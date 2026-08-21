@@ -16,7 +16,7 @@ upstream Herdr, and keeps the plugin independently installable.
 
 ## Install a packaged release
 
-Version `0.16.0` supports these release targets:
+Version `0.17.0` supports these release targets:
 
 | Platform | Architecture | Artifact target |
 |---|---|---|
@@ -31,18 +31,18 @@ status needs `jj` `0.37` or newer. Missing optional VCS tools degrade the
 affected status view without closing the dock.
 
 Download the archive and adjacent `.sha256` file for the host target from the
-`v0.16.0` GitHub release, then verify and install it:
+`v0.17.0` GitHub release, then verify and install it:
 
 ```sh
 target=x86_64-unknown-linux-gnu # choose a target from the table
 
 # Linux checksum tool:
-sha256sum -c "herdr-context-v0.16.0-$target.tar.gz.sha256"
+sha256sum -c "herdr-context-v0.17.0-$target.tar.gz.sha256"
 # macOS checksum tool:
-shasum -a 256 -c "herdr-context-v0.16.0-$target.tar.gz.sha256"
+shasum -a 256 -c "herdr-context-v0.17.0-$target.tar.gz.sha256"
 
-tar -xzf "herdr-context-v0.16.0-$target.tar.gz"
-cd "herdr-context-v0.16.0-$target"
+tar -xzf "herdr-context-v0.17.0-$target.tar.gz"
+cd "herdr-context-v0.17.0-$target"
 ./install.sh
 ```
 
@@ -345,7 +345,7 @@ renders status as potentially stale.
 
 ## Release status
 
-Version `0.16.0` is the V1 packaging contract. Tag `v0.16.0`, Cargo metadata,
+Version `0.17.0` is the V1 packaging contract. Tag `v0.17.0`, Cargo metadata,
 the source and packaged manifests, binary name, minimum Herdr version, archive
 names, and checksums are validated together. CI builds from `Cargo.lock` and
 blocks publication on formatting, Clippy, tests, release build, manifest,

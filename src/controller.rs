@@ -1,6 +1,6 @@
 //! Intent transitions and orchestration between state and bounded workers.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -84,6 +84,45 @@ impl ConversationPaths {
     }
 }
 
+/// Adaptive poller for Herdr live agent sessions driving real-time conversation creation.
+#[derive(Debug)]
+struct LiveSensor {
+    minimum: Duration,
+    maximum: Duration,
+    interval: Duration,
+    next_tick: Instant,
+    fingerprint: Option<u64>,
+    references: BTreeMap<String, String>,
+    pending_generation: Option<u64>,
+}
+
+impl LiveSensor {
+    fn new(minimum: Duration, maximum: Duration, now: Instant) -> Self {
+        Self {
+            minimum,
+            maximum,
+            interval: minimum,
+            next_tick: now + minimum,
+            fingerprint: None,
+            references: BTreeMap::new(),
+            pending_generation: None,
+        }
+    }
+
+    fn arm_reset(&mut self, now: Instant) {
+        self.interval = self.minimum;
+        self.next_tick = now + self.minimum;
+    }
+
+    fn arm_backoff(&mut self, now: Instant) {
+        self.interval = self
+            .interval
+            .saturating_mul(2)
+            .clamp(self.minimum, self.maximum);
+        self.next_tick = now + self.interval;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Transition {
     pub(super) dirty: bool,
@@ -98,6 +137,7 @@ pub struct Controller {
     filesystem_conversations: Option<FilesystemConversationSnapshot>,
     conversation_project: Option<ProjectIdentity>,
     live_snapshot: Option<LiveSnapshot>,
+    live_sensor: Option<LiveSensor>,
     conversation_launch_generation: u64,
     conversation_launch_running: bool,
     pane_input_generation: u64,
@@ -124,6 +164,7 @@ impl Controller {
             pane_input_queue: VecDeque::new(),
             pane_input_running: false,
             live_snapshot: None,
+            live_sensor: None,
             config: PluginConfig::default(),
             subsystems_started: false,
         }
@@ -150,6 +191,7 @@ impl Controller {
             pane_input_queue: VecDeque::new(),
             pane_input_running: false,
             live_snapshot: None,
+            live_sensor: None,
             config: PluginConfig::default(),
             subsystems_started: false,
         }
@@ -207,6 +249,11 @@ impl Controller {
 
     fn apply_config_load(&mut self, load: ConfigLoad, workers: &mut WorkerRuntime) {
         let (config, warnings) = load.into_parts();
+        self.live_sensor = config
+            .conversations()
+            .live_cadence()
+            .adaptive()
+            .map(|(minimum, maximum)| LiveSensor::new(minimum, maximum, Instant::now()));
         self.config = config;
         self.model.set_display_mode(self.config.ui().display_mode());
         let search_hint = self
@@ -268,8 +315,14 @@ impl Controller {
     }
 
     fn schedule_live_conversations(&mut self, workers: &mut WorkerRuntime) {
+        self.schedule_live_poll(workers, false);
+    }
+
+    fn schedule_live_poll(&mut self, workers: &mut WorkerRuntime, quiet: bool) {
         let Some(binary) = self.host_binary.clone() else {
-            self.model.conversations_mut().set_live_loading(false);
+            if !quiet {
+                self.model.conversations_mut().set_live_loading(false);
+            }
             return;
         };
         let (requested, applied) = self.model.conversations().live_generations();
@@ -277,7 +330,19 @@ impl Controller {
         self.model
             .conversations_mut()
             .set_live_generations(generation, applied);
-        self.model.conversations_mut().set_live_loading(true);
+        if quiet {
+            let Some(sensor) = self.live_sensor.as_mut() else {
+                return;
+            };
+            sensor.pending_generation = Some(generation);
+            let now = Instant::now();
+            sensor.next_tick = now + sensor.interval;
+        } else {
+            self.model.conversations_mut().set_live_loading(true);
+            if let Some(sensor) = self.live_sensor.as_mut() {
+                sensor.pending_generation = None;
+            }
+        }
         let root = self
             .model
             .launch_context()
@@ -296,6 +361,10 @@ impl Controller {
             },
         );
         if !accepted(workers.submit(job)) {
+            if quiet {
+                self.sync_and_back_off_live_sensor(generation, generation);
+                return;
+            }
             self.live_snapshot = None;
             self.model
                 .conversations_mut()
@@ -304,6 +373,86 @@ impl Controller {
             self.model
                 .conversations_mut()
                 .replace_live_items(visible, generation);
+        }
+    }
+
+    fn take_pending_live_sensor(&mut self, generation: u64) -> bool {
+        match self.live_sensor.as_mut() {
+            Some(sensor) if sensor.pending_generation == Some(generation) => {
+                sensor.pending_generation = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn sync_and_back_off_live_sensor(&mut self, requested: u64, generation: u64) {
+        self.model
+            .conversations_mut()
+            .set_live_generations(requested, generation);
+        if let Some(sensor) = self.live_sensor.as_mut() {
+            sensor.arm_backoff(Instant::now());
+        }
+    }
+
+    /// Applies one quiet sensor snapshot: merge on change, discover only on reference drift.
+    fn apply_sensor_snapshot(
+        &mut self,
+        snapshot: LiveSnapshot,
+        generation: u64,
+        requested: u64,
+        workers: &mut WorkerRuntime,
+    ) -> bool {
+        let fingerprint = snapshot.sessions.fingerprint();
+        if self
+            .live_sensor
+            .as_ref()
+            .is_some_and(|sensor| sensor.fingerprint == Some(fingerprint))
+        {
+            self.model
+                .conversations_mut()
+                .set_live_generations(requested, generation);
+            self.model.conversations_mut().set_live_loading(false);
+            if let Some(sensor) = self.live_sensor.as_mut() {
+                sensor.arm_backoff(Instant::now());
+            }
+            return false;
+        }
+        let reference_changed = {
+            let references = snapshot.sessions.pane_references();
+            self.live_sensor.as_ref().is_some_and(|sensor| {
+                references.iter().any(|(pane, reference)| {
+                    sensor.references.get(*pane).map(String::as_str) != Some(*reference)
+                })
+            })
+        };
+        self.seed_live_baseline(&snapshot);
+        self.live_snapshot = Some(snapshot);
+        self.model.conversations_mut().set_live_error(None);
+        let visible = self.merged_conversations();
+        let changed = self
+            .model
+            .conversations_mut()
+            .replace_live_items(visible, generation);
+        if reference_changed {
+            self.schedule_conversation_page(workers, false);
+        }
+        changed
+    }
+
+    /// Re-baselines the sensor after any applied live snapshot, loud or quiet.
+    fn seed_live_baseline(&mut self, snapshot: &LiveSnapshot) {
+        let fingerprint = snapshot.sessions.fingerprint();
+        let references: BTreeMap<String, String> = snapshot
+            .sessions
+            .pane_references()
+            .into_iter()
+            .map(|(pane, reference)| (pane.to_owned(), reference.to_owned()))
+            .collect();
+        if let Some(sensor) = self.live_sensor.as_mut() {
+            sensor.fingerprint = Some(fingerprint);
+            sensor.references = references;
+            sensor.arm_reset(Instant::now());
         }
     }
 
@@ -551,6 +700,10 @@ impl Controller {
                 if generation < requested {
                     return false;
                 }
+                if self.take_pending_live_sensor(generation) {
+                    self.sync_and_back_off_live_sensor(requested, generation);
+                    return true;
+                }
                 self.live_snapshot = None;
                 self.model.conversations_mut().set_live_error(Some(
                     "Herdr live session worker stopped unexpectedly".to_owned(),
@@ -692,7 +845,12 @@ impl Controller {
                 if generation < requested {
                     return false;
                 }
+                let quiet = self.take_pending_live_sensor(generation);
                 let Ok(result) = result.downcast::<LiveConversationsResult>() else {
+                    if quiet {
+                        self.sync_and_back_off_live_sensor(requested, generation);
+                        return false;
+                    }
                     self.live_snapshot = None;
                     self.model
                         .conversations_mut()
@@ -705,10 +863,19 @@ impl Controller {
                 };
                 match result.0 {
                     LiveConversationJobResult::Ready(snapshot) => {
+                        if quiet {
+                            return self
+                                .apply_sensor_snapshot(snapshot, generation, requested, workers);
+                        }
+                        self.seed_live_baseline(&snapshot);
                         self.live_snapshot = Some(snapshot);
                         self.model.conversations_mut().set_live_error(None);
                     }
                     LiveConversationJobResult::Cancelled => {
+                        if quiet {
+                            self.sync_and_back_off_live_sensor(requested, generation);
+                            return false;
+                        }
                         self.model
                             .conversations_mut()
                             .set_live_generations(requested, generation);
@@ -716,6 +883,10 @@ impl Controller {
                         return true;
                     }
                     LiveConversationJobResult::Error(message) => {
+                        if quiet {
+                            self.sync_and_back_off_live_sensor(requested, generation);
+                            return false;
+                        }
                         self.live_snapshot = None;
                         self.model
                             .conversations_mut()
@@ -908,20 +1079,47 @@ impl Controller {
     }
 
     pub(super) fn next_refresh_in(&self, now: Instant) -> Option<Duration> {
-        if self.model.active_view() != View::Files {
-            return None;
+        let files_wait = if self.model.active_view() == View::Files {
+            self.files
+                .as_ref()
+                .and_then(|files| files.next_refresh_in(now))
+        } else {
+            None
+        };
+        let sensor_wait = if self.model.active_view() == View::Conversations {
+            self.live_sensor
+                .as_ref()
+                .map(|sensor| sensor.next_tick.saturating_duration_since(now))
+        } else {
+            None
+        };
+        match (files_wait, sensor_wait) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
         }
-        self.files
-            .as_ref()
-            .and_then(|files| files.next_refresh_in(now))
     }
 
     pub(super) fn tick(&mut self, now: Instant, workers: &mut WorkerRuntime) -> bool {
-        self.model.active_view() == View::Files
+        let files_ticked = self.model.active_view() == View::Files
             && self
                 .files
                 .as_mut()
-                .is_some_and(|files| files.tick(now, workers))
+                .is_some_and(|files| files.tick(now, workers));
+        files_ticked || self.tick_live_sensor(now, workers)
+    }
+
+    fn tick_live_sensor(&mut self, now: Instant, workers: &mut WorkerRuntime) -> bool {
+        let due = self.model.active_view() == View::Conversations
+            && self.host_binary.is_some()
+            && self
+                .live_sensor
+                .as_ref()
+                .is_some_and(|sensor| sensor.next_tick <= now);
+        if !due {
+            return false;
+        }
+        self.schedule_live_poll(workers, true);
+        false
     }
 }
 
@@ -1251,14 +1449,14 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::atomic::AtomicBool;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::{Duration, Instant, UNIX_EPOCH};
     use tempfile::TempDir;
 
     use super::{
         Controller, ConversationJobResult, ConversationPaths, configured_external_source_id,
         load_conversations,
     };
-    use crate::config::PluginConfig;
+    use crate::config::{LiveCadence, PluginConfig};
     use crate::conversations::active::{
         merge_filesystem_snapshots, prepare_filesystem_conversations,
     };
@@ -2530,6 +2728,329 @@ esac
         );
         assert_eq!(controller.input_mode(), InputMode::FileSearchActive);
         assert_eq!(controller.model.files().filter(), "main");
+        workers.shutdown();
+    }
+
+    fn write_agent_list_fixture(binary: &Path, agents: &str) {
+        let response =
+            format!(r#"{{"id":"test","result":{{"type":"agent_list","agents":[{agents}]}}}}"#);
+        fs::write(
+            binary,
+            format!("#!/bin/sh\nsleep 0.02\nprintf '%s\\n' '{response}'\n"),
+        )
+        .expect("fake Herdr script");
+        fs::set_permissions(binary, fs::Permissions::from_mode(0o700)).expect("executable");
+    }
+
+    fn omp_agent_json(cwd: &Path, pane: &str, session_id: &str) -> String {
+        serde_json::json!({
+            "agent": "omp",
+            "agent_session": {
+                "source": "herdr:omp",
+                "agent": "omp",
+                "kind": "id",
+                "value": session_id,
+            },
+            "agent_status": "working",
+            "cwd": cwd,
+            "foreground_cwd": cwd,
+            "pane_id": pane,
+            "title": "sensor fixture",
+        })
+        .to_string()
+    }
+
+    fn adaptive_config_dir(min_ms: u64, max_ms: u64) -> TempDir {
+        let dir = TempDir::new().expect("config dir");
+        fs::write(
+            dir.path().join("config.toml"),
+            format!(
+                "[conversations]\nlive_cadence = \"adaptive\"\nlive_min_interval_ms = {min_ms}\nlive_max_interval_ms = {max_ms}\n"
+            ),
+        )
+        .expect("adaptive config");
+        dir
+    }
+
+    fn drain_workers(controller: &mut Controller, workers: &mut WorkerRuntime) {
+        while workers.has_pending_work() {
+            let result = workers
+                .recv_timeout(Duration::from_secs(2))
+                .expect("worker result");
+            controller.apply_result(result, workers);
+        }
+    }
+
+    #[test]
+    fn live_cadence_configuration_parses_with_validation() {
+        let empty = TempDir::new().expect("empty config dir");
+        assert!(matches!(
+            PluginConfig::load_from_dir(empty.path())
+                .into_config()
+                .conversations()
+                .live_cadence(),
+            LiveCadence::Manual
+        ));
+
+        let adaptive = adaptive_config_dir(250, 2_000);
+        match PluginConfig::load_from_dir(adaptive.path())
+            .into_config()
+            .conversations()
+            .live_cadence()
+        {
+            LiveCadence::Adaptive { minimum, maximum } => {
+                assert_eq!(minimum, Duration::from_millis(250));
+                assert_eq!(maximum, Duration::from_millis(2_000));
+            }
+            LiveCadence::Manual => panic!("adaptive cadence was expected"),
+        }
+
+        let broken = TempDir::new().expect("broken config dir");
+        fs::write(
+            broken.path().join("config.toml"),
+            "[conversations]\nlive_cadence = \"turbo\"\n",
+        )
+        .expect("broken config");
+        let (config, warnings) = PluginConfig::load_from_dir(broken.path()).into_parts();
+        assert!(matches!(
+            config.conversations().live_cadence(),
+            LiveCadence::Manual
+        ));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("conversations.live_cadence"))
+        );
+
+        let inverted = TempDir::new().expect("inverted config dir");
+        fs::write(
+            inverted.path().join("config.toml"),
+            "[conversations]\nlive_cadence = \"adaptive\"\nlive_min_interval_ms = 5000\nlive_max_interval_ms = 1000\n",
+        )
+        .expect("inverted config");
+        let (config, warnings) = PluginConfig::load_from_dir(inverted.path()).into_parts();
+        match config.conversations().live_cadence() {
+            LiveCadence::Adaptive { minimum, maximum } => {
+                assert_eq!(minimum, Duration::from_millis(2_000));
+                assert_eq!(maximum, Duration::from_millis(30_000));
+            }
+            LiveCadence::Manual => panic!("fallback must stay adaptive"),
+        }
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("conversations.live_cadence"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_sensor_polls_quietly_backs_off_and_pauses_outside_view() {
+        let project = TempDir::new().expect("project");
+        let binary = project.path().join("fake-herdr");
+        let session_a = "019b8721-4a18-7000-8005-000000000005";
+        write_agent_list_fixture(
+            &binary,
+            &omp_agent_json(project.path(), "pane-live", session_a),
+        );
+
+        let mut controller = controller(&project);
+        controller.host_binary = Some(binary);
+        let mut workers = WorkerRuntime::with_capacities(2, 4);
+        controller.model.set_active_view(View::Conversations);
+        let config_dir = adaptive_config_dir(250, 2_000);
+        controller.apply_config_load(PluginConfig::load_from_dir(config_dir.path()), &mut workers);
+        drain_workers(&mut controller, &mut workers);
+
+        assert_eq!(
+            controller.model.conversations().live_generations(),
+            (1, 1),
+            "startup live load must seed the sensor baseline"
+        );
+        assert!(
+            controller
+                .model
+                .conversations()
+                .items()
+                .iter()
+                .any(|item| item.session_reference().id() == session_a)
+        );
+
+        controller.tick(Instant::now() + Duration::from_secs(1), &mut workers);
+        drain_workers(&mut controller, &mut workers);
+        assert_eq!(controller.model.conversations().generations().0, 1);
+        assert!(!controller.model.conversations().live_loading());
+        let wait = controller
+            .next_refresh_in(Instant::now())
+            .expect("sensor deadline");
+        assert!(
+            wait > Duration::from_millis(250) && wait <= Duration::from_millis(500),
+            "unchanged poll must back off past the minimum, got {wait:?}"
+        );
+
+        controller.apply(Intent::SwitchView(View::Files), &mut workers);
+        drain_workers(&mut controller, &mut workers);
+        let before = controller.model.conversations().live_generations();
+        controller.tick(Instant::now() + Duration::from_secs(60), &mut workers);
+        drain_workers(&mut controller, &mut workers);
+        assert_eq!(
+            before,
+            controller.model.conversations().live_generations(),
+            "sensor must pause outside the Conversations view"
+        );
+
+        controller.apply(Intent::SwitchView(View::Conversations), &mut workers);
+        controller.tick(Instant::now() + Duration::from_secs(60), &mut workers);
+        assert!(
+            workers.has_pending_work(),
+            "re-entering the view must fire an immediate catch-up poll"
+        );
+        drain_workers(&mut controller, &mut workers);
+        workers.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_sensor_reference_change_triggers_discovery_once_and_resets_backoff() {
+        let project = TempDir::new().expect("project");
+        let binary = project.path().join("fake-herdr");
+        let session_a = "019b8721-4a18-7000-8005-000000000005";
+        write_agent_list_fixture(
+            &binary,
+            &omp_agent_json(project.path(), "pane-live", session_a),
+        );
+
+        let mut controller = controller(&project);
+        controller.host_binary = Some(binary.clone());
+        let mut workers = WorkerRuntime::with_capacities(2, 4);
+        controller.model.set_active_view(View::Conversations);
+        let config_dir = adaptive_config_dir(250, 2_000);
+        controller.apply_config_load(PluginConfig::load_from_dir(config_dir.path()), &mut workers);
+        drain_workers(&mut controller, &mut workers);
+        controller.tick(Instant::now() + Duration::from_secs(1), &mut workers);
+        drain_workers(&mut controller, &mut workers);
+        assert_eq!(controller.model.conversations().generations().0, 1);
+
+        let session_b = "019b8721-4a18-7000-8005-000000000006";
+        write_agent_list_fixture(
+            &binary,
+            &omp_agent_json(project.path(), "pane-live", session_b),
+        );
+        controller.tick(Instant::now() + Duration::from_secs(1), &mut workers);
+        drain_workers(&mut controller, &mut workers);
+        assert_eq!(
+            controller.model.conversations().generations().0,
+            2,
+            "reference change must trigger exactly one quiet discovery"
+        );
+        assert!(
+            controller
+                .model
+                .conversations()
+                .items()
+                .iter()
+                .any(|item| item.session_reference().id() == session_b)
+        );
+        let wait = controller
+            .next_refresh_in(Instant::now())
+            .expect("reset deadline");
+        assert!(
+            wait <= Duration::from_millis(250),
+            "reference change must reset the interval to the minimum, got {wait:?}"
+        );
+
+        controller.tick(Instant::now() + Duration::from_secs(1), &mut workers);
+        drain_workers(&mut controller, &mut workers);
+        assert_eq!(
+            controller.model.conversations().generations().0,
+            2,
+            "stable references must not re-trigger discovery"
+        );
+        workers.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_sensor_failures_back_off_silently_and_keep_rows() {
+        let project = TempDir::new().expect("project");
+        let binary = project.path().join("fake-herdr");
+        let session_a = "019b8721-4a18-7000-8005-000000000005";
+        write_agent_list_fixture(
+            &binary,
+            &omp_agent_json(project.path(), "pane-live", session_a),
+        );
+
+        let mut controller = controller(&project);
+        controller.host_binary = Some(binary.clone());
+        let mut workers = WorkerRuntime::with_capacities(2, 4);
+        controller.model.set_active_view(View::Conversations);
+        let config_dir = adaptive_config_dir(250, 2_000);
+        controller.apply_config_load(PluginConfig::load_from_dir(config_dir.path()), &mut workers);
+        drain_workers(&mut controller, &mut workers);
+        controller.tick(Instant::now() + Duration::from_secs(1), &mut workers);
+        drain_workers(&mut controller, &mut workers);
+
+        fs::write(&binary, "#!/bin/sh\nprintf 'not json\\n'\n").expect("broken fake Herdr");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).expect("executable");
+        controller.tick(Instant::now() + Duration::from_secs(5), &mut workers);
+        drain_workers(&mut controller, &mut workers);
+
+        assert!(
+            !controller
+                .model
+                .conversations()
+                .visible_errors()
+                .iter()
+                .any(|error| error.starts_with("Herdr:")),
+            "quiet sensor failures must not surface error notices"
+        );
+        assert!(
+            controller
+                .model
+                .conversations()
+                .items()
+                .iter()
+                .any(|item| item.session_reference().id() == session_a),
+            "quiet failures must retain the last known live rows"
+        );
+        assert!(!controller.model.conversations().live_loading());
+        let wait = controller
+            .next_refresh_in(Instant::now())
+            .expect("backoff deadline after failure");
+        assert!(wait > Duration::from_millis(250));
+        workers.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manual_refresh_seeds_baseline_without_redundant_sensor_discovery() {
+        let project = TempDir::new().expect("project");
+        let binary = project.path().join("fake-herdr");
+        let session_a = "019b8721-4a18-7000-8005-000000000005";
+        write_agent_list_fixture(
+            &binary,
+            &omp_agent_json(project.path(), "pane-live", session_a),
+        );
+
+        let mut controller = controller(&project);
+        controller.host_binary = Some(binary);
+        let mut workers = WorkerRuntime::with_capacities(2, 4);
+        controller.model.set_active_view(View::Conversations);
+        let config_dir = adaptive_config_dir(250, 2_000);
+        controller.apply_config_load(PluginConfig::load_from_dir(config_dir.path()), &mut workers);
+        drain_workers(&mut controller, &mut workers);
+
+        controller.apply(Intent::Refresh, &mut workers);
+        drain_workers(&mut controller, &mut workers);
+        let discovery_after_refresh = controller.model.conversations().generations().0;
+
+        controller.tick(Instant::now() + Duration::from_secs(1), &mut workers);
+        drain_workers(&mut controller, &mut workers);
+        assert_eq!(
+            controller.model.conversations().generations().0,
+            discovery_after_refresh,
+            "manual refresh baseline must prevent a redundant sensor discovery"
+        );
         workers.shutdown();
     }
 }

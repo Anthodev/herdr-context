@@ -36,6 +36,8 @@ const MIN_PASSIVE_JJ_CADENCE_MS: u64 = 1_000;
 const MAX_CADENCE_MS: u64 = 300_000;
 const DEFAULT_GIT_MIN_MS: u64 = 2_000;
 const DEFAULT_GIT_MAX_MS: u64 = 30_000;
+const DEFAULT_LIVE_MIN_MS: u64 = 2_000;
+const DEFAULT_LIVE_MAX_MS: u64 = 30_000;
 const KNOWN_SOURCE_IDS: [&str; 6] = [
     "claude-code",
     "codex-cli",
@@ -229,7 +231,6 @@ impl FilesConfig {
         &self.exclusions
     }
 }
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConversationsConfig {
     enabled_sources: BTreeSet<String>,
@@ -237,6 +238,7 @@ pub struct ConversationsConfig {
     external_roots: Vec<ExternalHistoryRoot>,
     page_size: NonZeroUsize,
     cache_entries: NonZeroUsize,
+    live_cadence: LiveCadence,
 }
 
 impl ConversationsConfig {
@@ -264,10 +266,14 @@ impl ConversationsConfig {
     pub const fn page_size(&self) -> NonZeroUsize {
         self.page_size
     }
-
     #[must_use]
     pub const fn cache_entries(&self) -> NonZeroUsize {
         self.cache_entries
+    }
+
+    #[must_use]
+    pub const fn live_cadence(&self) -> LiveCadence {
+        self.live_cadence
     }
 }
 
@@ -279,6 +285,7 @@ impl Default for ConversationsConfig {
             external_roots: Vec::new(),
             page_size: NonZeroUsize::new(DEFAULT_HISTORY_PAGE_SIZE).expect("non-zero default"),
             cache_entries: NonZeroUsize::new(DEFAULT_CACHE_ENTRIES).expect("non-zero default"),
+            live_cadence: LiveCadence::Manual,
         }
     }
 }
@@ -343,6 +350,26 @@ pub enum GitCadence {
         minimum: Duration,
         maximum: Duration,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LiveCadence {
+    #[default]
+    Manual,
+    Adaptive {
+        minimum: Duration,
+        maximum: Duration,
+    },
+}
+
+impl LiveCadence {
+    #[must_use]
+    pub const fn adaptive(self) -> Option<(Duration, Duration)> {
+        match self {
+            Self::Manual => None,
+            Self::Adaptive { minimum, maximum } => Some((minimum, maximum)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -681,6 +708,9 @@ fn parse_config(value: &toml::Value) -> ConfigLoad {
                 "page_size",
                 "cache_entries",
                 "external_roots",
+                "live_cadence",
+                "live_min_interval_ms",
+                "live_max_interval_ms",
             ],
             "conversations.unknown_field",
             &mut warnings,
@@ -716,6 +746,7 @@ fn parse_config(value: &toml::Value) -> ConfigLoad {
         if let Some(value) = table.get("external_roots") {
             config.conversations.external_roots = parse_external_roots(value, &mut warnings);
         }
+        config.conversations.live_cadence = parse_live_cadence(table, &mut warnings);
     }
 
     if let Some(table) = optional_table(root, "vcs", &mut warnings) {
@@ -1026,6 +1057,48 @@ fn parse_refresh_policy(table: &toml::Table, warnings: &mut Vec<String>) -> Refr
         git,
         passive_jujutsu,
     }
+}
+
+fn parse_live_cadence(table: &toml::Table, warnings: &mut Vec<String>) -> LiveCadence {
+    let cadence = parse_string(table.get("live_cadence")).unwrap_or("manual");
+    let parsed = match cadence {
+        "manual" => LiveCadence::Manual,
+        "adaptive" => {
+            let minimum = parse_duration_ms(
+                table.get("live_min_interval_ms"),
+                MIN_CADENCE_MS,
+                MAX_CADENCE_MS,
+                DEFAULT_LIVE_MIN_MS,
+                "conversations.live_min_interval_ms",
+                warnings,
+            );
+            let maximum = parse_duration_ms(
+                table.get("live_max_interval_ms"),
+                MIN_CADENCE_MS,
+                MAX_CADENCE_MS,
+                DEFAULT_LIVE_MAX_MS,
+                "conversations.live_max_interval_ms",
+                warnings,
+            );
+            if minimum > maximum {
+                invalid("conversations.live_cadence", warnings);
+                LiveCadence::Adaptive {
+                    minimum: Duration::from_millis(DEFAULT_LIVE_MIN_MS),
+                    maximum: Duration::from_millis(DEFAULT_LIVE_MAX_MS),
+                }
+            } else {
+                LiveCadence::Adaptive { minimum, maximum }
+            }
+        }
+        _ => {
+            invalid("conversations.live_cadence", warnings);
+            LiveCadence::Manual
+        }
+    };
+    if table.contains_key("live_cadence") && parse_string(table.get("live_cadence")).is_none() {
+        invalid("conversations.live_cadence", warnings);
+    }
+    parsed
 }
 
 fn parse_duration_ms(
