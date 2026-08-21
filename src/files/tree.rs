@@ -47,6 +47,31 @@ impl TreeNode {
     }
 }
 
+/// Flat, file-level VCS change derived from the latest accepted status snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChangedFile {
+    path: PathBuf,
+    kind: VcsStatusKind,
+    missing: bool,
+}
+
+impl ChangedFile {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> VcsStatusKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn is_missing(&self) -> bool {
+        self.missing
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct DirectoryLoader {
     ignore: IgnorePolicy,
@@ -115,6 +140,7 @@ pub struct FilesTree {
     loader: DirectoryLoader,
     nodes: Arc<BTreeMap<PathBuf, TreeNode>>,
     statuses: Arc<BTreeMap<PathBuf, VcsStatusKind>>,
+    changed_files: Arc<Vec<ChangedFile>>,
     children: Arc<BTreeMap<PathBuf, Vec<PathBuf>>>,
     selection: Option<PathBuf>,
 }
@@ -130,6 +156,7 @@ impl FilesTree {
             loader: DirectoryLoader { ignore },
             nodes: Arc::new(BTreeMap::new()),
             statuses: Arc::new(BTreeMap::new()),
+            changed_files: Arc::new(Vec::new()),
             children: Arc::new(BTreeMap::new()),
             selection: None,
         })
@@ -144,6 +171,7 @@ impl FilesTree {
             loader: DirectoryLoader { ignore },
             nodes: Arc::new(BTreeMap::new()),
             statuses: Arc::new(BTreeMap::new()),
+            changed_files: Arc::new(Vec::new()),
             children: Arc::new(BTreeMap::new()),
             selection: None,
         })
@@ -158,6 +186,7 @@ impl FilesTree {
             loader: DirectoryLoader { ignore },
             nodes: Arc::new(BTreeMap::new()),
             statuses: Arc::new(BTreeMap::new()),
+            changed_files: Arc::new(Vec::new()),
             children: Arc::new(BTreeMap::new()),
             selection: None,
         })
@@ -235,12 +264,14 @@ impl FilesTree {
         let capacity = snapshot.entries().len().saturating_mul(2);
         let mut statuses = BTreeMap::new();
         let mut virtual_candidates = BTreeMap::new();
+        let mut changed = BTreeMap::<PathBuf, (VcsStatusKind, bool)>::new();
         for entry in snapshot.entries() {
             if let Ok(path) = entry.path().strip_prefix(files_prefix)
                 && self.loader.ignore.is_visible(path)
             {
                 let path = path.to_path_buf();
                 insert_status_with_ancestors(&mut statuses, &path, entry.kind());
+                upsert_changed_file(&mut changed, path.clone(), entry.kind(), false);
                 if entry.kind() == VcsStatusKind::Deleted
                     || entry.index_state() == Some(VcsStatusKind::Deleted)
                     || entry.worktree_state() == Some(VcsStatusKind::Deleted)
@@ -262,6 +293,7 @@ impl FilesTree {
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     insert_status_with_ancestors(&mut statuses, &path, status);
+                    upsert_changed_file(&mut changed, path.clone(), status, true);
                     virtual_nodes.push(TreeNode {
                         path,
                         kind: TreeNodeKind::Virtual,
@@ -283,6 +315,16 @@ impl FilesTree {
                 .map(|node| (node.path.clone(), node)),
         );
         self.statuses = Arc::new(statuses);
+        self.changed_files = Arc::new(
+            changed
+                .into_iter()
+                .map(|(path, (kind, missing))| ChangedFile {
+                    path,
+                    kind,
+                    missing,
+                })
+                .collect(),
+        );
         self.rebuild_children();
         self.restore_selection();
         Ok(())
@@ -322,6 +364,12 @@ impl FilesTree {
             .collect()
     }
 
+    /// Flat, path-sorted file-level changes from the latest accepted snapshot.
+    #[must_use]
+    pub fn changed_files(&self) -> &[ChangedFile] {
+        &self.changed_files
+    }
+
     pub(crate) fn nodes(&self) -> impl Iterator<Item = &TreeNode> {
         self.nodes.values()
     }
@@ -339,6 +387,7 @@ impl FilesTree {
             loader: self.loader.clone(),
             nodes: Arc::new(nodes),
             statuses: Arc::clone(&self.statuses),
+            changed_files: Arc::clone(&self.changed_files),
             children: Arc::new(BTreeMap::new()),
             selection: self.selection.clone(),
         };
@@ -349,6 +398,7 @@ impl FilesTree {
 
     pub(crate) fn sync_status_overlay_from(&mut self, source: &Self) {
         self.statuses = Arc::clone(&source.statuses);
+        self.changed_files = Arc::clone(&source.changed_files);
         let nodes = Arc::make_mut(&mut self.nodes);
         nodes.retain(|_, node| node.kind != TreeNodeKind::Virtual);
         for node in nodes.values_mut() {
@@ -492,6 +542,23 @@ fn insert_preferred_status(
             }
         })
         .or_insert(status);
+}
+
+fn upsert_changed_file(
+    changed: &mut BTreeMap<PathBuf, (VcsStatusKind, bool)>,
+    path: PathBuf,
+    status: VcsStatusKind,
+    missing: bool,
+) {
+    changed
+        .entry(path)
+        .and_modify(|(current_kind, current_missing)| {
+            if status_order(status) < status_order(*current_kind) {
+                *current_kind = status;
+            }
+            *current_missing |= missing;
+        })
+        .or_insert((status, missing));
 }
 
 const fn status_order(status: VcsStatusKind) -> u8 {
@@ -1030,5 +1097,75 @@ mod tests {
             TreeNodeKind::File
         );
         assert!(tree.node(Path::new("changed/child")).is_none());
+    }
+
+    #[test]
+    fn derives_flat_changed_files_from_the_snapshot() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join("src")).expect("src");
+        fs::write(temp.path().join("src/mod.rs"), []).expect("modified file");
+        fs::write(temp.path().join("added.rs"), []).expect("added file");
+        fs::write(temp.path().join("renamed.rs"), []).expect("renamed file");
+        let mut tree = FilesTree::new(temp.path().to_path_buf()).expect("tree");
+        tree.load_directory(Path::new("")).expect("root");
+
+        tree.merge_status(&VcsStatusSnapshot::new(
+            vec![
+                status("src/deep/deleted.rs", None, VcsStatusKind::Deleted),
+                status("src/mod.rs", None, VcsStatusKind::Modified),
+                status("added.rs", None, VcsStatusKind::Added),
+                status("renamed.rs", Some("src/old.rs"), VcsStatusKind::Renamed),
+            ],
+            false,
+        ))
+        .expect("merge status");
+
+        let changed: Vec<(&Path, VcsStatusKind, bool)> = tree
+            .changed_files()
+            .iter()
+            .map(|file| (file.path(), file.kind(), file.is_missing()))
+            .collect();
+        assert_eq!(
+            changed,
+            vec![
+                (Path::new("added.rs"), VcsStatusKind::Added, false),
+                (Path::new("renamed.rs"), VcsStatusKind::Renamed, false),
+                (
+                    Path::new("src/deep/deleted.rs"),
+                    VcsStatusKind::Deleted,
+                    true
+                ),
+                (Path::new("src/mod.rs"), VcsStatusKind::Modified, false),
+                (Path::new("src/old.rs"), VcsStatusKind::Renamed, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn changed_files_honor_the_visibility_policy() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join(".secret"), []).expect("hidden file");
+        fs::write(temp.path().join("kept.rs"), []).expect("kept file");
+        let mut tree = FilesTree::with_visibility_policy(
+            temp.path().to_path_buf(),
+            std::sync::Arc::new(crate::files::ignore::ConfiguredVisibilityPolicy::new(
+                false,
+                Vec::new(),
+            )),
+        )
+        .expect("tree");
+        tree.load_directory(Path::new("")).expect("root");
+
+        tree.merge_status(&VcsStatusSnapshot::new(
+            vec![
+                status(".secret", None, VcsStatusKind::Untracked),
+                status("kept.rs", None, VcsStatusKind::Modified),
+            ],
+            false,
+        ))
+        .expect("merge status");
+
+        let paths: Vec<&Path> = tree.changed_files().iter().map(|f| f.path()).collect();
+        assert_eq!(paths, [Path::new("kept.rs")]);
     }
 }

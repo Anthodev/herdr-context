@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::files::ignore::VisibilityPolicy;
-use crate::vcs::{VcsError, VcsErrorKind, VcsStatusSnapshot};
+use crate::vcs::{VcsDiffStats, VcsError, VcsErrorKind, VcsStatusSnapshot};
 use refresh::{RefreshCoordinator, RefreshResult};
 use tree::FilesTree;
 
@@ -28,6 +28,7 @@ pub(crate) struct PreparedRefreshResult {
     tree_revision: u64,
     tree: Result<(FilesTree, bool), VcsError>,
     status_fingerprint: Option<u64>,
+    diff_stats: Option<VcsDiffStats>,
 }
 
 impl PreparedRefreshResult {
@@ -35,6 +36,7 @@ impl PreparedRefreshResult {
         generation: u64,
         input: StatusMergeInput,
         snapshot: Result<VcsStatusSnapshot, VcsError>,
+        diff_stats: Option<VcsDiffStats>,
     ) -> Self {
         let status_fingerprint = snapshot.as_ref().ok().map(snapshot_fingerprint);
         let tree = snapshot.and_then(|snapshot| {
@@ -54,6 +56,7 @@ impl PreparedRefreshResult {
             tree_revision: input.tree_revision,
             tree,
             status_fingerprint,
+            diff_stats,
         }
     }
 
@@ -86,6 +89,7 @@ pub struct FilesModel {
     workspace_prefix: PathBuf,
     failure_notice: Option<String>,
     status_is_stale: bool,
+    diff_stats: Option<VcsDiffStats>,
     tree_revision: u64,
 }
 
@@ -141,6 +145,7 @@ impl FilesModel {
             workspace_prefix,
             failure_notice: None,
             status_is_stale: false,
+            diff_stats: None,
             tree_revision: 0,
         })
     }
@@ -174,6 +179,11 @@ impl FilesModel {
         self.status_is_stale
     }
 
+    /// Line-level `+/−` totals of the latest applied diff, when available.
+    #[must_use]
+    pub const fn diff_stats(&self) -> Option<VcsDiffStats> {
+        self.diff_stats
+    }
     pub(crate) const fn mark_status_stale(&mut self) -> bool {
         if self.status_is_stale {
             return false;
@@ -223,6 +233,7 @@ impl FilesModel {
                 self.tree = tree;
                 self.failure_notice = None;
                 self.status_is_stale = stale;
+                self.diff_stats = result.diff_stats;
                 true
             }
             Err(error) => {
@@ -248,6 +259,9 @@ impl FilesModel {
                         self.tree_revision = self.tree_revision.saturating_add(1);
                         self.failure_notice = None;
                         self.status_is_stale = stale;
+                        // This legacy path carries no diff statistics; the
+                        // prepared pipeline is the production source.
+                        self.diff_stats = None;
                         true
                     }
                     Err(error) => {
@@ -344,6 +358,7 @@ mod tests {
             generation,
             input,
             Ok(VcsStatusSnapshot::new(vec![deleted], false)),
+            None,
         );
         fs::write(temp.path().join("added"), []).expect("added");
         files.load_directory(Path::new("")).expect("newer tree");

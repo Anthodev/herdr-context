@@ -101,6 +101,7 @@ fn map_normal_key(key: KeyEvent) -> Option<Intent> {
         KeyCode::Left | KeyCode::Char('h') => Some(Intent::CollapseOrAscend),
         KeyCode::Enter | KeyCode::Char(' ') => Some(Intent::ToggleSelected),
         KeyCode::Char('r') => Some(Intent::Refresh),
+        KeyCode::Char('w') => Some(Intent::SwitchFilesPane),
         KeyCode::Char('/') => Some(Intent::BeginFileSearch),
         _ => None,
     }
@@ -186,6 +187,25 @@ mod tests {
                 &geometry,
             ),
             Some(Intent::Quit)
+        );
+    }
+
+    #[test]
+    fn w_maps_to_the_files_pane_focus_toggle() {
+        let geometry = UiGeometry::default();
+
+        assert_eq!(
+            map_event(
+                key(KeyCode::Char('w'), KeyModifiers::NONE),
+                InputMode::Normal,
+                &geometry,
+            ),
+            Some(Intent::SwitchFilesPane)
+        );
+        assert_eq!(
+            crate::config::KeyBindings::default()
+                .map_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+            Some(Intent::SwitchFilesPane)
         );
     }
 }

@@ -11,11 +11,11 @@ use std::time::{Duration, Instant};
 
 use command_group::{CommandGroup, GroupChild};
 
+use super::status::parse_shortstat_summary;
 use super::{
-    VcsBackendMetadata, VcsEntryStatus, VcsError, VcsErrorKind, VcsService, VcsStatusKind,
-    VcsStatusSnapshot, VcsWorkspace, find_executable,
+    VcsBackendMetadata, VcsDiffStats, VcsEntryStatus, VcsError, VcsErrorKind, VcsService,
+    VcsStatusKind, VcsStatusSnapshot, VcsWorkspace, find_executable,
 };
-
 const GIT_BACKEND_ID: &str = "git";
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_EXECUTABLE_BUSY_RETRIES: usize = 10;
@@ -27,8 +27,12 @@ const FILTER_CONFIG_OUTPUT_LIMITS: OutputLimits = OutputLimits {
     stdout: 1024 * 1024,
     stderr: 1024 * 1024,
 };
-const MAX_FILTER_OVERRIDES: usize = 1024;
 const MAX_STATUS_ENTRIES: usize = 100_000;
+const MAX_FILTER_OVERRIDES: usize = 1024;
+const SHORTSTAT_OUTPUT_LIMITS: OutputLimits = OutputLimits {
+    stdout: 4096,
+    stderr: 4096,
+};
 
 #[derive(Clone, Copy, Debug)]
 struct OutputLimits {
@@ -81,6 +85,17 @@ impl GitService {
     ) -> Result<VcsStatusSnapshot, VcsError> {
         self.validate_workspace(workspace)?;
         self.status(workspace.root(), cancelled)
+    }
+    pub(crate) fn refresh_diff_stats_cancellable(
+        &self,
+        workspace: &VcsWorkspace,
+        cancelled: &AtomicBool,
+    ) -> Result<Option<VcsDiffStats>, VcsError> {
+        self.validate_workspace(workspace)?;
+        let executable = self.executable.as_ref().ok_or_else(|| {
+            VcsError::new(VcsErrorKind::Unavailable, "Git executable is unavailable")
+        })?;
+        diff_shortstat(executable, workspace.root(), self.timeout, cancelled)
     }
 
     fn validate_workspace(&self, workspace: &VcsWorkspace) -> Result<(), VcsError> {
@@ -147,20 +162,49 @@ fn run_status(
     cancelled: &AtomicBool,
 ) -> Result<Vec<u8>, VcsError> {
     let deadline = Instant::now().checked_add(timeout);
-    let mut config = git_command(executable, root);
-    config.args(["config", "--null", "--name-only", "--list"]);
-    let config = run_command(config, deadline, FILTER_CONFIG_OUTPUT_LIMITS, cancelled)?;
-    check_exit(config.status, &config.stderr)?;
-    let filter_overrides = parse_filter_overrides(&config.stdout)?;
+    let overrides = filter_overrides(executable, root, deadline, cancelled)?;
 
     let mut status = git_command(executable, root);
-    for key in filter_overrides {
+    for key in overrides {
         status.args(["-c", &format!("{key}=")]);
     }
     status.args(["status", "--porcelain=v2", "-z", "--untracked-files=all"]);
     let status = run_command(status, deadline, limits, cancelled)?;
     check_exit(status.status, &status.stderr)?;
     Ok(status.stdout)
+}
+
+fn diff_shortstat(
+    executable: &Path,
+    root: &Path,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> Result<Option<VcsDiffStats>, VcsError> {
+    let deadline = Instant::now().checked_add(timeout);
+    let overrides = filter_overrides(executable, root, deadline, cancelled)?;
+
+    let mut diff = git_command(executable, root);
+    for key in overrides {
+        diff.args(["-c", &format!("{key}=")]);
+    }
+    // One bounded command covering staged and unstaged tracked changes.
+    diff.args(["diff", "--shortstat", "HEAD"]);
+    let diff = run_command(diff, deadline, SHORTSTAT_OUTPUT_LIMITS, cancelled)?;
+    check_exit(diff.status, &diff.stderr)?;
+    Ok(parse_shortstat_summary(&diff.stdout))
+}
+
+fn filter_overrides(
+    executable: &Path,
+    root: &Path,
+    deadline: Option<Instant>,
+    cancelled: &AtomicBool,
+) -> Result<BTreeSet<String>, VcsError> {
+    let mut config = git_command(executable, root);
+    config.args(["config", "--null", "--name-only", "--list"]);
+    let config = run_command(config, deadline, FILTER_CONFIG_OUTPUT_LIMITS, cancelled)?;
+    check_exit(config.status, &config.stderr)?;
+    parse_filter_overrides(&config.stdout)
 }
 
 fn git_command(executable: &Path, root: &Path) -> Command {

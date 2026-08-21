@@ -16,7 +16,7 @@ upstream Herdr, and keeps the plugin independently installable.
 
 ## Install a packaged release
 
-Version `0.15.0` supports these release targets:
+Version `0.16.0` supports these release targets:
 
 | Platform | Architecture | Artifact target |
 |---|---|---|
@@ -31,18 +31,18 @@ status needs `jj` `0.37` or newer. Missing optional VCS tools degrade the
 affected status view without closing the dock.
 
 Download the archive and adjacent `.sha256` file for the host target from the
-`v0.15.0` GitHub release, then verify and install it:
+`v0.16.0` GitHub release, then verify and install it:
 
 ```sh
 target=x86_64-unknown-linux-gnu # choose a target from the table
 
 # Linux checksum tool:
-sha256sum -c "herdr-context-v0.15.0-$target.tar.gz.sha256"
+sha256sum -c "herdr-context-v0.16.0-$target.tar.gz.sha256"
 # macOS checksum tool:
-shasum -a 256 -c "herdr-context-v0.15.0-$target.tar.gz.sha256"
+shasum -a 256 -c "herdr-context-v0.16.0-$target.tar.gz.sha256"
 
-tar -xzf "herdr-context-v0.15.0-$target.tar.gz"
-cd "herdr-context-v0.15.0-$target"
+tar -xzf "herdr-context-v0.16.0-$target.tar.gz"
+cd "herdr-context-v0.16.0-$target"
 ./install.sh
 ```
 
@@ -119,6 +119,14 @@ see the retained performance evidence below.
   modified is yellow or yellow-orange, and deleted is red; directories inherit
   the highest-priority status of their descendants;
 - represent deleted files even though they no longer exist on disk;
+- split the Files area into a top tree and a bottom flat list of every file
+  carrying a VCS status (modified, added, untracked, renamed, copied, deleted,
+  conflicted), derived from the latest status snapshot; a muted labeled rule
+  separates the panes and shows the workspace diff totals as green `+N` and
+  red `-N` line counts (tracked changes only; untracked files contribute no
+  line totals), falling back to the file count when the diff is unavailable;
+  the rule lights up while the flat pane owns keyboard focus, and the flat
+  pane hides while the path filter is active;
 - never intentionally modify project files or VCS history.
 
 Jujutsu status requires `jj` 0.37 or newer and is integration-tested against
@@ -165,21 +173,25 @@ require a dedicated adapter and cannot be inferred safely.
 ### Controls
 
 - `Tab` / `Shift+Tab` or `1` / `2`: switch views without restarting the dock;
-- arrow keys or `h` / `j` / `k` / `l`: navigate the Files tree or visible
-  Conversation provider/session rows;
+- arrow keys or `h` / `j` / `k` / `l`: navigate the focused Files pane (tree or
+  flat modified-files list) or visible Conversation provider/session rows;
+  the flat list shows full project-relative paths with the same status markers;
 - `Home` / `End`: select the first or last visible row;
 - `Enter` / `Space`: expand or collapse the selected directory or Conversation
   provider; on a Files file row, insert its project-relative `@path` reference
   followed by a space into the originating pane, then focus that pane; on a
   resumable Conversation session, open a new focused tab in the current Herdr
   workspace and launch its harness with that session;
-- `r`: refresh the active view;
+- `w`: move keyboard focus between the Files tree pane and its flat
+  modified-files pane; activating a missing file there is reported in the
+  notice line instead of inserting a reference;
 - `/`: edit a live Files path filter; `Enter` keeps the filter and returns to
   result navigation, `Ctrl+U` clears the query while editing, and `Esc` clears
   an active filter before it can close the TUI;
-- left click selects a Files or Conversation row; right click toggles a Files
-  row or Conversation provider, and clicking a Conversation disclosure marker
-  also toggles its group; the mouse wheel navigates;
+- left click selects and focuses whichever Files or Conversation row was
+  clicked, including the flat modified-files pane; right click toggles a Files
+  tree row or Conversation provider, and clicking a Conversation disclosure
+  marker also toggles its group; the mouse wheel navigates the focused pane;
 - `q`, `Esc` with no active Files filter, or `Ctrl+C`: close the TUI and restore
   the terminal.
 
@@ -282,6 +294,7 @@ passive_jujutsu_interval_ms = 0 # 0 disables; otherwise 1000..300000
 [keybindings]
 refresh = ["r"]
 search = ["/"]
+toggle_files_focus = ["w"]
 quit = ["q", "esc", "ctrl+c"]
 ```
 
@@ -332,7 +345,7 @@ renders status as potentially stale.
 
 ## Release status
 
-Version `0.15.0` is the V1 packaging contract. Tag `v0.15.0`, Cargo metadata,
+Version `0.16.0` is the V1 packaging contract. Tag `v0.16.0`, Cargo metadata,
 the source and packaged manifests, binary name, minimum Herdr version, archive
 names, and checksums are validated together. CI builds from `Cargo.lock` and
 blocks publication on formatting, Clippy, tests, release build, manifest,

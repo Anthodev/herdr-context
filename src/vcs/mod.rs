@@ -13,7 +13,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-pub use status::{VcsEntryStatus, VcsEntryStatusError, VcsStatusKind, VcsStatusSnapshot};
+pub use status::{
+    VcsDiffStats, VcsEntryStatus, VcsEntryStatusError, VcsStatusKind, VcsStatusSnapshot,
+};
 
 /// Open backend identifier and capabilities. No adapter record escapes here.
 #[derive(Clone, Debug, Eq, PartialEq)]

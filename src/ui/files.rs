@@ -8,8 +8,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
 use crate::config::DisplayMode;
-use crate::files::tree::{FilesTree, TreeNodeKind};
-use crate::vcs::VcsStatusKind;
+use crate::files::tree::{ChangedFile, FilesTree, TreeNodeKind};
+use crate::vcs::{VcsDiffStats, VcsStatusKind};
 
 use super::{file_display, sanitize_terminal_cow, sanitize_terminal_text, theme};
 
@@ -146,24 +146,18 @@ impl Widget for FilesView<'_> {
         }
 
         if let Some((label, notice)) = self.notice {
-            Line::from(vec![
-                Span::styled(format!("{label}: "), theme::error().bold()),
-                Span::styled(sanitize_terminal_text(notice), theme::error()),
-            ])
-            .render(
-                Rect::new(
-                    area.x,
-                    area.y.saturating_add(area.height.saturating_sub(1)),
-                    area.width,
-                    1,
-                ),
-                buffer,
+            let rect = Rect::new(
+                area.x,
+                area.y.saturating_add(area.height.saturating_sub(1)),
+                area.width,
+                1,
             );
+            render_notice(label, notice, rect, buffer);
         }
     }
 }
 
-fn render_search(search: FileSearchDisplay<'_>, area: Rect, buffer: &mut Buffer) {
+pub(crate) fn render_search(search: FileSearchDisplay<'_>, area: Rect, buffer: &mut Buffer) {
     if area.is_empty() {
         return;
     }
@@ -274,6 +268,120 @@ const fn status_marker(status: Option<VcsStatusKind>) -> (&'static str, Style) {
     }
 }
 
+pub(crate) fn render_notice(label: &str, message: &str, area: Rect, buffer: &mut Buffer) {
+    Line::from(vec![
+        Span::styled(format!("{label}: "), theme::error().bold()),
+        Span::styled(sanitize_terminal_text(message), theme::error()),
+    ])
+    .render(area, buffer);
+}
+
+/// View-model for the flat modified-files pane.
+#[derive(Clone, Copy, Debug)]
+pub struct ChangedPane<'a> {
+    pub rows: &'a [ChangedFile],
+    pub selected: Option<&'a Path>,
+    pub empty_message: Option<&'a str>,
+}
+
+/// Renders the flat modified-files list; rows are marker + relative path.
+pub(crate) fn render_changed_pane(pane: ChangedPane<'_>, area: Rect, buffer: &mut Buffer) {
+    if area.is_empty() {
+        return;
+    }
+    if pane.rows.is_empty() {
+        if let Some(message) = pane.empty_message {
+            Span::styled(sanitize_terminal_text(message), theme::inactive()).render(area, buffer);
+        }
+        return;
+    }
+    for (offset, file) in pane.rows.iter().enumerate() {
+        let y = area.y.saturating_add(offset as u16);
+        let (marker, marker_style) = status_marker(Some(file.kind()));
+        let mut spans = Vec::with_capacity(4);
+        spans.push(Span::styled(marker, marker_style));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            sanitize_terminal_cow(file.path().to_string_lossy()),
+            marker_style,
+        ));
+        if file.is_missing() {
+            spans.push(Span::styled(" (missing)", theme::inactive()));
+        }
+        let mut line = Line::from(spans);
+        if pane.selected == Some(file.path()) {
+            line = line.style(theme::selected_neutral());
+        }
+        line.render(Rect::new(area.x, y, area.width, 1), buffer);
+    }
+}
+
+const fn divider_glyph(mode: DisplayMode) -> &'static str {
+    match mode {
+        DisplayMode::Ascii => "-",
+        DisplayMode::Unicode | DisplayMode::Nerd => "─",
+    }
+}
+
+/// Renders the labeled rule separating the tree pane from the flat list.
+/// The rule stays muted; the label carries the entry count or, when the
+/// backend reported line totals, green/red `+/−` numbers that light up with
+/// the accent color while keyboard focus lives in the flat pane.
+pub(crate) fn render_changed_divider(
+    count: usize,
+    diff: Option<VcsDiffStats>,
+    focused: bool,
+    mode: DisplayMode,
+    area: Rect,
+    buffer: &mut Buffer,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let glyph = divider_glyph(mode);
+    let width = usize::from(area.width);
+    let line_style = theme::inactive();
+    let label_style = if focused {
+        Style::new().fg(theme::ACCENT)
+    } else {
+        theme::inactive()
+    };
+    // Build the labeled rule first; fall back to a bare full-width rule when
+    // the pane is too narrow to carry the label unclipped.
+    let mut labeled = Vec::with_capacity(7);
+    let mut plain_width = glyph.chars().count() + 2;
+    labeled.push(Span::styled(glyph, line_style));
+    labeled.push(Span::raw(" "));
+    plain_width += "Changed".chars().count();
+    labeled.push(Span::styled("Changed", label_style));
+    match diff {
+        Some(stats) if stats.insertions() != 0 || stats.deletions() != 0 => {
+            let insertions = format!(" +{}", stats.insertions());
+            plain_width += insertions.chars().count();
+            labeled.push(Span::styled(insertions, Style::new().fg(theme::VCS_ADDED)));
+            let deletions = format!(" -{}", stats.deletions());
+            plain_width += deletions.chars().count();
+            labeled.push(Span::styled(deletions, Style::new().fg(theme::VCS_DELETED)));
+        }
+        None => {
+            let count_label = format!(" ({count})");
+            plain_width += count_label.chars().count();
+            labeled.push(Span::styled(count_label, label_style));
+        }
+        Some(_) => {}
+    }
+    labeled.push(Span::raw(" "));
+    if width >= plain_width {
+        labeled.push(Span::styled(
+            glyph.repeat(width.saturating_sub(plain_width)),
+            line_style,
+        ));
+        Line::from(labeled).render(area, buffer);
+    } else {
+        Span::styled(glyph.repeat(width), line_style).render(area, buffer);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -285,10 +393,10 @@ mod tests {
     use ratatui::style::Color;
     use ratatui::widgets::Widget;
 
-    use super::{FileSearchDisplay, FilesView};
+    use super::{FileSearchDisplay, FilesView, theme};
     use crate::config::DisplayMode;
     use crate::files::tree::FilesTree;
-    use crate::vcs::{VcsEntryStatus, VcsStatusKind, VcsStatusSnapshot};
+    use crate::vcs::{VcsDiffStats, VcsEntryStatus, VcsStatusKind, VcsStatusSnapshot};
     use tempfile::TempDir;
 
     #[test]
@@ -549,5 +657,150 @@ mod tests {
         assert!(first.contains("Search > auth"));
         assert!(first.ends_with("0 partial, 2 skipped"));
         assert!(second.starts_with("No matches in searched paths"));
+    }
+
+    #[test]
+    fn renders_the_changed_pane_with_markers_missing_rows_and_selection() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("mod.rs"), []).expect("modified file");
+        let mut tree = FilesTree::new(temp.path().to_path_buf()).expect("tree");
+        tree.merge_status(&VcsStatusSnapshot::new(
+            vec![
+                status_entry("gone.rs", VcsStatusKind::Deleted),
+                status_entry("mod.rs", VcsStatusKind::Modified),
+                status_entry("new.rs", VcsStatusKind::Untracked),
+            ],
+            false,
+        ))
+        .expect("merge status");
+
+        let area = Rect::new(0, 0, 24, 3);
+        let mut buffer = Buffer::empty(area);
+        super::render_changed_pane(
+            super::ChangedPane {
+                rows: tree.changed_files(),
+                selected: Some(Path::new("mod.rs")),
+                empty_message: Some("No modified files"),
+            },
+            area,
+            &mut buffer,
+        );
+        let line = |y: u16| {
+            (0..area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(line(0).starts_with("D gone.rs (missing)"));
+        assert!(line(1).starts_with("M mod.rs"));
+        assert!(line(2).starts_with("? new.rs"));
+
+        let mut plain = Buffer::empty(area);
+        super::render_changed_pane(
+            super::ChangedPane {
+                rows: tree.changed_files(),
+                selected: None,
+                empty_message: None,
+            },
+            area,
+            &mut plain,
+        );
+        assert_ne!(buffer[(0, 1)].style(), plain[(0, 1)].style());
+    }
+
+    #[test]
+    fn renders_the_changed_pane_empty_message_without_rows() {
+        let area = Rect::new(0, 0, 20, 2);
+        let mut buffer = Buffer::empty(area);
+        super::render_changed_pane(
+            super::ChangedPane {
+                rows: &[],
+                selected: None,
+                empty_message: Some("No modified files"),
+            },
+            area,
+            &mut buffer,
+        );
+        let line: String = (0..area.width).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(line.starts_with("No modified files"));
+    }
+
+    #[test]
+    fn renders_the_changed_divider_with_diff_totals_and_focus_accent() {
+        let area = Rect::new(0, 0, 24, 1);
+        let mut muted = Buffer::empty(area);
+        super::render_changed_divider(
+            3,
+            Some(VcsDiffStats::new(12, 4)),
+            false,
+            DisplayMode::Ascii,
+            area,
+            &mut muted,
+        );
+        let mut focused = Buffer::empty(area);
+        super::render_changed_divider(
+            3,
+            Some(VcsDiffStats::new(12, 4)),
+            true,
+            DisplayMode::Ascii,
+            area,
+            &mut focused,
+        );
+        let line = |buffer: &Buffer| {
+            (0..area.width)
+                .map(|x| buffer[(x, 0)].symbol())
+                .collect::<String>()
+        };
+        assert!(line(&muted).starts_with("- Changed +12 -4 -"));
+        assert!(line(&muted).ends_with('-'));
+        // Same glyphs in both states; only the label styling changes.
+        assert_eq!(line(&muted), line(&focused));
+        assert_ne!(muted[(2, 0)].style(), focused[(2, 0)].style());
+        // Insertions and deletions carry the VCS added/deleted colors.
+        assert_eq!(muted[(11, 0)].fg, theme::VCS_ADDED);
+        assert_eq!(muted[(15, 0)].fg, theme::VCS_DELETED);
+    }
+
+    #[test]
+    fn falls_back_to_the_file_count_without_diff_stats() {
+        let area = Rect::new(0, 0, 24, 1);
+        let mut buffer = Buffer::empty(area);
+        super::render_changed_divider(3, None, false, DisplayMode::Ascii, area, &mut buffer);
+        let line: String = (0..area.width).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(line.starts_with("- Changed (3) -"));
+
+        // Zeroed totals stay quiet instead of showing "+0 -0".
+        let mut zeroed = Buffer::empty(area);
+        super::render_changed_divider(
+            0,
+            Some(VcsDiffStats::new(0, 0)),
+            false,
+            DisplayMode::Ascii,
+            area,
+            &mut zeroed,
+        );
+        let line: String = (0..area.width).map(|x| zeroed[(x, 0)].symbol()).collect();
+        assert!(line.starts_with("- Changed -"));
+    }
+
+    #[test]
+    fn renders_the_unicode_rule_in_unicode_mode() {
+        let area = Rect::new(0, 0, 16, 1);
+        let mut buffer = Buffer::empty(area);
+        super::render_changed_divider(1, None, false, DisplayMode::Unicode, area, &mut buffer);
+        let line: String = (0..area.width).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(line.starts_with("─ Changed (1) ─"));
+    }
+
+    #[test]
+    fn falls_back_to_a_plain_rule_when_the_label_does_not_fit() {
+        let area = Rect::new(0, 0, 6, 1);
+        let mut buffer = Buffer::empty(area);
+        super::render_changed_divider(3, None, false, DisplayMode::Ascii, area, &mut buffer);
+        let line: String = (0..area.width).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert_eq!(line, "------");
+    }
+
+    fn status_entry(path: &str, kind: VcsStatusKind) -> VcsEntryStatus {
+        VcsEntryStatus::new(PathBuf::from(path), None, kind, None, None).expect("status entry")
     }
 }

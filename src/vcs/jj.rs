@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use crate::worker::process::{ProcessError, ProcessErrorKind, ProcessOutput, ProcessSpec, run};
 
+use super::status::parse_shortstat_summary;
 use super::{
-    VcsBackendMetadata, VcsEntryStatus, VcsError, VcsErrorKind, VcsService, VcsStatusKind,
-    VcsStatusSnapshot, VcsWorkspace, find_executable,
+    VcsBackendMetadata, VcsDiffStats, VcsEntryStatus, VcsError, VcsErrorKind, VcsService,
+    VcsStatusKind, VcsStatusSnapshot, VcsWorkspace, find_executable,
 };
 
 const JJ_BACKEND_ID: &str = "jj";
@@ -143,6 +144,31 @@ impl JjService {
         let output = run(&spec, cancelled).map_err(process_error)?;
         check_status_exit(&output)?;
         parse_templated_diff(output.stdout(), self.mode == JujutsuMode::Passive)
+    }
+
+    pub(crate) fn refresh_diff_stats_cancellable(
+        &self,
+        workspace: &VcsWorkspace,
+        cancelled: &AtomicBool,
+    ) -> Result<Option<VcsDiffStats>, VcsError> {
+        self.validate_workspace(workspace)?;
+        let executable = self.executable.as_ref().ok_or_else(|| {
+            VcsError::new(
+                VcsErrorKind::Unavailable,
+                "Jujutsu executable is unavailable",
+            )
+        })?;
+        let mut spec = base_spec(executable, self.timeout)
+            .args(["-R"])
+            .arg(workspace.root())
+            .current_dir(workspace.root());
+        if self.mode == JujutsuMode::Passive {
+            spec = spec.arg("--ignore-working-copy");
+        }
+        spec = spec.args(["diff", "-r", "@", "--stat"]);
+        let output = run(&spec, cancelled).map_err(process_error)?;
+        check_status_exit(&output)?;
+        Ok(parse_shortstat_summary(output.stdout()))
     }
 
     fn validate_workspace(&self, workspace: &VcsWorkspace) -> Result<(), VcsError> {
