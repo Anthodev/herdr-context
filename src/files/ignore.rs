@@ -135,6 +135,7 @@ pub(crate) enum VisibleEntryKind {
 pub(crate) struct VisibleEntry {
     pub(crate) path: PathBuf,
     pub(crate) kind: VisibleEntryKind,
+    pub(crate) ignored: bool,
 }
 
 pub(crate) struct VisibleEntriesBatch {
@@ -152,18 +153,20 @@ pub struct IgnorePolicy {
     files_prefix: PathBuf,
     visibility: Arc<dyn VisibilityPolicy>,
     gitignore_enabled: bool,
+    show_ignored: bool,
 }
 
 impl IgnorePolicy {
     pub fn new(root: PathBuf) -> io::Result<Self> {
-        Self::with_visibility_policy(root, Arc::new(DefaultVisibilityPolicy))
+        Self::with_visibility_policy(root, Arc::new(DefaultVisibilityPolicy), false)
     }
 
     pub fn with_visibility_policy(
         root: PathBuf,
         visibility: Arc<dyn VisibilityPolicy>,
+        show_ignored: bool,
     ) -> io::Result<Self> {
-        Self::with_workspace_visibility_policy(root.clone(), root, visibility)
+        Self::with_workspace_visibility_policy(root.clone(), root, visibility, show_ignored)
     }
 
     pub(crate) fn for_workspace(root: PathBuf, workspace_root: PathBuf) -> io::Result<Self> {
@@ -171,20 +174,23 @@ impl IgnorePolicy {
             root,
             workspace_root,
             Arc::new(DefaultVisibilityPolicy),
+            false,
         )
     }
     pub(crate) fn for_workspace_with_visibility(
         root: PathBuf,
         workspace_root: PathBuf,
         visibility: Arc<dyn VisibilityPolicy>,
+        show_ignored: bool,
     ) -> io::Result<Self> {
-        Self::with_workspace_visibility_policy(root, workspace_root, visibility)
+        Self::with_workspace_visibility_policy(root, workspace_root, visibility, show_ignored)
     }
 
     fn with_workspace_visibility_policy(
         root: PathBuf,
         workspace_root: PathBuf,
         visibility: Arc<dyn VisibilityPolicy>,
+        show_ignored: bool,
     ) -> io::Result<Self> {
         if !root.is_absolute() || !workspace_root.is_absolute() {
             return Err(io::Error::new(
@@ -222,7 +228,16 @@ impl IgnorePolicy {
             files_prefix,
             visibility,
             gitignore_enabled,
+            show_ignored,
         })
+    }
+
+    /// Clones the policy with the ignored-visibility flag flipped; no I/O.
+    #[must_use]
+    pub(crate) fn rescoped(&self, show_ignored: bool) -> Self {
+        let mut rescoped = self.clone();
+        rescoped.show_ignored = show_ignored;
+        rescoped
     }
 
     #[must_use]
@@ -270,7 +285,7 @@ impl IgnorePolicy {
         let mut matcher_budget = bounds.as_ref().map(MatcherBudget::new);
         let (directory, matchers, ancestor_ignored) =
             self.open_directory_with_matchers(relative_directory, matcher_budget.as_mut())?;
-        if ancestor_ignored {
+        if ancestor_ignored && !self.show_ignored {
             return Ok(VisibleEntriesBatch {
                 entries: Vec::new(),
                 examined: 0,
@@ -315,11 +330,12 @@ impl IgnorePolicy {
             } else {
                 VisibleEntryKind::File
             };
-            if is_ignored(
+            let ignored = is_ignored(
                 &matchers,
                 &self.root_path.join(&relative),
                 kind == VisibleEntryKind::Directory,
-            ) {
+            );
+            if ignored && !self.show_ignored {
                 continue;
             }
             if bounds
@@ -332,6 +348,7 @@ impl IgnorePolicy {
             entries.push(VisibleEntry {
                 path: relative,
                 kind,
+                ignored,
             });
         }
         entries.sort_unstable_by(|left, right| left.path.cmp(&right.path));
@@ -827,5 +844,63 @@ mod tests {
         symlink(outside.path(), temp.path().join("a")).expect("replace with symlink");
 
         assert!(policy.visible_children(Path::new("a/b")).is_err());
+    }
+
+    #[test]
+    fn show_ignored_flags_entries_and_enters_ignored_directories() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join(".git")).expect("git marker");
+        fs::write(
+            temp.path().join(".gitignore"),
+            b"skipped.txt\nskipped-dir/\n",
+        )
+        .expect("gitignore");
+        touch(temp.path().join("kept"));
+        touch(temp.path().join("skipped.txt"));
+        fs::create_dir(temp.path().join("skipped-dir")).expect("ignored directory");
+        touch(temp.path().join("skipped-dir/nested"));
+
+        let hidden =
+            IgnorePolicy::for_workspace(temp.path().to_path_buf(), temp.path().to_path_buf())
+                .expect("policy");
+        let shown = hidden.rescoped(true);
+
+        assert_eq!(
+            hidden.visible_children(Path::new("")).expect("children"),
+            vec![PathBuf::from("kept")]
+        );
+        assert!(
+            hidden
+                .visible_children(Path::new("skipped-dir"))
+                .expect("children")
+                .is_empty()
+        );
+
+        let entries = shown.visible_entries(Path::new("")).expect("entries");
+        let mut shown_children: Vec<PathBuf> =
+            entries.iter().map(|entry| entry.path.clone()).collect();
+        shown_children.sort_unstable();
+        assert_eq!(
+            shown_children,
+            [
+                PathBuf::from("kept"),
+                PathBuf::from("skipped-dir"),
+                PathBuf::from("skipped.txt"),
+            ]
+        );
+        let ignored_flag = |path: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.path == Path::new(path))
+                .map(|entry| entry.ignored)
+        };
+        assert_eq!(ignored_flag("skipped.txt"), Some(true));
+        assert_eq!(ignored_flag("kept"), Some(false));
+        assert_eq!(
+            shown
+                .visible_children(Path::new("skipped-dir"))
+                .expect("children"),
+            vec![PathBuf::from("skipped-dir/nested")]
+        );
     }
 }

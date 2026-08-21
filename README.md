@@ -6,7 +6,7 @@ context dock to the right of the active terminal or coding agent.
 ```text
 ┌────────────────┬──────────────────────────────────┬────────────────────────┐
 │ Native sidebar │ Terminal / agent                 │ herdr-context          │
-│ Herdr          │                                  │ Files | Conversations  │
+│ Herdr          │                                  │ Files | History        │
 └────────────────┴──────────────────────────────────┴────────────────────────┘
 ```
 
@@ -16,7 +16,7 @@ upstream Herdr, and keeps the plugin independently installable.
 
 ## Install a packaged release
 
-Version `0.17.0` supports these release targets:
+Version `0.18.0` supports these release targets:
 
 | Platform | Architecture | Artifact target |
 |---|---|---|
@@ -31,18 +31,18 @@ status needs `jj` `0.37` or newer. Missing optional VCS tools degrade the
 affected status view without closing the dock.
 
 Download the archive and adjacent `.sha256` file for the host target from the
-`v0.17.0` GitHub release, then verify and install it:
+`v0.18.0` GitHub release, then verify and install it:
 
 ```sh
 target=x86_64-unknown-linux-gnu # choose a target from the table
 
 # Linux checksum tool:
-sha256sum -c "herdr-context-v0.17.0-$target.tar.gz.sha256"
+sha256sum -c "herdr-context-v0.18.0-$target.tar.gz.sha256"
 # macOS checksum tool:
-shasum -a 256 -c "herdr-context-v0.17.0-$target.tar.gz.sha256"
+shasum -a 256 -c "herdr-context-v0.18.0-$target.tar.gz.sha256"
 
-tar -xzf "herdr-context-v0.17.0-$target.tar.gz"
-cd "herdr-context-v0.17.0-$target"
+tar -xzf "herdr-context-v0.18.0-$target.tar.gz"
+cd "herdr-context-v0.18.0-$target"
 ./install.sh
 ```
 
@@ -95,8 +95,8 @@ the disposable cache stores metadata only.
 
 Windows, musl Linux, older glibc releases, and architectures outside the table
 are not release targets. External conversation discovery remains restricted to
-the fixture-validated provider versions and local readable metadata. The
-Conversations view can resume fixture-backed Claude Code, Codex CLI, Pi, OMP,
+the fixture-validated provider versions and local readable metadata.
+The History view can resume fixture-backed Claude Code, Codex CLI, Pi, OMP,
 and OpenCode sessions, but does not edit, delete, summarize, or upload them.
 Ratatui measurement excludes terminal-driver and multiplexer transport latency;
 see the retained performance evidence below.
@@ -138,7 +138,7 @@ The injectable `Passive` mode adds `--ignore-working-copy` and marks the
 displayed status as potentially stale. The plugin never issues commit,
 bookmark, operation-rewrite, or other explicit mutation commands.
 
-### Conversations
+### History
 
 - list LLM conversations associated with the current project or worktree;
 - discover histories stored inside the project as the preferred source;
@@ -158,12 +158,12 @@ require a dedicated adapter and cannot be inferred safely.
 
 ## Target experience
 
-- `Files` and `Conversations` are two views rendered by the same TUI process;
+- `Files` and `History` are two views rendered by the same TUI process;
 - the dock remains the rightmost pane in its tab;
 - at most one dock instance is open per tab;
 - one shortcut toggles between open, focus, and close;
 - each view preserves its selection and scroll position across tab switches;
-  Conversations also preserves collapsed provider groups across refreshes;
+  History also preserves collapsed provider groups across refreshes;
 - general UI colors use semantic ANSI slots resolved by Herdr's active user
   theme; primary VCS colors use deterministic truecolor overrides so terminal
   palette remapping cannot turn green/yellow/red states into unrelated colors;
@@ -197,7 +197,7 @@ require a dedicated adapter and cannot be inferred safely.
 
 ### Project-local generic conversations
 
-The Conversations view checks only these registered project-relative locations:
+The History view checks only these registered project-relative locations:
 `.herdr/conversations/` (direct children only), `.herdr/conversations.jsonl`,
 and `.herdr/conversations.json`. It never scans the project recursively.
 
@@ -264,6 +264,7 @@ display_mode = "ascii" # ascii, unicode, or nerd
 
 [files]
 show_hidden = false
+show_ignored = false          # `i` toggles ignored files in-session
 exclusions = ["target", "generated/cache"] # project-relative paths
 
 [conversations]
@@ -295,6 +296,7 @@ passive_jujutsu_interval_ms = 0 # 0 disables; otherwise 1000..300000
 refresh = ["r"]
 search = ["/"]
 toggle_files_focus = ["w"]
+toggle_ignored_files = ["i"]
 quit = ["q", "esc", "ctrl+c"]
 ```
 
@@ -303,10 +305,10 @@ canonical-project, and metadata bounds. Extra project roots are
 project-relative; extra external roots are absolute. Unsupported or unreadable
 roots are isolated so healthy sources and cached metadata remain visible.
 
-`ui.display_mode` controls glyphs in both Files and Conversations:
+`ui.display_mode` controls glyphs in both Files and History:
 
 - `ascii` is the compact terminal-safe default. Files uses ASCII tree
-  connectors with `+` / `-` directories and `f` files; Conversations uses
+  connectors with `+` / `-` directories and `f` files; History uses
   `+` / `-` provider groups and `*` / `-` / `?` session states;
 - `unicode` uses `├──` / `└──` Files connectors, `▸` / `▾` expandable groups,
   and Unicode file/session bullets;
@@ -345,7 +347,7 @@ renders status as potentially stale.
 
 ## Release status
 
-Version `0.17.0` is the V1 packaging contract. Tag `v0.17.0`, Cargo metadata,
+Version `0.18.0` is the V1 packaging contract. Tag `v0.18.0`, Cargo metadata,
 the source and packaged manifests, binary name, minimum Herdr version, archive
 names, and checksums are validated together. CI builds from `Cargo.lock` and
 blocks publication on formatting, Clippy, tests, release build, manifest,

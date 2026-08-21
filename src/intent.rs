@@ -42,6 +42,7 @@ pub enum Intent {
     CollapseOrAscend,
     ToggleSelected,
     Refresh,
+    ToggleIgnoredFiles,
     SwitchFilesPane,
     BeginFileSearch,
     FileSearchInput(String),

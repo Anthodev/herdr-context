@@ -10,7 +10,7 @@ use ratatui::widgets::{Paragraph, Widget};
 
 use crate::config::DisplayMode;
 use crate::intent::View;
-use crate::model::{AppModel, ConversationsViewState, LoadingState, UiGeometry};
+use crate::model::{AppModel, ConversationsViewState, LoadingState, NoticeSeverity, UiGeometry};
 
 mod conversation_display;
 pub mod conversations;
@@ -49,7 +49,7 @@ pub fn render_shell(model: &mut AppModel, area: Rect, buffer: &mut Buffer) {
         let active = model.active_view();
         Line::from(vec![
             Span::styled(" Files ", tab_style(active == View::Files)),
-            Span::styled(" Conversations ", tab_style(active == View::Conversations)),
+            Span::styled(" History ", tab_style(active == View::Conversations)),
         ])
         .render(Rect::new(area.x, area.y, area.width, 1), buffer);
         let search_hint = model.search_hint();
@@ -103,7 +103,7 @@ pub fn render_shell(model: &mut AppModel, area: Rect, buffer: &mut Buffer) {
             let loading = model.conversations().loading().clone();
             match loading {
                 LoadingState::Loading => {
-                    render_message("Loading conversations…", content, buffer);
+                    render_message("Loading history…", content, buffer);
                 }
                 LoadingState::Ready => {
                     render_conversations_state(
@@ -154,10 +154,14 @@ fn render_conversations_state(
         } else {
             String::new()
         };
+        let style = match error.severity() {
+            NoticeSeverity::Quiet => theme::inactive(),
+            NoticeSeverity::Alert => theme::warning(),
+        };
         Paragraph::new(Line::from(vec![
-            Span::styled("Warning: ", theme::warning().bold()),
-            Span::styled(count, theme::warning()),
-            Span::styled(sanitize_terminal_text(error), theme::warning()),
+            Span::styled("Warning: ", style),
+            Span::styled(count, style),
+            Span::styled(sanitize_terminal_text(error.message()), style),
         ]))
         .render(Rect::new(area.x, area.y, area.width, 1), buffer);
         Rect::new(
@@ -185,7 +189,7 @@ fn render_conversations_state(
         return;
     }
     if state.items().is_empty() {
-        render_message("No conversations", content, buffer);
+        render_message("No history", content, buffer);
     } else {
         conversations::render(state, display_mode, content, buffer);
     }

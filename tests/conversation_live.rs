@@ -67,16 +67,29 @@ fn stale_live_generations_cannot_replace_visible_items_or_selection() {
 #[test]
 fn live_errors_are_separate_non_fatal_warnings() {
     let mut state = ConversationsViewState::default();
-    state.set_source_errors(vec!["filesystem warning".to_owned()]);
+    state.set_source_errors(vec![herdr_context::model::VisibleError::quiet(
+        "filesystem warning".to_owned(),
+    )]);
     state.set_live_error(Some("Herdr unavailable".to_owned()));
 
     assert_eq!(
-        state.visible_errors(),
+        state
+            .visible_errors()
+            .iter()
+            .map(|error| error.message())
+            .collect::<Vec<_>>(),
         ["filesystem warning", "Herdr unavailable"]
     );
 
     state.set_live_error(None);
-    assert_eq!(state.visible_errors(), ["filesystem warning"]);
+    assert_eq!(
+        state
+            .visible_errors()
+            .iter()
+            .map(|error| error.message())
+            .collect::<Vec<_>>(),
+        ["filesystem warning"]
+    );
 }
 
 #[test]

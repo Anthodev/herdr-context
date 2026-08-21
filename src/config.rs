@@ -217,6 +217,7 @@ impl UiConfig {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FilesConfig {
     show_hidden: bool,
+    show_ignored: bool,
     exclusions: Vec<PathBuf>,
 }
 
@@ -224,6 +225,11 @@ impl FilesConfig {
     #[must_use]
     pub const fn show_hidden(&self) -> bool {
         self.show_hidden
+    }
+
+    #[must_use]
+    pub const fn show_ignored(&self) -> bool {
+        self.show_ignored
     }
 
     #[must_use]
@@ -407,10 +413,11 @@ pub enum KeyAction {
     Refresh,
     ToggleFilesFocus,
     Search,
+    ToggleIgnoredFiles,
 }
 
 impl KeyAction {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 16] = [
         Self::Quit,
         Self::NextView,
         Self::PreviousView,
@@ -426,6 +433,7 @@ impl KeyAction {
         Self::Refresh,
         Self::ToggleFilesFocus,
         Self::Search,
+        Self::ToggleIgnoredFiles,
     ];
 
     const fn field(self) -> &'static str {
@@ -445,6 +453,7 @@ impl KeyAction {
             Self::Refresh => "refresh",
             Self::ToggleFilesFocus => "toggle_files_focus",
             Self::Search => "search",
+            Self::ToggleIgnoredFiles => "toggle_ignored_files",
         }
     }
 
@@ -465,6 +474,7 @@ impl KeyAction {
             Self::Refresh => Intent::Refresh,
             Self::ToggleFilesFocus => Intent::SwitchFilesPane,
             Self::Search => Intent::BeginFileSearch,
+            Self::ToggleIgnoredFiles => Intent::ToggleIgnoredFiles,
         }
     }
 }
@@ -520,6 +530,7 @@ impl Default for KeyBindings {
             (KeyAction::Refresh, &["r"]),
             (KeyAction::ToggleFilesFocus, &["w"]),
             (KeyAction::Search, &["/"]),
+            (KeyAction::ToggleIgnoredFiles, &["i"]),
         ];
         Self {
             bindings: defaults
@@ -686,13 +697,19 @@ fn parse_config(value: &toml::Value) -> ConfigLoad {
     if let Some(table) = optional_table(root, "files", &mut warnings) {
         warn_unknown_fields(
             table,
-            &["show_hidden", "exclusions"],
+            &["show_hidden", "show_ignored", "exclusions"],
             "files.unknown_field",
             &mut warnings,
         );
         config.files.show_hidden =
             parse_bool(table.get("show_hidden"), "files.show_hidden", &mut warnings)
                 .unwrap_or(false);
+        config.files.show_ignored = parse_bool(
+            table.get("show_ignored"),
+            "files.show_ignored",
+            &mut warnings,
+        )
+        .unwrap_or(false);
         if let Some(value) = table.get("exclusions") {
             config.files.exclusions =
                 parse_relative_paths(value, MAX_EXCLUSIONS, "files.exclusions", &mut warnings);

@@ -116,7 +116,7 @@ fn injected_visibility_policy_can_include_hidden_entries() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join(".hidden"), []).expect("hidden fixture");
     let mut tree =
-        FilesTree::with_visibility_policy(temp.path().to_path_buf(), Arc::new(IncludeAll))
+        FilesTree::with_visibility_policy(temp.path().to_path_buf(), Arc::new(IncludeAll), false)
             .expect("tree");
 
     tree.load_directory(Path::new("")).expect("root");
@@ -162,6 +162,7 @@ fn disappearing_child_does_not_discard_readable_siblings() {
     let mut tree = FilesTree::with_visibility_policy(
         temp.path().to_path_buf(),
         Arc::new(RemoveDuringScan { victim }),
+        false,
     )
     .expect("tree");
 
@@ -192,6 +193,7 @@ fn root_swap_cannot_redirect_entry_metadata_outside_the_tree() {
             outside: outside.path().to_path_buf(),
             swapped: std::sync::atomic::AtomicBool::new(false),
         }),
+        false,
     )
     .expect("tree");
 

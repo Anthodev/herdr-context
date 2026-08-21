@@ -23,6 +23,7 @@ pub struct TreeNode {
     path: PathBuf,
     kind: TreeNodeKind,
     status: Option<VcsStatusKind>,
+    ignored: bool,
 }
 
 impl TreeNode {
@@ -39,6 +40,12 @@ impl TreeNode {
     #[must_use]
     pub const fn status(&self) -> Option<VcsStatusKind> {
         self.status
+    }
+
+    /// True when the walker matched this path via ignore rules; rendering only.
+    #[must_use]
+    pub const fn is_ignored(&self) -> bool {
+        self.ignored
     }
 
     #[must_use]
@@ -116,6 +123,7 @@ impl DirectoryLoader {
                     VisibleEntryKind::Symlink => TreeNodeKind::Symlink,
                 },
                 status: None,
+                ignored: entry.ignored,
             })
             .collect();
         DirectorySnapshot { directory, nodes }
@@ -147,7 +155,7 @@ pub struct FilesTree {
 
 impl FilesTree {
     pub fn new(root: PathBuf) -> io::Result<Self> {
-        Self::with_visibility_policy(root, Arc::new(DefaultVisibilityPolicy))
+        Self::with_visibility_policy(root, Arc::new(DefaultVisibilityPolicy), false)
     }
 
     pub(crate) fn for_workspace(root: PathBuf, workspace_root: PathBuf) -> io::Result<Self> {
@@ -165,8 +173,14 @@ impl FilesTree {
         root: PathBuf,
         workspace_root: PathBuf,
         visibility: Arc<dyn VisibilityPolicy>,
+        show_ignored: bool,
     ) -> io::Result<Self> {
-        let ignore = IgnorePolicy::for_workspace_with_visibility(root, workspace_root, visibility)?;
+        let ignore = IgnorePolicy::for_workspace_with_visibility(
+            root,
+            workspace_root,
+            visibility,
+            show_ignored,
+        )?;
         Ok(Self {
             loader: DirectoryLoader { ignore },
             nodes: Arc::new(BTreeMap::new()),
@@ -180,8 +194,9 @@ impl FilesTree {
     pub fn with_visibility_policy(
         root: PathBuf,
         visibility: Arc<dyn VisibilityPolicy>,
+        show_ignored: bool,
     ) -> io::Result<Self> {
-        let ignore = IgnorePolicy::with_visibility_policy(root, visibility)?;
+        let ignore = IgnorePolicy::with_visibility_policy(root, visibility, show_ignored)?;
         Ok(Self {
             loader: DirectoryLoader { ignore },
             nodes: Arc::new(BTreeMap::new()),
@@ -200,6 +215,15 @@ impl FilesTree {
 
     pub(crate) fn directory_loader(&self) -> DirectoryLoader {
         self.loader.clone()
+    }
+
+    /// Same cached tree with the ignored-visibility flag flipped; callers follow
+    /// up with a bounded re-enumeration of the loaded directories.
+    #[must_use]
+    pub(crate) fn with_show_ignored(&self, show_ignored: bool) -> Self {
+        let mut rescoped = self.clone();
+        rescoped.loader.ignore = self.loader.ignore.rescoped(show_ignored);
+        rescoped
     }
 
     pub(crate) fn apply_directory(&mut self, mut snapshot: DirectorySnapshot) {
@@ -298,6 +322,7 @@ impl FilesTree {
                         path,
                         kind: TreeNodeKind::Virtual,
                         status: Some(status),
+                        ignored: false,
                     });
                 }
                 Err(_) => continue,
@@ -1152,6 +1177,7 @@ mod tests {
                 false,
                 Vec::new(),
             )),
+            false,
         )
         .expect("tree");
         tree.load_directory(Path::new("")).expect("root");

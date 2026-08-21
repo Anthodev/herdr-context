@@ -17,16 +17,17 @@ use crate::conversations::active::{
 use crate::conversations::discovery::discover_conversations_cancellable;
 use crate::conversations::index::{ConversationIndex, IndexStatus};
 use crate::conversations::sources::{
-    ClaudeCodeSource, CodexCliSource, ConversationSource, ConversationSourceError, DiscoveryLimit,
-    GenericJsonlSource, KnownStoreRoots, MetadataBudget, OmpSource, OpenCodeSource, PiSource,
-    ProjectLocalLocation, SourceId, SourceRegistry,
+    ClaudeCodeSource, CodexCliSource, ConversationSource, ConversationSourceError,
+    ConversationSourceErrorKind, DiscoveryLimit, GenericJsonlSource, KnownStoreRoots,
+    MetadataBudget, OmpSource, OpenCodeSource, PiSource, ProjectLocalLocation, SourceId,
+    SourceRegistry,
 };
 use crate::conversations::{Conversation, ResumeCapability};
 use crate::host::client::CommandHostClient;
 use crate::host::{AgentHarness, HostClient, LaunchContext, ResumeConversationRequest};
 use crate::input::InputMode;
 use crate::intent::{Intent, View};
-use crate::model::{AppModel, LoadingState};
+use crate::model::{AppModel, LoadingState, NoticeSeverity, VisibleError};
 use crate::project::{ProjectIdentity, resolve_project_context_with_backend};
 use crate::runtime::{FilesRuntime, RuntimeMessage};
 use crate::ui::render_shell;
@@ -46,7 +47,7 @@ enum ConversationJobResult {
         project: ProjectIdentity,
         conversations: FilesystemConversationSnapshot,
         has_more: bool,
-        source_errors: Vec<String>,
+        source_errors: Vec<VisibleError>,
         reset_source_errors: bool,
     },
     Cancelled,
@@ -787,9 +788,11 @@ impl Controller {
                         reset_source_errors,
                     } => {
                         self.conversation_project = Some(project);
-                        let degraded_cache = source_errors
-                            .iter()
-                            .any(|error| error.starts_with("Cache: metadata index is unavailable"));
+                        let degraded_cache = source_errors.iter().any(|error| {
+                            error
+                                .message()
+                                .starts_with("Cache: metadata index is unavailable")
+                        });
                         let conversations = if degraded_cache {
                             if let Some(previous) = self.filesystem_conversations.as_ref() {
                                 merge_filesystem_snapshots(previous, conversations)
@@ -811,12 +814,10 @@ impl Controller {
                             self.model.conversations().source_errors().to_vec()
                         };
                         visible_errors.extend(source_errors);
-                        visible_errors.sort_unstable();
-                        visible_errors.dedup();
+                        visible_errors
+                            .sort_unstable_by(|left, right| left.message().cmp(right.message()));
+                        visible_errors.dedup_by(|left, right| left.message() == right.message());
                         visible_errors.truncate(8);
-                        self.model
-                            .conversations_mut()
-                            .set_source_errors(visible_errors);
                         if has_more {
                             self.schedule_conversation_page(workers, false);
                         }
@@ -1234,10 +1235,14 @@ fn load_conversations(
                     Ok(refresh) => {
                         let mut source_errors = source_error_messages(refresh.errors());
                         match cache_status {
-                            IndexStatus::RebuiltCorrupt => source_errors
-                                .push("Cache: corrupt metadata index was rebuilt".to_owned()),
-                            IndexStatus::RebuiltIncompatible => source_errors
-                                .push("Cache: incompatible metadata index was rebuilt".to_owned()),
+                            IndexStatus::RebuiltCorrupt => source_errors.push(VisibleError::quiet(
+                                "Cache: corrupt metadata index was rebuilt".to_owned(),
+                            )),
+                            IndexStatus::RebuiltIncompatible => {
+                                source_errors.push(VisibleError::quiet(
+                                    "Cache: incompatible metadata index was rebuilt".to_owned(),
+                                ))
+                            }
                             IndexStatus::Loaded | IndexStatus::RebuiltMissing => {}
                         }
                         (
@@ -1257,10 +1262,10 @@ fn load_conversations(
                             config.cache_entries().get(),
                             cancelled,
                         );
-                        errors.push(
+                        errors.push(VisibleError::quiet(
                             "Cache: metadata index is unavailable; using nonpersistent discovery"
                                 .to_owned(),
-                        );
+                        ));
                         (conversations, false, errors)
                     }
                 }
@@ -1274,10 +1279,10 @@ fn load_conversations(
                     config.cache_entries().get(),
                     cancelled,
                 );
-                errors.push(
+                errors.push(VisibleError::quiet(
                     "Cache: metadata index is unavailable; using nonpersistent discovery"
                         .to_owned(),
-                );
+                ));
                 (conversations, false, errors)
             }
         }
@@ -1293,7 +1298,7 @@ fn load_conversations(
         (conversations, false, errors)
     };
     conversations.truncate(config.cache_entries().get());
-    source_errors.extend(setup_errors);
+    source_errors.extend(setup_errors.into_iter().map(VisibleError::alert));
     if cancelled.load(Ordering::Relaxed) {
         return ConversationJobResult::Cancelled;
     }
@@ -1318,7 +1323,7 @@ fn discover_without_index(
     budget: MetadataBudget,
     max_entries: usize,
     cancelled: &AtomicBool,
-) -> (Vec<Conversation>, Vec<String>) {
+) -> (Vec<Conversation>, Vec<VisibleError>) {
     let mut watermarks = HashMap::new();
     let mut conversations = Vec::new();
     let mut seen = HashSet::new();
@@ -1425,15 +1430,30 @@ fn load_live_conversations(
     }
 }
 
-fn source_error_messages(errors: &[ConversationSourceError]) -> Vec<String> {
-    let mut messages = errors
+fn source_error_messages(errors: &[ConversationSourceError]) -> Vec<VisibleError> {
+    let severity = |kind: ConversationSourceErrorKind| match kind {
+        ConversationSourceErrorKind::UnsupportedFormat
+        | ConversationSourceErrorKind::MalformedData
+        | ConversationSourceErrorKind::InvalidData => NoticeSeverity::Quiet,
+        ConversationSourceErrorKind::Unavailable
+        | ConversationSourceErrorKind::PermissionDenied
+        | ConversationSourceErrorKind::SourceMismatch
+        | ConversationSourceErrorKind::ProjectMismatch
+        | ConversationSourceErrorKind::Io => NoticeSeverity::Alert,
+    };
+    let mut notices = errors
         .iter()
-        .map(|error| format!("{:?}: {error}", error.kind()))
+        .map(|error| {
+            VisibleError::new(
+                severity(error.kind()),
+                format!("{:?}: {error}", error.kind()),
+            )
+        })
         .collect::<Vec<_>>();
-    messages.sort_unstable();
-    messages.dedup();
-    messages.truncate(8);
-    messages
+    notices.sort_unstable_by(|left, right| left.message().cmp(right.message()));
+    notices.dedup_by(|left, right| left.message() == right.message());
+    notices.truncate(8);
+    notices
 }
 
 const fn accepted(status: SubmitStatus) -> bool {
@@ -1467,7 +1487,7 @@ mod tests {
     use crate::host::LaunchContext;
     use crate::input::InputMode;
     use crate::intent::{Intent, PointerAction, View};
-    use crate::model::LoadingState;
+    use crate::model::{LoadingState, NoticeSeverity};
     use crate::project::ProjectIdentity;
     use crate::runtime::FilesRuntime;
     use crate::worker::{JobKind, WorkerRuntime};
@@ -2141,7 +2161,9 @@ esac
         };
         assert_eq!(conversations.conversations().len(), 2);
         assert!(source_errors.iter().any(|error| {
-            error.contains("metadata index is unavailable; using nonpersistent discovery")
+            error
+                .message()
+                .contains("metadata index is unavailable; using nonpersistent discovery")
         }));
     }
 
@@ -2217,11 +2239,11 @@ esac
             conversations.conversations()[0].session_reference().id(),
             "019b7ca9-8c88-7000-8003-000000000003"
         );
-        assert!(
-            source_errors
-                .iter()
-                .any(|error| { error.contains("pi: user home directory is unavailable") })
-        );
+        assert!(source_errors.iter().any(|error| {
+            error
+                .message()
+                .contains("pi: user home directory is unavailable")
+        }));
 
         let state = TempDir::new().expect("state");
         let cached_paths = ConversationPaths {
@@ -2260,7 +2282,7 @@ esac
         assert!(
             source_errors
                 .iter()
-                .all(|error| !error.contains("incompatible metadata index"))
+                .all(|error| !error.message().contains("incompatible metadata index"))
         );
 
         let base_config_dir = TempDir::new().expect("base config");
@@ -2560,7 +2582,7 @@ esac
                 .conversations()
                 .visible_errors()
                 .iter()
-                .any(|error| error.starts_with("Herdr:"))
+                .any(|error| error.message().starts_with("Herdr:"))
         );
         workers.shutdown();
     }
@@ -3001,7 +3023,7 @@ esac
                 .conversations()
                 .visible_errors()
                 .iter()
-                .any(|error| error.starts_with("Herdr:")),
+                .any(|error| error.message().starts_with("Herdr:")),
             "quiet sensor failures must not surface error notices"
         );
         assert!(
@@ -3052,5 +3074,37 @@ esac
             "manual refresh baseline must prevent a redundant sensor discovery"
         );
         workers.shutdown();
+    }
+
+    #[test]
+    fn source_error_severity_splits_parse_rejections_from_environmental_failures() {
+        use crate::conversations::sources::{ConversationSourceError, ConversationSourceErrorKind};
+
+        let id = |name: &str| SourceId::new(name).expect("static source ID is valid");
+        let errors = [
+            ConversationSourceError::new(
+                id("codex-cli"),
+                ConversationSourceErrorKind::UnsupportedFormat,
+                "malformed record",
+            ),
+            ConversationSourceError::new(
+                id("pi"),
+                ConversationSourceErrorKind::Io,
+                "store unreadable",
+            ),
+        ];
+
+        let notices = super::source_error_messages(&errors);
+        let severity_of = |prefix: &str| {
+            notices
+                .iter()
+                .find(|notice| notice.message().starts_with(prefix))
+                .map(|notice| notice.severity())
+        };
+        assert_eq!(
+            severity_of("UnsupportedFormat:"),
+            Some(NoticeSeverity::Quiet)
+        );
+        assert_eq!(severity_of("Io:"), Some(NoticeSeverity::Alert));
     }
 }

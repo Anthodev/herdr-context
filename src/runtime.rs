@@ -250,6 +250,7 @@ pub struct FilesRuntime {
     pane_input_notice: Option<String>,
     backend_notice: Option<String>,
     display_mode: DisplayMode,
+    show_ignored: bool,
     search: Option<FileSearchState>,
 }
 
@@ -367,10 +368,13 @@ impl FilesRuntime {
                 project.files_root().to_path_buf(),
                 vcs.workspace().root().to_path_buf(),
                 visibility,
+                files_config.show_ignored(),
             )?,
-            None => {
-                FilesModel::with_visibility_policy(project.files_root().to_path_buf(), visibility)?
-            }
+            None => FilesModel::with_visibility_policy(
+                project.files_root().to_path_buf(),
+                visibility,
+                files_config.show_ignored(),
+            )?,
         };
         model.load_directory(Path::new(""))?;
         if vcs.as_ref().and_then(VcsRefresh::jujutsu_mode) == Some(JujutsuMode::Passive) {
@@ -418,6 +422,7 @@ impl FilesRuntime {
                 "configured VCS backend was not found; showing the filesystem only".to_owned()
             }),
             display_mode,
+            show_ignored: files_config.show_ignored(),
             search: None,
         };
         runtime.rebuild_visible_rows();
@@ -476,16 +481,14 @@ impl FilesRuntime {
             .or(self.search_projection_notice.as_deref())
             .or(self.filesystem_notice.as_deref())
             .or(self.backend_notice.as_deref());
+        // Staleness alone is conveyed by the divider hint (`passive`); the
+        // footer is reserved for real failure/runtime notices.
         let notice = match (runtime_notice, self.model.failure_notice(), stale) {
             (Some(message), _, true) => Some(("Files / VCS stale", message)),
             (Some(message), _, false) => Some(("Files", message)),
             (None, Some(message), true) => Some(("VCS stale", message)),
             (None, Some(message), false) => Some(("VCS", message)),
-            (None, None, true) => Some((
-                "VCS stale",
-                "passive mode; working copy was not snapshotted",
-            )),
-            (None, None, false) => None,
+            (None, None, _) => None,
         };
         let search_display = self.search.as_ref().and_then(|search| {
             (search.editing || search.active()).then_some(FileSearchDisplay {
@@ -539,6 +542,7 @@ impl FilesRuntime {
                 self.model.diff_stats(),
                 self.focused_pane == FilesPane::Changed,
                 self.display_mode,
+                self.refresh_hint(),
                 Rect::new(area.x, self.changed_y.saturating_sub(1), area.width, 1),
                 buffer,
             );
@@ -572,6 +576,33 @@ impl FilesRuntime {
         }
     }
 
+    /// Right-aligned divider hint: whether VCS data refreshes on its own.
+    const fn refresh_hint(&self) -> Option<&'static str> {
+        match &self.vcs {
+            Some(VcsRefresh::Git { .. }) => Some(match self.refresh_policy.git() {
+                GitCadence::Adaptive { .. } => "live",
+                GitCadence::Manual => "manual",
+            }),
+            Some(VcsRefresh::Jujutsu { service, .. }) => Some(match service.mode() {
+                JujutsuMode::Passive => "passive",
+                JujutsuMode::Fresh => "manual",
+            }),
+            None => None,
+        }
+    }
+
+    /// Flips ignored-file visibility, preserving tree state, then re-enumerates.
+    fn toggle_ignored_files(&mut self, workers: &mut WorkerRuntime) -> bool {
+        self.show_ignored = !self.show_ignored;
+        let selected = self.model.tree().selection().map(Path::to_path_buf);
+        let mut tree = self.model.tree().with_show_ignored(self.show_ignored);
+        tree.sync_status_overlay_from(self.model.tree());
+        tree.restore_selection_from(selected.as_deref());
+        self.model.replace_tree(tree);
+        self.clear_search_query(false);
+        self.request_reload(workers)
+    }
+
     pub(crate) fn handle_intent(&mut self, intent: &Intent, workers: &mut WorkerRuntime) -> bool {
         match intent {
             Intent::SelectPrevious => self.move_focused_selection(-1),
@@ -582,6 +613,7 @@ impl FilesRuntime {
             Intent::CollapseOrAscend => self.collapse_or_ascend(),
             Intent::ToggleSelected => self.toggle_selected(workers),
             Intent::Refresh => self.request_reload(workers),
+            Intent::ToggleIgnoredFiles => self.toggle_ignored_files(workers),
             Intent::SwitchFilesPane => self.toggle_pane_focus(),
             Intent::BeginFileSearch => self.begin_search(workers),
             Intent::FileSearchInput(value) => self.append_search_query(value, workers),
@@ -2748,7 +2780,111 @@ mod tests {
         assert!(workers.try_recv().is_none(), "unexpected periodic result");
     }
 
+    #[test]
+    fn toggling_ignored_files_preserves_selection_and_round_trips() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join(".git")).expect("git marker");
+        fs::write(temp.path().join(".gitignore"), b"skip.txt\n").expect("gitignore");
+        fs::create_dir(temp.path().join("src")).expect("src");
+        fs::write(temp.path().join("src/main.rs"), []).expect("main");
+        fs::write(temp.path().join("kept.rs"), []).expect("kept");
+        fs::write(temp.path().join("skip.txt"), []).expect("skip");
+        fs::write(temp.path().join("config.toml"), "[vcs]\nbackend = \"jj\"\n").expect("config");
+        let context = LaunchContext::from_vars([(
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            format!(
+                r#"{{"workspace_id":"workspace","tab_id":"tab","pane_id":"pane","cwd":"{}"}}"#,
+                temp.path().display()
+            ),
+        )])
+        .expect("context");
+        // A missing jj workspace keeps the probe subprocess-free while the
+        // `.git` marker still enables the ignore matchers under test.
+        let config = PluginConfig::load_from_dir(temp.path()).into_config();
+        let mut runtime = FilesRuntime::bootstrap_with_config(&context, &config).expect("run");
+        let mut workers = workers();
+        runtime.start_background(&mut workers);
+        for _ in 0..4 {
+            if !runtime.has_pending_work() && !workers.has_pending_work() {
+                break;
+            }
+            runtime.complete_background(receive(&mut workers), &mut workers);
+        }
+        assert!(runtime.model.tree().node(Path::new("kept.rs")).is_some());
+        assert!(runtime.model.tree().node(Path::new("skip.txt")).is_none());
+        assert!(runtime.model.select(Path::new("src")));
+
+        assert!(runtime.handle_intent(&Intent::ToggleIgnoredFiles, &mut workers));
+        for _ in 0..6 {
+            if !runtime.has_pending_work() && !workers.has_pending_work() {
+                break;
+            }
+            runtime.complete_background(receive(&mut workers), &mut workers);
+        }
+        assert!(runtime.model.tree().node(Path::new("skip.txt")).is_some());
+        assert_eq!(runtime.model.tree().selection(), Some(Path::new("src")));
+
+        assert!(runtime.handle_intent(&Intent::ToggleIgnoredFiles, &mut workers));
+        for _ in 0..6 {
+            if !runtime.has_pending_work() && !workers.has_pending_work() {
+                break;
+            }
+            runtime.complete_background(receive(&mut workers), &mut workers);
+        }
+        assert!(runtime.model.tree().node(Path::new("skip.txt")).is_none());
+        assert_eq!(runtime.model.tree().selection(), Some(Path::new("src")));
+        workers.shutdown();
+    }
+
     #[cfg(unix)]
+    #[test]
+    fn passive_staleness_shows_only_as_the_divider_hint() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join(".jj/repo")).expect("repo marker");
+        fs::create_dir_all(temp.path().join(".jj/working_copy")).expect("working-copy marker");
+        fs::write(temp.path().join("visible"), []).expect("file");
+        let script = temp.path().join("fake-jj");
+        executable(&script, "#!/bin/sh\nexit 0\n");
+        let context = LaunchContext::from_vars([(
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            format!(
+                r#"{{"workspace_id":"workspace","tab_id":"tab","pane_id":"pane","cwd":"{}"}}"#,
+                temp.path().display()
+            ),
+        )])
+        .expect("context");
+        fs::write(
+            temp.path().join("config.toml"),
+            "[vcs]\njujutsu_mode = \"passive\"\npassive_jujutsu_interval_ms = 1000\n",
+        )
+        .expect("config");
+        let config = PluginConfig::load_from_dir(temp.path()).into_config();
+        let mut runtime = FilesRuntime::bootstrap_with_config(&context, &config).expect("runtime");
+        let Some(VcsRefresh::Jujutsu { service, .. }) = &mut runtime.vcs else {
+            panic!("Jujutsu backend");
+        };
+        *service = JjService::with_executable(script, JujutsuMode::Passive, Duration::from_secs(1));
+        let mut workers = workers();
+        runtime.start_background(&mut workers);
+        for _ in 0..4 {
+            if !runtime.has_pending_work() && !workers.has_pending_work() {
+                break;
+            }
+            runtime.complete_background(receive(&mut workers), &mut workers);
+        }
+
+        assert!(runtime.model.status_is_stale());
+        assert!(runtime.model.failure_notice().is_none());
+
+        let area = Rect::new(0, 0, 64, 6);
+        let mut buffer = Buffer::empty(area);
+        runtime.render(area, &mut buffer);
+        let lines = rendered_lines(&buffer, area);
+        // Staleness is carried by the divider vocabulary alone: no footer row.
+        assert!(lines.iter().all(|line| !line.contains("VCS passive")));
+        assert!(lines.iter().any(|line| line.ends_with("passive")));
+    }
+
     #[test]
     fn failed_passive_jujutsu_refresh_preserves_files_and_stale_notice() {
         let temp = TempDir::new().expect("tempdir");
