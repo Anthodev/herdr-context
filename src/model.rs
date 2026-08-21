@@ -409,6 +409,7 @@ impl ConversationsViewState {
             | Intent::NextView
             | Intent::PreviousView
             | Intent::Refresh
+            | Intent::SwitchFilesPane
             | Intent::BeginFileSearch
             | Intent::FileSearchInput(_)
             | Intent::FileSearchBackspace

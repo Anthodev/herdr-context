@@ -16,12 +16,15 @@ use crate::files::search::{
     MAX_QUERY_BYTES, PreparedSearchPage, SearchPageRequest, SearchProjection, SearchablePaths,
     prepare_page, project,
 };
-use crate::files::tree::{DirectorySnapshot, FilesTree, TreeNodeKind};
+use crate::files::tree::{ChangedFile, DirectorySnapshot, FilesTree, TreeNodeKind};
 use crate::files::{FilesModel, PreparedRefreshResult};
 use crate::host::LaunchContext;
 use crate::intent::{Intent, PointerAction};
 use crate::project::resolve_project_context_with_backend;
-use crate::ui::files::{FileSearchDisplay, FilesView};
+use crate::ui::files::{
+    ChangedPane, FileSearchDisplay, FilesView, render_changed_divider, render_changed_pane,
+    render_notice,
+};
 use crate::vcs::git::GitService;
 use crate::vcs::jj::{JjService, JujutsuMode};
 use crate::vcs::{VcsBackendMetadata, VcsWorkspace};
@@ -64,6 +67,20 @@ impl VcsRefresh {
             }
             Self::Jujutsu { service, workspace } => {
                 service.refresh_status_cancellable(workspace, cancelled)
+            }
+        }
+    }
+
+    fn refresh_diff_stats_cancellable(
+        &self,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<Option<crate::vcs::VcsDiffStats>, crate::vcs::VcsError> {
+        match self {
+            Self::Git { service, workspace } => {
+                service.refresh_diff_stats_cancellable(workspace, cancelled)
+            }
+            Self::Jujutsu { service, workspace } => {
+                service.refresh_diff_stats_cancellable(workspace, cancelled)
             }
         }
     }
@@ -189,6 +206,13 @@ impl FileSearchState {
     }
 }
 
+/// Focused region of the split Files view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FilesPane {
+    Tree,
+    Changed,
+}
+
 /// Fully connected Files surface. Filesystem and VCS work is dispatched separately.
 #[derive(Debug)]
 pub struct FilesRuntime {
@@ -206,6 +230,12 @@ pub struct FilesRuntime {
     viewport_offset: usize,
     viewport_height: usize,
     viewport_y: u16,
+    focused_pane: FilesPane,
+    changed_selected: Option<PathBuf>,
+    changed_offset: usize,
+    changed_y: u16,
+    changed_height: usize,
+    status_seen: bool,
     filesystem_generation: u64,
     filesystem_applied_generation: u64,
     filesystem_running: Option<u64>,
@@ -366,6 +396,12 @@ impl FilesRuntime {
             viewport_offset: 0,
             viewport_height: usize::MAX,
             viewport_y: 0,
+            focused_pane: FilesPane::Tree,
+            changed_selected: None,
+            changed_offset: 0,
+            changed_y: 0,
+            changed_height: 0,
+            status_seen: false,
             filesystem_generation: 0,
             filesystem_applied_generation: 0,
             filesystem_running: None,
@@ -401,11 +437,32 @@ impl FilesRuntime {
             .is_some_and(|search| search.editing || search.active());
         let notice_height = usize::from(has_notice);
         let search_height = usize::from(search_visible);
-        self.viewport_y = area.y.saturating_add(search_height as u16);
-        self.viewport_height = usize::from(area.height)
+        let content_height = usize::from(area.height)
             .saturating_sub(search_height)
             .saturating_sub(notice_height);
+        let divider_height = if search_visible {
+            0
+        } else {
+            usize::from(content_height >= 3)
+        };
+        let split_height = content_height.saturating_sub(divider_height);
+        let changed_height = if divider_height == 0 {
+            0
+        } else {
+            split_height / 2
+        };
+        let tree_height = split_height.saturating_sub(changed_height);
+        self.viewport_y = area.y.saturating_add(search_height as u16);
+        self.viewport_height = tree_height;
+        self.changed_y = self
+            .viewport_y
+            .saturating_add(tree_height as u16)
+            .saturating_add(divider_height as u16);
+        self.changed_height = changed_height;
         self.ensure_selection_visible();
+        if changed_height != 0 {
+            self.ensure_changed_selection_visible();
+        }
         let end = self
             .viewport_offset
             .saturating_add(self.viewport_height)
@@ -460,27 +517,72 @@ impl FilesRuntime {
                     )
                 },
             );
-        let mut view = FilesView::new(tree, rows, selected, notice)
+        let mut view = FilesView::new(tree, rows, selected, None)
             .with_expanded(expanded)
             .with_display_mode(self.display_mode);
         if let Some(search) = search_display {
             view = view.with_search(search);
         }
-        view.render(area, buffer);
+        view.render(
+            Rect::new(
+                area.x,
+                area.y,
+                area.width,
+                (search_height + tree_height) as u16,
+            ),
+            buffer,
+        );
+        if changed_height != 0 {
+            let files = self.model.tree().changed_files();
+            render_changed_divider(
+                files.len(),
+                self.model.diff_stats(),
+                self.focused_pane == FilesPane::Changed,
+                self.display_mode,
+                Rect::new(area.x, self.changed_y.saturating_sub(1), area.width, 1),
+                buffer,
+            );
+            let offset = self.changed_offset.min(files.len());
+            let end = offset.saturating_add(changed_height).min(files.len());
+            let selected = (self.focused_pane == FilesPane::Changed)
+                .then_some(self.changed_selected.as_deref())
+                .flatten();
+            render_changed_pane(
+                ChangedPane {
+                    rows: &files[offset..end],
+                    selected,
+                    empty_message: Some(self.changed_empty_message()),
+                },
+                Rect::new(area.x, self.changed_y, area.width, changed_height as u16),
+                buffer,
+            );
+        }
+        if let Some((label, message)) = notice {
+            render_notice(
+                label,
+                message,
+                Rect::new(
+                    area.x,
+                    area.y.saturating_add(area.height.saturating_sub(1)),
+                    area.width,
+                    1,
+                ),
+                buffer,
+            );
+        }
     }
 
     pub(crate) fn handle_intent(&mut self, intent: &Intent, workers: &mut WorkerRuntime) -> bool {
         match intent {
-            Intent::SelectPrevious => self.move_selection(-1),
-            Intent::SelectNext => self.move_selection(1),
-            Intent::SelectFirst => self.select_navigable_index(0),
-            Intent::SelectLast => {
-                self.select_navigable_index(self.navigable_len().saturating_sub(1))
-            }
+            Intent::SelectPrevious => self.move_focused_selection(-1),
+            Intent::SelectNext => self.move_focused_selection(1),
+            Intent::SelectFirst => self.select_focused_index(0),
+            Intent::SelectLast => self.select_focused_last(),
             Intent::ExpandOrDescend => self.expand_or_descend(workers),
             Intent::CollapseOrAscend => self.collapse_or_ascend(),
             Intent::ToggleSelected => self.toggle_selected(workers),
             Intent::Refresh => self.request_reload(workers),
+            Intent::SwitchFilesPane => self.toggle_pane_focus(),
             Intent::BeginFileSearch => self.begin_search(workers),
             Intent::FileSearchInput(value) => self.append_search_query(value, workers),
             Intent::FileSearchBackspace => self.backspace_search_query(workers),
@@ -491,7 +593,7 @@ impl FilesRuntime {
                 PointerAction::Select => self.select_viewport_row(*row),
                 PointerAction::Toggle => self.toggle_viewport_row(*row, workers),
             },
-            Intent::Scroll(delta) => self.move_selection(isize::from(*delta)),
+            Intent::Scroll(delta) => self.move_focused_selection(isize::from(*delta)),
             Intent::Resize => true,
             Intent::Quit | Intent::SwitchView(_) | Intent::NextView | Intent::PreviousView => false,
         }
@@ -519,6 +621,7 @@ impl FilesRuntime {
     }
 
     fn begin_search(&mut self, workers: &mut WorkerRuntime) -> bool {
+        self.focused_pane = FilesPane::Tree;
         self.search_page_notice = None;
         self.search_projection_notice = None;
         let changed = if let Some(search) = &mut self.search {
@@ -627,6 +730,9 @@ impl FilesRuntime {
     }
 
     pub(crate) fn selected_file_reference(&self) -> Option<Result<String, &'static str>> {
+        if self.focused_pane == FilesPane::Changed {
+            return self.changed_file_reference();
+        }
         let tree = self.active_tree();
         let path = tree.selection()?;
         let node = tree.node(path)?;
@@ -734,7 +840,11 @@ impl FilesRuntime {
     }
 
     fn select_viewport_row(&mut self, terminal_row: u16) -> bool {
-        let Some(index) = self.viewport_index(terminal_row) else {
+        if let Some(index) = self.changed_row_index(terminal_row) {
+            self.focused_pane = FilesPane::Changed;
+            return self.select_changed_index(index);
+        }
+        let Some(index) = self.tree_viewport_index(terminal_row) else {
             return false;
         };
         let Some(path) = self.visible_rows.get(index).cloned() else {
@@ -743,11 +853,15 @@ impl FilesRuntime {
         if !self.path_is_navigable(&path) {
             return false;
         }
+        self.focused_pane = FilesPane::Tree;
         self.select_path(&path)
     }
 
     fn toggle_viewport_row(&mut self, terminal_row: u16, workers: &mut WorkerRuntime) -> bool {
-        let Some(index) = self.viewport_index(terminal_row) else {
+        if self.changed_row_index(terminal_row).is_some() {
+            return false;
+        }
+        let Some(index) = self.tree_viewport_index(terminal_row) else {
             return false;
         };
         let Some(path) = self.visible_rows.get(index).cloned() else {
@@ -760,7 +874,7 @@ impl FilesRuntime {
         self.toggle_selected(workers) || selection_changed
     }
 
-    fn viewport_index(&self, terminal_row: u16) -> Option<usize> {
+    fn tree_viewport_index(&self, terminal_row: u16) -> Option<usize> {
         let row = terminal_row.checked_sub(self.viewport_y).map(usize::from)?;
         if row >= self.viewport_height {
             return None;
@@ -769,7 +883,22 @@ impl FilesRuntime {
         (index < self.visible_rows.len()).then_some(index)
     }
 
+    fn changed_row_index(&self, terminal_row: u16) -> Option<usize> {
+        if self.changed_height == 0 {
+            return None;
+        }
+        let row = usize::from(terminal_row.checked_sub(self.changed_y)?);
+        if row >= self.changed_height {
+            return None;
+        }
+        let index = self.changed_offset.saturating_add(row);
+        (index < self.model.tree().changed_files().len()).then_some(index)
+    }
+
     fn expand_or_descend(&mut self, workers: &mut WorkerRuntime) -> bool {
+        if self.focused_pane == FilesPane::Changed {
+            return false;
+        }
         if self.has_search_filter() {
             return false;
         }
@@ -796,6 +925,9 @@ impl FilesRuntime {
     }
 
     fn toggle_selected(&mut self, workers: &mut WorkerRuntime) -> bool {
+        if self.focused_pane == FilesPane::Changed {
+            return false;
+        }
         if self.has_search_filter() {
             return false;
         }
@@ -816,6 +948,9 @@ impl FilesRuntime {
     }
 
     fn collapse_or_ascend(&mut self) -> bool {
+        if self.focused_pane == FilesPane::Changed {
+            return false;
+        }
         if self.has_search_filter() {
             return false;
         }
@@ -1317,8 +1452,9 @@ impl FilesRuntime {
         let key = JobKey::new(JobKind::Vcs, vcs.workspace().root());
         let job = Job::new(key, generation, Priority::High, move |cancelled| {
             let snapshot = vcs.refresh_status_cancellable(cancelled);
+            let diff_stats = vcs.refresh_diff_stats_cancellable(cancelled).ok().flatten();
             Box::new(RuntimeMessage::Vcs(PreparedRefreshResult::prepare(
-                generation, input, snapshot,
+                generation, input, snapshot, diff_stats,
             )))
         });
         if !matches!(
@@ -1349,6 +1485,8 @@ impl FilesRuntime {
         let changed = self.model.complete_prepared_refresh(result);
         self.schedule_next_status_refresh(now, fingerprint, changed);
         if changed {
+            self.status_seen = true;
+            self.restore_changed_selection();
             if let Some(search) = &mut self.search {
                 search.index.sync_status_overlay_from(self.model.tree());
                 search.sync_virtual_entries();
@@ -1481,6 +1619,159 @@ impl FilesRuntime {
         self.viewport_offset = self
             .viewport_offset
             .min(self.visible_rows.len().saturating_sub(1));
+    }
+
+    fn toggle_pane_focus(&mut self) -> bool {
+        if self.search_editing() || self.has_search_filter() || self.changed_height == 0 {
+            return false;
+        }
+        self.focused_pane = match self.focused_pane {
+            FilesPane::Tree => FilesPane::Changed,
+            FilesPane::Changed => FilesPane::Tree,
+        };
+        true
+    }
+
+    fn move_focused_selection(&mut self, delta: isize) -> bool {
+        match self.focused_pane {
+            FilesPane::Tree => self.move_selection(delta),
+            FilesPane::Changed => self.move_changed_selection(delta),
+        }
+    }
+
+    fn select_focused_index(&mut self, index: usize) -> bool {
+        match self.focused_pane {
+            FilesPane::Tree => self.select_navigable_index(index),
+            FilesPane::Changed => self.select_changed_index(index),
+        }
+    }
+
+    fn select_focused_last(&mut self) -> bool {
+        match self.focused_pane {
+            FilesPane::Tree => self.select_navigable_index(self.navigable_len().saturating_sub(1)),
+            FilesPane::Changed => {
+                self.select_changed_index(self.model.tree().changed_files().len().saturating_sub(1))
+            }
+        }
+    }
+
+    fn changed_path_at(&self, index: usize) -> Option<&Path> {
+        self.model
+            .tree()
+            .changed_files()
+            .get(index)
+            .map(ChangedFile::path)
+    }
+
+    fn select_changed_index(&mut self, index: usize) -> bool {
+        let Some(path) = self.changed_path_at(index) else {
+            return false;
+        };
+        if self.changed_selected.as_deref() == Some(path) {
+            return false;
+        }
+        self.changed_selected = Some(path.to_path_buf());
+        self.ensure_changed_selection_visible();
+        true
+    }
+
+    fn move_changed_selection(&mut self, delta: isize) -> bool {
+        let files = self.model.tree().changed_files();
+        let Some(current) = self.changed_selected.as_ref().and_then(|selected| {
+            files
+                .iter()
+                .position(|file| file.path() == selected.as_path())
+        }) else {
+            return self.select_changed_index(0);
+        };
+        let last = files.len().saturating_sub(1);
+        let next = if delta.is_negative() {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current.saturating_add(delta as usize).min(last)
+        };
+        self.select_changed_index(next)
+    }
+
+    fn ensure_changed_selection_visible(&mut self) {
+        let Some(selected) = self.changed_selected.clone() else {
+            self.changed_offset = 0;
+            return;
+        };
+        let files = self.model.tree().changed_files();
+        let Some(index) = files
+            .iter()
+            .position(|file| file.path() == selected.as_path())
+        else {
+            self.changed_offset = 0;
+            return;
+        };
+        if index < self.changed_offset {
+            self.changed_offset = index;
+        } else if self.changed_height != 0
+            && index >= self.changed_offset.saturating_add(self.changed_height)
+        {
+            self.changed_offset = index.saturating_add(1).saturating_sub(self.changed_height);
+        }
+        self.changed_offset = self.changed_offset.min(files.len().saturating_sub(1));
+    }
+
+    fn restore_changed_selection(&mut self) {
+        let files = self.model.tree().changed_files();
+        let selected = self.changed_selected.take();
+        let kept = selected
+            .as_ref()
+            .filter(|selected| files.iter().any(|file| file.path() == selected.as_path()));
+        self.changed_selected = kept
+            .cloned()
+            .or_else(|| files.first().map(|file| file.path().to_path_buf()));
+        self.ensure_changed_selection_visible();
+    }
+
+    fn changed_empty_message(&self) -> &'static str {
+        if self.vcs.is_none()
+            || self.backend_notice.is_some()
+            || self.model.failure_notice().is_some()
+            || self.model.status_is_stale()
+        {
+            "VCS status unavailable"
+        } else if self.status_seen {
+            "No modified files"
+        } else {
+            "Loading VCS status…"
+        }
+    }
+
+    fn changed_file_reference(&self) -> Option<Result<String, &'static str>> {
+        let path = self.changed_selected.as_ref()?;
+        let file = self
+            .model
+            .tree()
+            .changed_files()
+            .iter()
+            .find(|file| file.path() == path.as_path())?;
+        if file.is_missing() {
+            return Some(Err("modified file is missing"));
+        }
+        match std::fs::symlink_metadata(self.root.join(path)) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Some(Err("selected path is not a regular file")),
+            Err(_) => return Some(Err("modified file is missing")),
+        }
+        let Some(relative) = path.to_str() else {
+            return Some(Err("selected file path is not valid UTF-8"));
+        };
+        if relative.is_empty()
+            || relative.len().saturating_add(2) > MAX_FILE_REFERENCE_BYTES
+            || relative.chars().any(char::is_control)
+        {
+            return Some(Err("selected file path cannot be inserted safely"));
+        }
+        let mut reference = String::with_capacity(relative.len().saturating_add(2));
+        reference.push('@');
+        reference.push_str(relative);
+        reference.push(' ');
+        Some(Ok(reference))
     }
 
     pub(crate) fn has_pending_work(&self) -> bool {
@@ -1750,14 +2041,16 @@ mod tests {
     use ratatui::layout::Rect;
     use tempfile::TempDir;
 
-    use super::{FileSearchState, FilesRuntime, RuntimeMessage, VcsRefresh};
+    use super::{FileSearchState, FilesPane, FilesRuntime, RuntimeMessage, VcsRefresh};
     use crate::config::{DisplayMode, GitCadence, PluginConfig};
+    use crate::files::PreparedRefreshResult;
     use crate::host::LaunchContext;
-    use crate::intent::Intent;
+    use crate::intent::{Intent, PointerAction};
     use crate::vcs::git::GitService;
     use crate::vcs::jj::{JjService, JujutsuMode};
     use crate::vcs::{
-        VcsBackendMetadata, VcsEntryStatus, VcsStatusKind, VcsStatusSnapshot, VcsWorkspace,
+        VcsBackendMetadata, VcsDiffStats, VcsEntryStatus, VcsStatusKind, VcsStatusSnapshot,
+        VcsWorkspace,
     };
     use crate::worker::WorkerRuntime;
 
@@ -2034,7 +2327,7 @@ mod tests {
         let mut runtime = runtime(&temp);
 
         let mut workers = workers();
-        let area = Rect::new(0, 0, 20, 2);
+        let area = Rect::new(0, 0, 20, 4);
         runtime.render(area, &mut Buffer::empty(area));
 
         runtime.handle_event(
@@ -2130,7 +2423,7 @@ mod tests {
         }
         let mut runtime = runtime(&temp);
         let mut workers = workers();
-        let area = Rect::new(0, 0, 10, 2);
+        let area = Rect::new(0, 0, 10, 4);
         let mut buffer = Buffer::empty(area);
         runtime.render(area, &mut buffer);
 
@@ -2360,6 +2653,7 @@ mod tests {
             generation,
             input,
             Ok(VcsStatusSnapshot::new(Vec::new(), false)),
+            None,
         );
 
         assert!(!runtime.model.complete_prepared_refresh(old_result));
@@ -2417,7 +2711,7 @@ mod tests {
             .lines()
             .count();
         assert!(
-            (1..=2).contains(&activation_calls),
+            (2..=4).contains(&activation_calls),
             "activation scheduled {activation_calls} Jujutsu commands"
         );
         assert!(!runtime.has_pending_work());
@@ -2435,7 +2729,7 @@ mod tests {
             .lines()
             .count();
         assert!(
-            (1..=2).contains(&calls_after_refresh.saturating_sub(activation_calls)),
+            (2..=4).contains(&calls_after_refresh.saturating_sub(activation_calls)),
             "manual refresh scheduled {} Jujutsu commands",
             calls_after_refresh.saturating_sub(activation_calls)
         );
@@ -2711,6 +3005,303 @@ mod tests {
             search.pending_directories.front().map(PathBuf::as_path),
             Some(Path::new(""))
         );
+        workers.shutdown();
+    }
+
+    fn changed_entry(path: &str, kind: VcsStatusKind) -> VcsEntryStatus {
+        VcsEntryStatus::new(PathBuf::from(path), None, kind, None, None).expect("status entry")
+    }
+
+    fn complete_status(
+        runtime: &mut FilesRuntime,
+        workers: &mut WorkerRuntime,
+        entries: Vec<VcsEntryStatus>,
+    ) {
+        let _ = runtime.model.request_refresh();
+        let generation = runtime.model.begin_refresh().expect("refresh began");
+        let input = runtime.model.status_merge_input();
+        let prepared = PreparedRefreshResult::prepare(
+            generation,
+            input,
+            Ok(VcsStatusSnapshot::new(entries, false)),
+            Some(VcsDiffStats::new(2, 1)),
+        );
+        runtime.complete_vcs_refresh_at(prepared, workers, Instant::now());
+    }
+
+    fn rendered_lines(buffer: &Buffer, area: Rect) -> Vec<String> {
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn renders_split_tree_and_flat_changed_panes() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join("src")).expect("src");
+        fs::write(temp.path().join("src/kept.rs"), []).expect("kept");
+        fs::write(temp.path().join("fresh.rs"), []).expect("fresh");
+        let mut runtime = runtime(&temp);
+        let mut workers = workers();
+        let area = Rect::new(0, 0, 24, 4);
+
+        runtime.render(area, &mut Buffer::empty(area));
+        let mut buffer = Buffer::empty(area);
+        runtime.render(area, &mut buffer);
+        assert!(rendered_lines(&buffer, area)[2].starts_with("- Changed (0)"));
+        assert!(rendered_lines(&buffer, area)[3].starts_with("VCS status unavailable"));
+
+        complete_status(
+            &mut runtime,
+            &mut workers,
+            vec![
+                changed_entry("fresh.rs", VcsStatusKind::Untracked),
+                changed_entry("gone.rs", VcsStatusKind::Deleted),
+                changed_entry("src/kept.rs", VcsStatusKind::Modified),
+            ],
+        );
+        let mut buffer = Buffer::empty(area);
+        runtime.render(area, &mut buffer);
+        let lines = rendered_lines(&buffer, area);
+        assert!(lines[0].contains("src"));
+        assert!(lines[1].contains("fresh.rs"));
+        assert!(lines[2].starts_with("- Changed +2 -1"));
+        assert!(lines[3].starts_with("? fresh.rs"));
+        // The flat pane is viewport-bounded: rows beyond the half stay hidden.
+        assert!(!lines.iter().any(|line| line.contains("kept.rs")));
+        workers.shutdown();
+    }
+
+    #[test]
+    fn focus_toggle_navigates_and_activates_the_changed_pane() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("fresh.rs"), []).expect("fresh");
+        let mut runtime = runtime(&temp);
+        let mut workers = workers();
+        complete_status(
+            &mut runtime,
+            &mut workers,
+            vec![
+                changed_entry("fresh.rs", VcsStatusKind::Untracked),
+                changed_entry("missing.rs", VcsStatusKind::Deleted),
+            ],
+        );
+        let area = Rect::new(0, 0, 24, 4);
+        runtime.render(area, &mut Buffer::empty(area));
+
+        assert!(runtime.handle_intent(&Intent::SwitchFilesPane, &mut workers));
+        assert_eq!(runtime.focused_pane, FilesPane::Changed);
+        assert!(runtime.handle_intent(&Intent::SelectLast, &mut workers));
+        assert_eq!(
+            runtime.changed_selected.as_deref(),
+            Some(Path::new("missing.rs"))
+        );
+        assert!(matches!(runtime.selected_file_reference(), Some(Err(_))));
+
+        assert!(runtime.handle_intent(&Intent::SelectFirst, &mut workers));
+        assert_eq!(
+            runtime.selected_file_reference(),
+            Some(Ok("@fresh.rs ".to_owned()))
+        );
+
+        // Tree navigation stays inert while the flat pane owns the focus.
+        let tree_selection = runtime.model.tree().selection().map(Path::to_path_buf);
+        assert!(!runtime.handle_intent(&Intent::ExpandOrDescend, &mut workers));
+        assert_eq!(
+            runtime.model.tree().selection().map(Path::to_path_buf),
+            tree_selection
+        );
+
+        // A missing row activation surfaces through the shared notice path.
+        assert!(runtime.handle_intent(&Intent::SelectLast, &mut workers));
+        if let Some(Err(message)) = runtime.selected_file_reference() {
+            assert!(runtime.set_pane_input_notice(Some(message.to_owned())));
+        }
+        let notice_area = Rect::new(0, 0, 40, 6);
+        let mut notice_buffer = Buffer::empty(notice_area);
+        runtime.render(notice_area, &mut notice_buffer);
+        let lines = rendered_lines(&notice_buffer, notice_area);
+        assert!(lines.last().is_some_and(|line| {
+            line.contains("Files") && line.contains("modified file is missing")
+        }));
+        workers.shutdown();
+    }
+
+    #[test]
+    fn clicks_select_within_the_clicked_pane() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join("src")).expect("src");
+        fs::write(temp.path().join("src/kept.rs"), []).expect("kept");
+        fs::write(temp.path().join("fresh.rs"), []).expect("fresh");
+        let mut runtime = runtime(&temp);
+        let mut workers = workers();
+        complete_status(
+            &mut runtime,
+            &mut workers,
+            vec![
+                changed_entry("fresh.rs", VcsStatusKind::Untracked),
+                changed_entry("src/kept.rs", VcsStatusKind::Modified),
+            ],
+        );
+        let area = Rect::new(0, 0, 24, 6);
+        runtime.render(area, &mut Buffer::empty(area));
+
+        assert!(runtime.handle_intent(
+            &Intent::Pointer {
+                column: 0,
+                row: 5,
+                action: PointerAction::Select,
+            },
+            &mut workers,
+        ));
+        assert_eq!(runtime.focused_pane, FilesPane::Changed);
+        assert_eq!(
+            runtime.selected_file_reference(),
+            Some(Ok("@src/kept.rs ".to_owned()))
+        );
+
+        // Clicking the divider row itself is a no-op.
+        assert!(!runtime.handle_intent(
+            &Intent::Pointer {
+                column: 0,
+                row: 3,
+                action: PointerAction::Select,
+            },
+            &mut workers,
+        ));
+
+        // Right-click has no toggle semantics in the flat pane.
+        assert!(!runtime.handle_intent(
+            &Intent::Pointer {
+                column: 0,
+                row: 5,
+                action: PointerAction::Toggle,
+            },
+            &mut workers,
+        ));
+
+        assert!(runtime.handle_intent(
+            &Intent::Pointer {
+                column: 0,
+                row: 1,
+                action: PointerAction::Select,
+            },
+            &mut workers,
+        ));
+        assert_eq!(runtime.focused_pane, FilesPane::Tree);
+        assert_eq!(
+            runtime.model.tree().selection(),
+            Some(Path::new("fresh.rs"))
+        );
+        assert_eq!(
+            runtime.selected_file_reference(),
+            Some(Ok("@fresh.rs ".to_owned()))
+        );
+        workers.shutdown();
+    }
+
+    #[test]
+    fn search_overlay_hides_the_changed_pane() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("fresh.rs"), []).expect("fresh");
+        let mut runtime = runtime(&temp);
+        let mut workers = workers();
+        complete_status(
+            &mut runtime,
+            &mut workers,
+            vec![changed_entry("fresh.rs", VcsStatusKind::Untracked)],
+        );
+        let area = Rect::new(0, 0, 24, 4);
+        runtime.render(area, &mut Buffer::empty(area));
+        assert!(runtime.handle_intent(&Intent::SwitchFilesPane, &mut workers));
+        runtime.handle_intent(&Intent::SelectLast, &mut workers);
+        assert_eq!(
+            runtime.changed_selected.as_deref(),
+            Some(Path::new("fresh.rs"))
+        );
+
+        assert!(runtime.handle_intent(&Intent::BeginFileSearch, &mut workers));
+        runtime.render(area, &mut Buffer::empty(area));
+        let mut buffer = Buffer::empty(area);
+        runtime.render(area, &mut buffer);
+        let lines = rendered_lines(&buffer, area);
+        assert!(lines[0].starts_with("Search > "));
+        assert!(lines[3].trim().is_empty());
+        assert!(!runtime.handle_intent(&Intent::SwitchFilesPane, &mut workers));
+
+        assert!(runtime.handle_intent(&Intent::FileSearchCancel, &mut workers));
+        runtime.render(area, &mut buffer);
+        assert!(rendered_lines(&buffer, area)[3].starts_with("? fresh.rs"));
+        workers.shutdown();
+    }
+
+    #[test]
+    fn tiny_terminals_keep_the_tree_priority() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("fresh.rs"), []).expect("fresh");
+        let mut runtime = runtime(&temp);
+        let mut workers = workers();
+        complete_status(
+            &mut runtime,
+            &mut workers,
+            vec![changed_entry("fresh.rs", VcsStatusKind::Untracked)],
+        );
+        let area = Rect::new(0, 0, 24, 1);
+        runtime.render(area, &mut Buffer::empty(area));
+
+        assert_eq!(runtime.changed_height, 0);
+        assert!(!runtime.handle_intent(&Intent::SwitchFilesPane, &mut workers));
+
+        // Two rows are still too small: the divider only appears with room
+        // for at least one tree row and one flat row.
+        let area = Rect::new(0, 0, 24, 2);
+        runtime.render(area, &mut Buffer::empty(area));
+        assert_eq!(runtime.changed_height, 0);
+        assert!(!runtime.handle_intent(&Intent::SwitchFilesPane, &mut workers));
+        workers.shutdown();
+    }
+
+    #[test]
+    fn changed_selection_follows_refreshes() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("fresh.rs"), []).expect("fresh");
+        let mut runtime = runtime(&temp);
+        let mut workers = workers();
+        complete_status(
+            &mut runtime,
+            &mut workers,
+            vec![
+                changed_entry("fresh.rs", VcsStatusKind::Untracked),
+                changed_entry("gone.rs", VcsStatusKind::Deleted),
+            ],
+        );
+        runtime.render(
+            Rect::new(0, 0, 24, 4),
+            &mut Buffer::empty(Rect::new(0, 0, 24, 4)),
+        );
+        assert!(runtime.handle_intent(&Intent::SwitchFilesPane, &mut workers));
+        assert!(runtime.handle_intent(&Intent::SelectLast, &mut workers));
+        assert_eq!(
+            runtime.changed_selected.as_deref(),
+            Some(Path::new("gone.rs"))
+        );
+
+        complete_status(
+            &mut runtime,
+            &mut workers,
+            vec![changed_entry("fresh.rs", VcsStatusKind::Untracked)],
+        );
+        assert_eq!(
+            runtime.changed_selected.as_deref(),
+            Some(Path::new("fresh.rs"))
+        );
+
+        complete_status(&mut runtime, &mut workers, Vec::new());
+        assert_eq!(runtime.changed_selected, None);
         workers.shutdown();
     }
 }

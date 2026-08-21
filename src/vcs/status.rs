@@ -119,6 +119,63 @@ impl VcsStatusSnapshot {
     }
 }
 
+/// Aggregate line-level totals of the workspace diff (tracked changes only).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VcsDiffStats {
+    insertions: u64,
+    deletions: u64,
+}
+
+impl VcsDiffStats {
+    #[must_use]
+    pub const fn new(insertions: u64, deletions: u64) -> Self {
+        Self {
+            insertions,
+            deletions,
+        }
+    }
+
+    #[must_use]
+    pub const fn insertions(&self) -> u64 {
+        self.insertions
+    }
+
+    #[must_use]
+    pub const fn deletions(&self) -> u64 {
+        self.deletions
+    }
+}
+
+/// Parses the git-style `--shortstat` summary line ("…, 2 insertions(+), 1
+/// deletion(-)"). Empty or whitespace-only output means "no changes" and maps
+/// to zeroed stats; non-empty output without a parsable summary is unknown.
+#[must_use]
+pub(crate) fn parse_shortstat_summary(output: &[u8]) -> Option<VcsDiffStats> {
+    let text = String::from_utf8_lossy(output);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Some(VcsDiffStats::new(0, 0));
+    }
+    let summary = trimmed
+        .lines()
+        .rev()
+        .find(|line| line.contains("changed"))?;
+    let insertions = number_before(summary, "insertion").unwrap_or(0);
+    let deletions = number_before(summary, "deletion").unwrap_or(0);
+    Some(VcsDiffStats::new(insertions, deletions))
+}
+
+fn number_before(text: &str, marker: &str) -> Option<u64> {
+    let end = text.find(marker)?;
+    let prefix = text[..end].trim_end();
+    let start = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, character)| !character.is_ascii_digit())
+        .map_or(0, |(index, _)| index + 1);
+    prefix.get(start..)?.parse().ok()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VcsEntryStatusError {
     EmptyPath(&'static str),
@@ -150,7 +207,9 @@ impl Error for VcsEntryStatusError {}
 mod tests {
     use std::path::PathBuf;
 
-    use super::{VcsEntryStatus, VcsEntryStatusError, VcsStatusKind};
+    use super::{
+        VcsDiffStats, VcsEntryStatus, VcsEntryStatusError, VcsStatusKind, parse_shortstat_summary,
+    };
 
     #[test]
     fn accepts_normalized_relative_entry() -> Result<(), Box<dyn std::error::Error>> {
@@ -207,7 +266,31 @@ mod tests {
             Some(VcsStatusKind::Modified),
         )
         .expect("normalized status");
-
         assert_eq!(status.path(), PathBuf::from("src/lib.rs"));
+    }
+
+    #[test]
+    fn parses_git_style_shortstat_summaries() {
+        assert_eq!(parse_shortstat_summary(b""), Some(VcsDiffStats::new(0, 0)));
+        assert_eq!(
+            parse_shortstat_summary(b"\n"),
+            Some(VcsDiffStats::new(0, 0))
+        );
+        assert_eq!(
+            parse_shortstat_summary(b" 3 files changed, 12 insertions(+), 4 deletions(-)\n"),
+            Some(VcsDiffStats::new(12, 4))
+        );
+        assert_eq!(
+            parse_shortstat_summary(b" 1 file changed, 1 insertion(+)\n"),
+            Some(VcsDiffStats::new(1, 0))
+        );
+        // The jj diffstat body precedes the same summary line.
+        assert_eq!(
+            parse_shortstat_summary(
+                b" src/main.rs | 10 ++++++---\n 1 file changed, 7 insertions(+), 3 deletions(-)\n"
+            ),
+            Some(VcsDiffStats::new(7, 3))
+        );
+        assert_eq!(parse_shortstat_summary(b"garbage"), None);
     }
 }

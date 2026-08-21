@@ -378,11 +378,12 @@ pub enum KeyAction {
     Collapse,
     Toggle,
     Refresh,
+    ToggleFilesFocus,
     Search,
 }
 
 impl KeyAction {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::Quit,
         Self::NextView,
         Self::PreviousView,
@@ -396,6 +397,7 @@ impl KeyAction {
         Self::Collapse,
         Self::Toggle,
         Self::Refresh,
+        Self::ToggleFilesFocus,
         Self::Search,
     ];
 
@@ -414,6 +416,7 @@ impl KeyAction {
             Self::Collapse => "collapse",
             Self::Toggle => "toggle",
             Self::Refresh => "refresh",
+            Self::ToggleFilesFocus => "toggle_files_focus",
             Self::Search => "search",
         }
     }
@@ -433,6 +436,7 @@ impl KeyAction {
             Self::Collapse => Intent::CollapseOrAscend,
             Self::Toggle => Intent::ToggleSelected,
             Self::Refresh => Intent::Refresh,
+            Self::ToggleFilesFocus => Intent::SwitchFilesPane,
             Self::Search => Intent::BeginFileSearch,
         }
     }
@@ -487,6 +491,7 @@ impl Default for KeyBindings {
             (KeyAction::Collapse, &["left", "h"]),
             (KeyAction::Toggle, &["enter", "space"]),
             (KeyAction::Refresh, &["r"]),
+            (KeyAction::ToggleFilesFocus, &["w"]),
             (KeyAction::Search, &["/"]),
         ];
         Self {
