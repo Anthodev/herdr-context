@@ -1,62 +1,26 @@
 #!/usr/bin/env python3
+"""Validate the herdr-context release contracts.
+
+The plugin installs from source through `herdr plugin install`; a pushed
+`v*` tag runs these checks and publishes generated release notes without
+attaching any packaged assets.
+"""
 from __future__ import annotations
 
 import argparse
-import gzip
 import hashlib
-import io
 import json
-import os
 from pathlib import Path
 import re
-import shutil
-import subprocess
 import sys
-import tarfile
-import tempfile
 import tomllib
 from typing import Any, NamedTuple
 
 
 PLUGIN_ID = "herdr-context"
 MIN_HERDR_VERSION = "0.8.0"
-SUPPORTED_TARGETS = {
-    "x86_64-unknown-linux-gnu": "linux",
-    "aarch64-unknown-linux-gnu": "linux",
-    "x86_64-apple-darwin": "macos",
-    "aarch64-apple-darwin": "macos",
-}
-PACKAGE_FILES = (
-    "LICENSE",
-    "README.md",
-    "herdr-context",
-    "herdr-plugin.toml",
-    "install.sh",
-    "uninstall.sh",
-)
-EXECUTABLE_FILES = {"herdr-context", "install.sh", "uninstall.sh"}
-MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
-MAX_PACKAGE_MEMBER_BYTES = {
-    "LICENSE": 1024 * 1024,
-    "README.md": 2 * 1024 * 1024,
-    "herdr-context": 128 * 1024 * 1024,
-    "herdr-plugin.toml": 1024 * 1024,
-    "install.sh": 1024 * 1024,
-    "uninstall.sh": 1024 * 1024,
-}
-MAX_UNCOMPRESSED_BYTES = sum(MAX_PACKAGE_MEMBER_BYTES.values())
 VERSION_PATTERN = re.compile(
     r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z"
-)
-ARCHIVE_ROOT_PATTERN = re.compile(
-    r"herdr-context-v(?P<version>[0-9]+\.[0-9]+\.[0-9]+)-"
-    r"(?P<target>[A-Za-z0-9_.-]+)\Z"
-)
-SENSITIVE_MARKERS = (
-    b"BEGIN OPENSSH PRIVATE KEY",
-    b"BEGIN RSA PRIVATE KEY",
-    b"AWS_SECRET_ACCESS_KEY=",
-    b"GITHUB_TOKEN=",
 )
 
 
@@ -66,17 +30,8 @@ class ReleaseError(RuntimeError):
 
 class ReleaseContract(NamedTuple):
     version: str
-    binary_name: str
     min_herdr_version: str
     performance_metrics: tuple[str, ...]
-    manifest: dict[str, Any]
-
-
-class ArchiveMetadata(NamedTuple):
-    archive_root: str
-    version: str
-    target: str
-    members: tuple[str, ...]
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -101,13 +56,6 @@ def _required_table(table: dict[str, Any], key: str, context: str) -> dict[str, 
     value = table.get(key)
     if not isinstance(value, dict):
         raise ReleaseError(f"{context}.{key} must be a table")
-    return value
-
-
-def _required_tables(table: dict[str, Any], key: str, context: str) -> list[dict[str, Any]]:
-    value = table.get(key)
-    if not isinstance(value, list) or not value or not all(isinstance(item, dict) for item in value):
-        raise ReleaseError(f"{context}.{key} must be a non-empty array of tables")
     return value
 
 
@@ -208,7 +156,7 @@ def validate_performance_review(
 def validate_repository(root: Path) -> ReleaseContract:
     root = root.resolve()
     cargo = _load_toml(root / "Cargo.toml")
-    package = _required_table(cargo, "package", "Cargo.toml")
+    package = _required_table(cargo, "package", "Cargo.toml.package")
     package_name = _required_string(package, "name", "Cargo.toml.package")
     version = _required_string(package, "version", "Cargo.toml.package")
     if package_name != PLUGIN_ID:
@@ -245,7 +193,7 @@ def validate_repository(root: Path) -> ReleaseContract:
     if manifest.get("panes") != [
         {
             "id": "dock",
-            "title": "herdr-context dock",
+            "title": "herdr-context",
             "placement": "split",
             "command": ["./target/release/herdr-context", "dock"],
         }
@@ -263,16 +211,12 @@ def validate_repository(root: Path) -> ReleaseContract:
 
     try:
         readme = (root / "README.md").read_text(encoding="utf-8")
-        release_workflow = (root / ".github" / "workflows" / "release.yml").read_text(
-            encoding="utf-8"
-        )
     except (OSError, UnicodeDecodeError) as error:
-        raise ReleaseError(f"cannot read release documentation or workflow: {error}") from error
+        raise ReleaseError(f"cannot read release documentation: {error}") from error
     documented = (
         f"Version `{version}`",
         f"`v{version}`",
         f"Herdr `{MIN_HERDR_VERSION}`",
-        *SUPPORTED_TARGETS,
     )
     missing_documentation = [
         snippet for snippet in documented if snippet not in readme
@@ -281,11 +225,6 @@ def validate_repository(root: Path) -> ReleaseContract:
         raise ReleaseError(
             f"README release metadata is incomplete: {missing_documentation}"
         )
-    missing_matrix = [
-        target for target in SUPPORTED_TARGETS if target not in release_workflow
-    ]
-    if missing_matrix:
-        raise ReleaseError(f"release workflow target matrix is incomplete: {missing_matrix}")
 
     review_path = root / "release" / "performance-review.toml"
     review = _load_toml(review_path)
@@ -308,10 +247,8 @@ def validate_repository(root: Path) -> ReleaseContract:
     )
     return ReleaseContract(
         version=version,
-        binary_name=package_name,
         min_herdr_version=min_herdr_version,
         performance_metrics=performance_metrics,
-        manifest=manifest,
     )
 
 
@@ -321,279 +258,27 @@ def validate_trigger_tag(contract: ReleaseContract, tag: str) -> None:
         raise ReleaseError(f"release tag must be exactly {expected}; got {tag!r}")
 
 
-def _toml_string(value: str) -> str:
-    return json.dumps(value, ensure_ascii=True)
-
-
-def _toml_array(values: list[str]) -> str:
-    return "[" + ", ".join(_toml_string(value) for value in values) + "]"
-
-
-def render_binary_manifest(contract: ReleaseContract) -> bytes:
-    source = contract.manifest
-    description = _required_string(source, "description", "manifest")
-    pane = source["panes"][0]
-    action = source["actions"][0]
-    text = "\n".join(
-        (
-            f'id = {_toml_string(PLUGIN_ID)}',
-            f'name = {_toml_string(PLUGIN_ID)}',
-            f'version = {_toml_string(contract.version)}',
-            f'min_herdr_version = {_toml_string(contract.min_herdr_version)}',
-            f'description = {_toml_string(description)}',
-            'platforms = ["linux", "macos"]',
-            "",
-            "[[panes]]",
-            f'id = {_toml_string(pane["id"])}',
-            f'title = {_toml_string(pane["title"])}',
-            f'placement = {_toml_string(pane["placement"])}',
-            'command = ["./herdr-context", "dock"]',
-            "",
-            "[[actions]]",
-            f'id = {_toml_string(action["id"])}',
-            f'title = {_toml_string(action["title"])}',
-            f'contexts = {_toml_array(action["contexts"])}',
-            'command = ["./herdr-context", "toggle"]',
-            "",
-        )
-    )
-    rendered = text.encode()
-    parsed = tomllib.loads(text)
-    if "build" in parsed or parsed["panes"][0]["command"][0] != "./herdr-context":
-        raise ReleaseError("generated binary manifest is invalid")
-    return rendered
-
-
-def _run_git(root: Path, arguments: list[str]) -> str:
-    try:
-        completed = subprocess.run(
-            ["git", *arguments],
-            cwd=root,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as error:
-        raise ReleaseError(f"cannot inspect release Git state: {error}") from error
-    return completed.stdout.strip()
-
-
-def validate_tagged_source(root: Path, version: str) -> None:
-    dirty = _run_git(root, ["status", "--porcelain", "--untracked-files=all"])
-    if dirty:
-        raise ReleaseError("release source is dirty")
-    expected_tag = f"v{version}"
-    tags = set(_run_git(root, ["tag", "--points-at", "HEAD"]).splitlines())
-    if expected_tag not in tags:
-        raise ReleaseError(f"release source must be tagged {expected_tag}")
-
-
-def _safe_source_file(path: Path, context: str) -> bytes:
-    if path.is_symlink() or not path.is_file():
-        raise ReleaseError(f"{context} must be a regular file: {path}")
-    try:
-        return path.read_bytes()
-    except OSError as error:
-        raise ReleaseError(f"cannot read {context} {path}: {error}") from error
-
-
-def _scan_package_content(content: dict[str, bytes], root: Path) -> None:
-    forbidden_paths = {str(root.resolve()).encode(), str(Path.home().resolve()).encode()}
-    for name, data in content.items():
-        for marker in SENSITIVE_MARKERS:
-            if marker in data:
-                raise ReleaseError(f"sensitive marker found in package member {name}")
-        for forbidden in forbidden_paths:
-            if forbidden and forbidden in data:
-                raise ReleaseError(
-                    f"developer path {forbidden.decode(errors='replace')} found in package member {name}"
-                )
-
-
-def _write_deterministic_archive(archive: Path, archive_root: str, content: dict[str, bytes]) -> None:
-    with archive.open("wb") as raw:
-        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, compresslevel=9, mtime=0) as compressed:
-            with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as package:
-                root_info = tarfile.TarInfo(archive_root)
-                root_info.type = tarfile.DIRTYPE
-                root_info.mode = 0o755
-                root_info.mtime = 0
-                root_info.uid = root_info.gid = 0
-                root_info.uname = root_info.gname = ""
-                package.addfile(root_info)
-                for name in sorted(content):
-                    data = content[name]
-                    info = tarfile.TarInfo(f"{archive_root}/{name}")
-                    info.mode = 0o755 if name in EXECUTABLE_FILES else 0o644
-                    info.size = len(data)
-                    info.mtime = 0
-                    info.uid = info.gid = 0
-                    info.uname = info.gname = ""
-                    package.addfile(info, io.BytesIO(data))
-
-
-def create_package(
-    root: Path,
-    binary: Path,
-    target: str,
-    output_dir: Path,
-    *,
-    allow_untagged: bool,
-) -> tuple[Path, Path]:
-    root = root.resolve()
-    contract = validate_repository(root)
-    if target not in SUPPORTED_TARGETS:
-        raise ReleaseError(f"unsupported release target: {target}")
-    if not allow_untagged:
-        validate_tagged_source(root, contract.version)
-    binary_data = _safe_source_file(binary.resolve(), "release binary")
-    if not os.access(binary, os.X_OK):
-        raise ReleaseError(f"release binary is not executable: {binary}")
-
-    content = {
-        "LICENSE": _safe_source_file(root / "LICENSE", "license"),
-        "README.md": _safe_source_file(root / "README.md", "README"),
-        "herdr-context": binary_data,
-        "herdr-plugin.toml": render_binary_manifest(contract),
-        "install.sh": _safe_source_file(root / "scripts" / "release-install.sh", "installer"),
-        "uninstall.sh": _safe_source_file(root / "scripts" / "release-uninstall.sh", "uninstaller"),
-    }
-    if set(content) != set(PACKAGE_FILES):
-        raise ReleaseError("internal package whitelist mismatch")
-    _scan_package_content(content, root)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    archive_root = f"herdr-context-v{contract.version}-{target}"
-    archive = output_dir / f"{archive_root}.tar.gz"
-    checksum = output_dir / f"{archive.name}.sha256"
-    _write_deterministic_archive(archive, archive_root, content)
-    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    checksum.write_text(f"{digest}  {archive.name}\n", encoding="ascii", newline="\n")
-    verify_archive(archive, checksum)
-    return archive, checksum
-
-
-def verify_archive(archive: Path, checksum: Path) -> ArchiveMetadata:
-    if archive.is_symlink() or checksum.is_symlink() or not archive.is_file() or not checksum.is_file():
-        raise ReleaseError("archive and checksum must be regular files")
-    if archive.stat().st_size > MAX_ARCHIVE_BYTES:
-        raise ReleaseError("archive exceeds the 128 MiB release limit")
-    try:
-        checksum_text = checksum.read_text(encoding="ascii")
-    except (OSError, UnicodeDecodeError) as error:
-        raise ReleaseError(f"cannot read checksum: {error}") from error
-    match = re.fullmatch(r"([0-9a-f]{64})  ([^/\n]+)\n", checksum_text)
-    if match is None or match.group(2) != archive.name:
-        raise ReleaseError("checksum file has an invalid format or filename")
-    actual_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    if actual_digest != match.group(1):
-        raise ReleaseError("archive checksum mismatch")
-
-    try:
-        with tarfile.open(archive, "r:gz") as package:
-            entries = package.getmembers()
-            roots = [entry for entry in entries if entry.isdir()]
-            files = [entry for entry in entries if entry.isfile()]
-            if len(roots) != 1 or roots[0].name.count("/") != 0:
-                raise ReleaseError("archive must contain exactly one root directory")
-            archive_root = roots[0].name
-            root_match = ARCHIVE_ROOT_PATTERN.fullmatch(archive_root)
-            if root_match is None or root_match.group("target") not in SUPPORTED_TARGETS:
-                raise ReleaseError("archive root has an invalid versioned target name")
-            expected_names = {f"{archive_root}/{name}" for name in PACKAGE_FILES}
-            actual_names = {entry.name for entry in files}
-            if actual_names != expected_names or len(files) != len(expected_names):
-                raise ReleaseError("archive contents differ from the release whitelist")
-            if any(not (entry.isfile() or entry.isdir()) for entry in entries):
-                raise ReleaseError("archive contains links or special files")
-            total_size = 0
-            for entry in files:
-                member_name = Path(entry.name).name
-                maximum = MAX_PACKAGE_MEMBER_BYTES[member_name]
-                if entry.size < 0 or entry.size > maximum:
-                    raise ReleaseError(
-                        f"archive member exceeds its uncompressed limit: {entry.name}"
-                    )
-                total_size += entry.size
-            if total_size > MAX_UNCOMPRESSED_BYTES:
-                raise ReleaseError("archive exceeds the aggregate uncompressed limit")
-            content: dict[str, bytes] = {}
-            for entry in files:
-                expected_mode = 0o755 if Path(entry.name).name in EXECUTABLE_FILES else 0o644
-                if entry.mode != expected_mode or entry.uid != 0 or entry.gid != 0 or entry.mtime != 0:
-                    raise ReleaseError(f"archive metadata is not deterministic: {entry.name}")
-                extracted = package.extractfile(entry)
-                if extracted is None:
-                    raise ReleaseError(f"cannot read archive member: {entry.name}")
-                content[Path(entry.name).name] = extracted.read()
-    except (OSError, tarfile.TarError) as error:
-        raise ReleaseError(f"cannot read release archive: {error}") from error
-
-    manifest = tomllib.loads(content["herdr-plugin.toml"].decode("utf-8"))
-    if manifest.get("build") is not None:
-        raise ReleaseError("binary archive manifest must not contain build commands")
-    if manifest.get("version") != root_match.group("version"):
-        raise ReleaseError("archive manifest version does not match its filename")
-    if manifest.get("panes", [{}])[0].get("command") != ["./herdr-context", "dock"]:
-        raise ReleaseError("archive pane command does not use the packaged binary")
-    if manifest.get("actions", [{}])[0].get("command") != ["./herdr-context", "toggle"]:
-        raise ReleaseError("archive action command does not use the packaged binary")
-    _scan_package_content(content, Path("/__herdr_context_no_repository_path__"))
-    return ArchiveMetadata(
-        archive_root=archive_root,
-        version=root_match.group("version"),
-        target=root_match.group("target"),
-        members=tuple(sorted(f"{archive_root}/{name}" for name in content)),
-    )
-
-
 def _default_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Validate and package herdr-context releases")
+    parser = argparse.ArgumentParser(description="Validate herdr-context release contracts")
     subparsers = parser.add_subparsers(dest="command", required=True)
     validate = subparsers.add_parser(
         "validate", help="validate repository release contracts"
     )
     validate.add_argument("--tag", help="require the exact triggering release tag")
-    package = subparsers.add_parser("package", help="create a deterministic binary archive")
-    package.add_argument("--target", required=True, choices=sorted(SUPPORTED_TARGETS))
-    package.add_argument("--binary", type=Path, required=True)
-    package.add_argument("--output-dir", type=Path, default=Path("target/release-dist"))
-    package.add_argument("--allow-untagged", action="store_true")
-    verify = subparsers.add_parser("verify", help="verify an archive and checksum")
-    verify.add_argument("archive", type=Path)
-    verify.add_argument("checksum", type=Path)
     return parser
 
 
 def main(arguments: list[str] | None = None) -> int:
     args = _parser().parse_args(arguments)
     try:
-        if args.command == "validate":
-            contract = validate_repository(_default_root())
-            if args.tag is not None:
-                validate_trigger_tag(contract, args.tag)
-            print(f"release contract PASS: herdr-context v{contract.version}")
-        elif args.command == "package":
-            archive, checksum = create_package(
-                _default_root(),
-                args.binary,
-                args.target,
-                args.output_dir,
-                allow_untagged=args.allow_untagged,
-            )
-            print(archive)
-            print(checksum)
-        else:
-            metadata = verify_archive(args.archive, args.checksum)
-            print(
-                f"archive PASS: v{metadata.version} {metadata.target} "
-                f"({len(metadata.members)} files)"
-            )
+        contract = validate_repository(_default_root())
+        if args.tag is not None:
+            validate_trigger_tag(contract, args.tag)
+        print(f"release contract PASS: herdr-context v{contract.version}")
     except ReleaseError as error:
         print(f"release: {error}", file=sys.stderr)
         return 1

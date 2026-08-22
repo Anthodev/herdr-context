@@ -23,7 +23,7 @@ fn dock_mode_sets_stable_osc_title() -> Result<(), Box<dyn std::error::Error>> {
     let output = run_binary(Some("dock"), Some(VALID_CONTEXT))?;
 
     assert!(output.status.success());
-    assert_eq!(output.stdout, b"\x1b]2;herdr-context dock\x07");
+    assert_eq!(output.stdout, b"\x1b]2;herdr-context\x07");
     assert!(output.stderr.is_empty());
     Ok(())
 }

@@ -25,6 +25,7 @@ use crate::ui::files::{
     ChangedPane, FileSearchDisplay, FilesView, render_changed_divider, render_changed_pane,
     render_notice,
 };
+use crate::ui::sanitize_terminal_text;
 use crate::vcs::git::GitService;
 use crate::vcs::jj::{JjService, JujutsuMode};
 use crate::vcs::{VcsBackendMetadata, VcsWorkspace};
@@ -250,6 +251,7 @@ pub struct FilesRuntime {
     pane_input_notice: Option<String>,
     backend_notice: Option<String>,
     display_mode: DisplayMode,
+    colored_icons: bool,
     show_ignored: bool,
     search: Option<FileSearchState>,
 }
@@ -264,7 +266,7 @@ impl FilesRuntime {
             config.vcs().backend(),
             config.vcs().jujutsu_mode(),
             config.vcs().refresh(),
-            config.ui().display_mode(),
+            config.ui(),
             config.files(),
             &NOT_CANCELLED,
         )
@@ -282,7 +284,7 @@ impl FilesRuntime {
             config.vcs().backend(),
             jujutsu_mode,
             config.vcs().refresh(),
-            config.ui().display_mode(),
+            config.ui(),
             config.files(),
             &NOT_CANCELLED,
         )
@@ -307,7 +309,7 @@ impl FilesRuntime {
             config.vcs().backend(),
             config.vcs().jujutsu_mode(),
             config.vcs().refresh(),
-            config.ui().display_mode(),
+            config.ui(),
             config.files(),
             cancelled,
         )
@@ -318,7 +320,7 @@ impl FilesRuntime {
         backend: VcsBackendSelection,
         jujutsu_mode: JujutsuMode,
         refresh_policy: RefreshPolicy,
-        display_mode: DisplayMode,
+        ui: &crate::config::UiConfig,
         files_config: &FilesConfig,
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> Result<Self, FilesRuntimeError> {
@@ -421,7 +423,8 @@ impl FilesRuntime {
             backend_notice: configured_vcs_missing.then(|| {
                 "configured VCS backend was not found; showing the filesystem only".to_owned()
             }),
-            display_mode,
+            display_mode: ui.display_mode(),
+            colored_icons: ui.colored_icons(),
             show_ignored: files_config.show_ignored(),
             search: None,
         };
@@ -457,7 +460,15 @@ impl FilesRuntime {
             split_height / 2
         };
         let tree_height = split_height.saturating_sub(changed_height);
-        self.viewport_y = area.y.saturating_add(search_height as u16);
+        // The project header consumes the first tree row inside FilesView;
+        // subtract it here so selection math and pointer hit-testing share
+        // the same viewport the renderer actually fills.
+        let header_height = usize::from(self.root.file_name().is_some());
+        let tree_height = tree_height.saturating_sub(header_height);
+        self.viewport_y = area
+            .y
+            .saturating_add(search_height as u16)
+            .saturating_add(header_height as u16);
         self.viewport_height = tree_height;
         self.changed_y = self
             .viewport_y
@@ -520,9 +531,17 @@ impl FilesRuntime {
                     )
                 },
             );
+        let header = self
+            .root
+            .file_name()
+            .map(|name| sanitize_terminal_text(&name.to_string_lossy()).into_owned());
         let mut view = FilesView::new(tree, rows, selected, None)
             .with_expanded(expanded)
-            .with_display_mode(self.display_mode);
+            .with_display_mode(self.display_mode)
+            .with_icon_colors(self.colored_icons);
+        if let Some(header) = header.as_deref() {
+            view = view.with_header(header);
+        }
         if let Some(search) = search_display {
             view = view.with_search(search);
         }
@@ -531,7 +550,7 @@ impl FilesRuntime {
                 area.x,
                 area.y,
                 area.width,
-                (search_height + tree_height) as u16,
+                (search_height + tree_height + usize::from(header.is_some())) as u16,
             ),
             buffer,
         );
@@ -2135,15 +2154,25 @@ mod tests {
         )])
         .expect("context");
         let mut runtime = FilesRuntime::bootstrap_with_config(&context, &config).expect("runtime");
-        let area = Rect::new(0, 0, 40, 1);
+        let area = Rect::new(0, 0, 40, 2);
         let mut buffer = Buffer::empty(area);
 
         runtime.render(area, &mut buffer);
 
-        let rendered = (0..area.width)
+        let header = (0..area.width)
             .map(|column| buffer[(column, 0)].symbol())
             .collect::<String>();
-        assert!(rendered.starts_with("  └── • main.rs"));
+        let project_label = project
+            .path()
+            .file_name()
+            .expect("tempdir name")
+            .to_string_lossy()
+            .to_uppercase();
+        assert!(header.starts_with(&project_label));
+        let rendered = (0..area.width)
+            .map(|column| buffer[(column, 1)].symbol())
+            .collect::<String>();
+        assert!(rendered.starts_with("  • main.rs"));
         assert_eq!(runtime.display_mode, DisplayMode::Unicode);
     }
 
@@ -2371,13 +2400,13 @@ mod tests {
             }),
             &mut workers,
         );
-        assert_eq!(runtime.model.tree().selection(), Some(Path::new("root.rs")));
+        assert_eq!(runtime.model.tree().selection(), Some(Path::new("src")));
 
         runtime.handle_event(
             Event::Mouse(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Right),
                 column: 0,
-                row: 0,
+                row: 1,
                 modifiers: KeyModifiers::NONE,
             }),
             &mut workers,
@@ -2455,7 +2484,7 @@ mod tests {
         }
         let mut runtime = runtime(&temp);
         let mut workers = workers();
-        let area = Rect::new(0, 0, 10, 4);
+        let area = Rect::new(0, 0, 10, 6);
         let mut buffer = Buffer::empty(area);
         runtime.render(area, &mut buffer);
 
@@ -2465,10 +2494,16 @@ mod tests {
 
         assert_eq!(runtime.visible_rows.as_ptr(), cached_rows);
         assert_eq!(runtime.viewport_offset, 1);
+        // Header owns row 0; offset 1 leaves room for `b` on row 1 and
+        // `c` on row 2.
         let second_line = (0..area.width)
             .map(|x| buffer[(x, 1)].symbol())
             .collect::<String>();
-        assert!(second_line.contains('c'));
+        assert!(second_line.contains('b'));
+        let third_line = (0..area.width)
+            .map(|x| buffer[(x, 2)].symbol())
+            .collect::<String>();
+        assert!(third_line.contains('c'));
     }
 
     #[test]
@@ -3203,8 +3238,15 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         runtime.render(area, &mut buffer);
         let lines = rendered_lines(&buffer, area);
-        assert!(lines[0].contains("src"));
-        assert!(lines[1].contains("fresh.rs"));
+        // Header owns row 0; the first tree row follows on row 1.
+        let project_label = temp
+            .path()
+            .file_name()
+            .expect("tempdir name")
+            .to_string_lossy()
+            .to_uppercase();
+        assert!(lines[0].starts_with(&project_label));
+        assert!(lines[1].contains("src"));
         assert!(lines[2].starts_with("- Changed +2 -1"));
         assert!(lines[3].starts_with("? fresh.rs"));
         // The flat pane is viewport-bounded: rows beyond the half stay hidden.
@@ -3320,22 +3362,25 @@ mod tests {
             &mut workers,
         ));
 
+        // Row 1 is the default tree selection; click the second visible
+        // row so the pointer actually changes it.
         assert!(runtime.handle_intent(
             &Intent::Pointer {
                 column: 0,
-                row: 1,
+                row: 2,
                 action: PointerAction::Select,
             },
             &mut workers,
         ));
         assert_eq!(runtime.focused_pane, FilesPane::Tree);
+        let second_visible = runtime.visible_rows[runtime.viewport_offset + 1].clone();
         assert_eq!(
             runtime.model.tree().selection(),
-            Some(Path::new("fresh.rs"))
+            Some(second_visible.as_path())
         );
         assert_eq!(
             runtime.selected_file_reference(),
-            Some(Ok("@fresh.rs ".to_owned()))
+            Some(Ok(format!("@{} ", second_visible.display())))
         );
         workers.shutdown();
     }

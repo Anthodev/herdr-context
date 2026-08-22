@@ -13,6 +13,8 @@ pub const ERROR: Color = Color::Red;
 pub const VCS_ADDED: Color = Color::Rgb(63, 185, 80);
 pub const VCS_MODIFIED: Color = Color::Rgb(210, 153, 34);
 pub const VCS_DELETED: Color = Color::Rgb(248, 81, 73);
+/// Deterministic slate band behind the focused row; foregrounds survive.
+pub const SELECTION: Color = Color::Rgb(44, 49, 58);
 pub const MOVED: Color = Color::Cyan;
 pub const UNTRACKED: Color = Color::Blue;
 
@@ -22,8 +24,8 @@ pub const fn selected() -> Style {
 }
 
 #[must_use]
-pub const fn selected_neutral() -> Style {
-    Style::new().add_modifier(Modifier::REVERSED)
+pub const fn selection_band() -> Style {
+    Style::new().bg(SELECTION)
 }
 
 #[must_use]

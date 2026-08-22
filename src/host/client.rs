@@ -17,7 +17,7 @@ use super::{
 
 pub const PLUGIN_ID: &str = "herdr-context";
 pub const DOCK_ENTRYPOINT: &str = "dock";
-pub const DOCK_TITLE: &str = "herdr-context dock";
+pub const DOCK_TITLE: &str = "herdr-context";
 
 const MAX_RIGHT_SWAPS: usize = 256;
 const MAX_FOCUS_STEPS: usize = 256;

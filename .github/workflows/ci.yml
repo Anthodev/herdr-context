@@ -48,12 +48,3 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets --all-features --locked
 
-      - name: Build and validate release archive
-        run: |
-          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/usr/src/herdr-context --remap-path-prefix=$HOME=/usr/src/home"
-          cargo build --release --locked
-          scripts/package-release.sh \
-            --target x86_64-unknown-linux-gnu \
-            --binary target/release/herdr-context \
-            --output-dir target/ci-release \
-            --allow-untagged

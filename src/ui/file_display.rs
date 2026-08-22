@@ -1,25 +1,14 @@
+//! Row vocabulary for Files across display modes: the state column that
+//! carries expansion, the typed nerd icon, and its truecolor accents.
+//!
+//! Rows are `[marker][space][indent][state glyph][icon?][space][name]`;
+//! indentation is two columns per depth level and there are no tree guide
+//! connectors in any mode.
+
 use std::path::Path;
 
 use crate::config::DisplayMode;
 use crate::files::tree::{TreeNode, TreeNodeKind};
-
-pub const fn ancestor(mode: DisplayMode, last: bool) -> &'static str {
-    match (mode, last) {
-        (DisplayMode::Ascii, true) => "   ",
-        (DisplayMode::Ascii, false) => "|  ",
-        (DisplayMode::Unicode | DisplayMode::Nerd, true) => "    ",
-        (DisplayMode::Unicode | DisplayMode::Nerd, false) => "│   ",
-    }
-}
-
-pub const fn branch(mode: DisplayMode, last: bool) -> &'static str {
-    match (mode, last) {
-        (DisplayMode::Ascii, true) => "`- ",
-        (DisplayMode::Ascii, false) => "|- ",
-        (DisplayMode::Unicode | DisplayMode::Nerd, true) => "└── ",
-        (DisplayMode::Unicode | DisplayMode::Nerd, false) => "├── ",
-    }
-}
 
 pub fn icon(mode: DisplayMode, node: &TreeNode, expanded: bool) -> &'static str {
     match mode {
@@ -45,6 +34,109 @@ pub fn icon(mode: DisplayMode, node: &TreeNode, expanded: bool) -> &'static str 
             TreeNodeKind::Virtual => "",
         },
     }
+}
+
+/// The expansion/state column between the depth indent and the name. Ascii
+/// and unicode fold kind into one glyph; nerd reserves a chevron column so
+/// the typed [`icon`] glyphs stay vertically aligned with files.
+#[must_use]
+pub const fn state_glyph(mode: DisplayMode, kind: TreeNodeKind, expanded: bool) -> &'static str {
+    match mode {
+        DisplayMode::Ascii => match kind {
+            TreeNodeKind::Directory if expanded => "-",
+            TreeNodeKind::Directory => "+",
+            TreeNodeKind::File => "f",
+            TreeNodeKind::Symlink => "l",
+            TreeNodeKind::Virtual => "!",
+        },
+        DisplayMode::Unicode => match kind {
+            TreeNodeKind::Directory if expanded => "▾",
+            TreeNodeKind::Directory => "▸",
+            TreeNodeKind::File => "•",
+            TreeNodeKind::Symlink => "↗",
+            TreeNodeKind::Virtual => "×",
+        },
+        DisplayMode::Nerd => match kind {
+            TreeNodeKind::Directory if expanded => "▾ ",
+            TreeNodeKind::Directory => "▸ ",
+            // Files keep a same-width blank so icons line up across kinds.
+            _ => "   ",
+        },
+    }
+}
+
+/// Deterministic truecolor accent for the nerd icon of a node, or `None` to
+/// inherit the row style (monochrome configuration, ignored rows). Groups
+/// mirror [`nerd_file_icon`] so a colored glyph always has its color here.
+#[must_use]
+pub fn icon_rgb(kind: TreeNodeKind, path: &Path) -> Option<(u8, u8, u8)> {
+    if kind == TreeNodeKind::Directory {
+        return Some((232, 191, 92));
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        name.as_str(),
+        ".gitignore" | ".gitattributes" | ".gitmodules"
+    ) {
+        return Some((241, 78, 50));
+    }
+    if matches!(
+        name.as_str(),
+        "cargo.toml" | "cargo.lock" | "rust-toolchain.toml"
+    ) {
+        return Some((222, 165, 132));
+    }
+    if matches!(
+        name.as_str(),
+        "package.json" | "package-lock.json" | "npm-shrinkwrap.json"
+    ) {
+        return Some((203, 62, 53));
+    }
+    if name == "dockerfile" || name.starts_with("compose.") {
+        return Some((36, 150, 237));
+    }
+    if matches!(name.as_str(), "makefile" | "justfile") {
+        return Some((137, 171, 103));
+    }
+
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    Some(match extension.as_str() {
+        "rs" => (222, 165, 132),
+        "py" | "pyi" => (83, 114, 165),
+        "js" | "jsx" | "mjs" | "cjs" => (214, 202, 88),
+        "ts" | "tsx" | "mts" | "cts" => (73, 120, 198),
+        "md" | "mdx" | "markdown" => (81, 154, 186),
+        "json" | "jsonc" => (203, 203, 101),
+        "toml" => (156, 99, 66),
+        "yaml" | "yml" => (179, 98, 58),
+        "html" | "htm" => (227, 76, 38),
+        "css" | "scss" | "sass" | "less" => (142, 100, 182),
+        "sh" | "bash" | "zsh" | "fish" => (137, 224, 81),
+        "c" | "h" => (168, 185, 204),
+        "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" => (243, 75, 125),
+        "go" => (0, 173, 216),
+        "java" => (176, 114, 25),
+        "kt" | "kts" => (167, 123, 255),
+        "rb" => (204, 82, 111),
+        "php" => (119, 123, 179),
+        "swift" => (240, 81, 56),
+        "lua" => (81, 101, 180),
+        "sql" | "db" | "sqlite" | "sqlite3" => (109, 154, 214),
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "bmp" | "ico" => (160, 116, 196),
+        "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "rar" => (172, 138, 90),
+        "pdf" => (217, 84, 89),
+        "txt" | "log" => (168, 168, 168),
+        "lock" => (140, 140, 140),
+        _ => return None,
+    })
 }
 
 fn nerd_file_icon(path: &Path) -> &'static str {

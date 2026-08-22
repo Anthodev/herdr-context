@@ -99,8 +99,10 @@ fn conversations_are_grouped_by_provider_with_expandable_headers() {
     assert!(line(&buffer, 3).starts_with("  ? codex-old"));
     assert!(line(&buffer, 4).starts_with("- pi (1)"));
     assert!(line(&buffer, 5).starts_with("  ? pi-session"));
-    assert_eq!(buffer[(0, 1)].fg, Color::Magenta);
-    assert!(buffer[(0, 1)].modifier.contains(Modifier::REVERSED));
+    // Selection is the full-width neutral band; no video inversion.
+    assert_eq!(buffer[(0, 1)].bg, Color::Rgb(44, 49, 58));
+    assert_eq!(buffer[(0, 1)].fg, Color::Reset);
+    assert!(!buffer[(0, 1)].modifier.contains(Modifier::REVERSED));
     assert_eq!(buffer[(13, 2)].fg, Color::DarkGray);
 }
 

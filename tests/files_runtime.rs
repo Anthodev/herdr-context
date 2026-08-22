@@ -24,8 +24,9 @@ fn launch_context_bootstraps_and_renders_the_files_view() {
     let mut buffer = Buffer::empty(area);
     runtime.render(area, &mut buffer);
 
-    let first_line = (0..area.width)
-        .map(|x| buffer[(x, 0)].symbol())
+    // Row 0 is the project header; the tree starts on row 1.
+    let tree_line = (0..area.width)
+        .map(|x| buffer[(x, 1)].symbol())
         .collect::<String>();
-    assert!(first_line.contains("visible.txt"));
+    assert!(tree_line.contains("visible.txt"));
 }

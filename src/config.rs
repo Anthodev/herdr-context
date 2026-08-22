@@ -202,15 +202,30 @@ pub enum DisplayMode {
     Nerd,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UiConfig {
     display_mode: DisplayMode,
+    colored_icons: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            display_mode: DisplayMode::default(),
+            colored_icons: true,
+        }
+    }
 }
 
 impl UiConfig {
     #[must_use]
     pub const fn display_mode(self) -> DisplayMode {
         self.display_mode
+    }
+
+    #[must_use]
+    pub const fn colored_icons(self) -> bool {
+        self.colored_icons
     }
 }
 
@@ -678,7 +693,12 @@ fn parse_config(value: &toml::Value) -> ConfigLoad {
     }
 
     if let Some(table) = optional_table(root, "ui", &mut warnings) {
-        warn_unknown_fields(table, &["display_mode"], "ui.unknown_field", &mut warnings);
+        warn_unknown_fields(
+            table,
+            &["display_mode", "colored_icons"],
+            "ui.unknown_field",
+            &mut warnings,
+        );
         config.ui.display_mode = table
             .get("display_mode")
             .map_or(DisplayMode::Ascii, |value| {
@@ -692,6 +712,12 @@ fn parse_config(value: &toml::Value) -> ConfigLoad {
                     }
                 }
             });
+        config.ui.colored_icons = parse_bool(
+            table.get("colored_icons"),
+            "ui.colored_icons",
+            &mut warnings,
+        )
+        .unwrap_or(true);
     }
 
     if let Some(table) = optional_table(root, "files", &mut warnings) {
