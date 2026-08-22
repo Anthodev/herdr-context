@@ -13,6 +13,7 @@ use crate::vcs::{VcsDiffStats, VcsStatusKind};
 
 use super::{file_display, sanitize_terminal_cow, sanitize_terminal_text, theme};
 
+/// Search bar snapshot rendered above the tree while a search is active.
 #[derive(Clone, Copy, Debug)]
 pub struct FileSearchDisplay<'a> {
     pub query: &'a str,
@@ -33,7 +34,6 @@ pub struct FilesView<'a> {
     search: Option<FileSearchDisplay<'a>>,
     display_mode: DisplayMode,
 }
-
 impl<'a> FilesView<'a> {
     #[must_use]
     pub const fn new(
@@ -118,6 +118,11 @@ impl Widget for FilesView<'_> {
                 .saturating_add(search_height)
                 .saturating_add(offset as u16);
             let (marker, marker_style) = status_marker(node.status());
+            let row_style = if node.is_ignored() && node.status().is_none() {
+                theme::inactive()
+            } else {
+                marker_style
+            };
             let expanded = self
                 .expanded
                 .is_some_and(|expanded| expanded.contains(node.path()));
@@ -128,12 +133,12 @@ impl Widget for FilesView<'_> {
             push_tree_prefix(&mut spans, self.tree, node.path(), self.display_mode, depth);
             spans.push(Span::styled(
                 file_display::icon(self.display_mode, node, expanded),
-                marker_style,
+                row_style,
             ));
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
                 sanitize_terminal_cow(self.tree.display_path(node.path()).to_string_lossy()),
-                marker_style,
+                row_style,
             ));
             if node.kind() == TreeNodeKind::Virtual {
                 spans.push(Span::styled(" (missing)", theme::inactive()));
@@ -145,14 +150,14 @@ impl Widget for FilesView<'_> {
             line.render(Rect::new(area.x, y, area.width, 1), buffer);
         }
 
-        if let Some((label, notice)) = self.notice {
+        if let Some((label, message)) = self.notice {
             let rect = Rect::new(
                 area.x,
                 area.y.saturating_add(area.height.saturating_sub(1)),
                 area.width,
                 1,
             );
-            render_notice(label, notice, rect, buffer);
+            render_notice(label, message, rect, buffer);
         }
     }
 }
@@ -332,6 +337,7 @@ pub(crate) fn render_changed_divider(
     diff: Option<VcsDiffStats>,
     focused: bool,
     mode: DisplayMode,
+    refresh_hint: Option<&'static str>,
     area: Rect,
     buffer: &mut Buffer,
 ) {
@@ -347,8 +353,10 @@ pub(crate) fn render_changed_divider(
         theme::inactive()
     };
     // Build the labeled rule first; fall back to a bare full-width rule when
-    // the pane is too narrow to carry the label unclipped.
-    let mut labeled = Vec::with_capacity(7);
+    // the pane is too narrow to carry the label unclipped. The refresh hint
+    // rides right-aligned and is dropped first when width runs out.
+    let hint_width = refresh_hint.map_or(0, |hint| hint.chars().count() + 1);
+    let mut labeled = Vec::with_capacity(8);
     let mut plain_width = glyph.chars().count() + 2;
     labeled.push(Span::styled(glyph, line_style));
     labeled.push(Span::raw(" "));
@@ -371,7 +379,16 @@ pub(crate) fn render_changed_divider(
         Some(_) => {}
     }
     labeled.push(Span::raw(" "));
-    if width >= plain_width {
+    if width >= plain_width + hint_width {
+        labeled.push(Span::styled(
+            glyph.repeat(width.saturating_sub(plain_width + hint_width)),
+            line_style,
+        ));
+        if let Some(hint) = refresh_hint {
+            labeled.push(Span::styled(format!(" {hint}"), line_style));
+        }
+        Line::from(labeled).render(area, buffer);
+    } else if width >= plain_width {
         labeled.push(Span::styled(
             glyph.repeat(width.saturating_sub(plain_width)),
             line_style,
@@ -490,7 +507,7 @@ mod tests {
         assert!(rendered.iter().any(|line| line.contains("old/src/main.rs")));
     }
     #[test]
-    fn renders_conflict_marker_and_passive_stale_notice() {
+    fn renders_conflict_marker_rows() {
         let temp = TempDir::new().expect("tempdir");
         fs::write(temp.path().join("conflicted"), []).expect("file");
         let mut tree = FilesTree::new(temp.path().to_path_buf()).expect("tree");
@@ -509,24 +526,13 @@ mod tests {
         let area = Rect::new(0, 0, 56, 2);
         let mut buffer = Buffer::empty(area);
 
-        FilesView::new(
-            &tree,
-            &rows,
-            None,
-            Some(("VCS stale", "passive mode; working copy not snapshotted")),
-        )
-        .render(area, &mut buffer);
+        FilesView::new(&tree, &rows, None, None).render(area, &mut buffer);
 
         let first = (0..area.width)
             .map(|x| buffer[(x, 0)].symbol())
             .collect::<String>();
-        let second = (0..area.width)
-            .map(|x| buffer[(x, 1)].symbol())
-            .collect::<String>();
         assert!(first.starts_with("! `- f conflicted"));
-        assert!(second.starts_with("VCS stale: passive mode"));
         assert_eq!(buffer[(0, 0)].fg, Color::Rgb(248, 81, 73));
-        assert_eq!(buffer[(0, 1)].fg, Color::Red);
     }
 
     #[test]
@@ -733,6 +739,7 @@ mod tests {
             Some(VcsDiffStats::new(12, 4)),
             false,
             DisplayMode::Ascii,
+            None,
             area,
             &mut muted,
         );
@@ -742,6 +749,7 @@ mod tests {
             Some(VcsDiffStats::new(12, 4)),
             true,
             DisplayMode::Ascii,
+            None,
             area,
             &mut focused,
         );
@@ -764,7 +772,7 @@ mod tests {
     fn falls_back_to_the_file_count_without_diff_stats() {
         let area = Rect::new(0, 0, 24, 1);
         let mut buffer = Buffer::empty(area);
-        super::render_changed_divider(3, None, false, DisplayMode::Ascii, area, &mut buffer);
+        super::render_changed_divider(3, None, false, DisplayMode::Ascii, None, area, &mut buffer);
         let line: String = (0..area.width).map(|x| buffer[(x, 0)].symbol()).collect();
         assert!(line.starts_with("- Changed (3) -"));
 
@@ -775,6 +783,7 @@ mod tests {
             Some(VcsDiffStats::new(0, 0)),
             false,
             DisplayMode::Ascii,
+            None,
             area,
             &mut zeroed,
         );
@@ -786,7 +795,15 @@ mod tests {
     fn renders_the_unicode_rule_in_unicode_mode() {
         let area = Rect::new(0, 0, 16, 1);
         let mut buffer = Buffer::empty(area);
-        super::render_changed_divider(1, None, false, DisplayMode::Unicode, area, &mut buffer);
+        super::render_changed_divider(
+            1,
+            None,
+            false,
+            DisplayMode::Unicode,
+            None,
+            area,
+            &mut buffer,
+        );
         let line: String = (0..area.width).map(|x| buffer[(x, 0)].symbol()).collect();
         assert!(line.starts_with("─ Changed (1) ─"));
     }
@@ -795,9 +812,80 @@ mod tests {
     fn falls_back_to_a_plain_rule_when_the_label_does_not_fit() {
         let area = Rect::new(0, 0, 6, 1);
         let mut buffer = Buffer::empty(area);
-        super::render_changed_divider(3, None, false, DisplayMode::Ascii, area, &mut buffer);
+        super::render_changed_divider(3, None, false, DisplayMode::Ascii, None, area, &mut buffer);
         let line: String = (0..area.width).map(|x| buffer[(x, 0)].symbol()).collect();
         assert_eq!(line, "------");
+    }
+
+    #[test]
+    fn renders_the_refresh_hint_right_aligned_and_drops_it_when_narrow() {
+        let area = Rect::new(0, 0, 24, 1);
+        let mut buffer = Buffer::empty(area);
+        super::render_changed_divider(
+            3,
+            None,
+            false,
+            DisplayMode::Ascii,
+            Some("manual"),
+            area,
+            &mut buffer,
+        );
+        let line: String = (0..area.width).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(line.starts_with("- Changed (3) "));
+        assert!(line.ends_with(" manual"));
+
+        // Too narrow for the hint: it disappears before the label does.
+        let narrow = Rect::new(0, 0, 18, 1);
+        let mut buffer = Buffer::empty(narrow);
+        super::render_changed_divider(
+            3,
+            None,
+            false,
+            DisplayMode::Ascii,
+            Some("manual"),
+            narrow,
+            &mut buffer,
+        );
+        let line: String = (0..narrow.width).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(!line.contains("manual"));
+        assert!(line.ends_with('-'));
+    }
+
+    #[test]
+    fn dims_ignored_rows_without_status_and_keeps_other_coloring() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join(".git")).expect("git marker");
+        fs::write(temp.path().join(".gitignore"), b"skipped.txt\n").expect("gitignore");
+        fs::write(temp.path().join("skipped.txt"), []).expect("ignored file");
+        fs::write(temp.path().join("kept.rs"), []).expect("kept file");
+        let mut tree = FilesTree::with_visibility_policy(
+            temp.path().to_path_buf(),
+            std::sync::Arc::new(crate::files::ignore::ConfiguredVisibilityPolicy::new(
+                false,
+                Vec::new(),
+            )),
+            true,
+        )
+        .expect("tree");
+        tree.load_directory(Path::new("")).expect("root");
+        assert!(
+            tree.node(Path::new("skipped.txt"))
+                .is_some_and(|node| node.is_ignored())
+        );
+        let rows = [PathBuf::from("kept.rs"), PathBuf::from("skipped.txt")];
+        let area = Rect::new(0, 0, 40, 2);
+        let mut buffer = Buffer::empty(area);
+        FilesView::new(&tree, &rows, None, None).render(area, &mut buffer);
+
+        // Ignored without status renders dim somewhere on icon/name; the
+        // ordinary row keeps default coloring. Layout-agnostic on purpose.
+        let row_colors = |row: u16| {
+            (0..area.width)
+                .map(|x| buffer[(x, row)].fg)
+                .collect::<Vec<_>>()
+        };
+        assert!(row_colors(1).contains(&Color::DarkGray));
+        assert!(!row_colors(0).contains(&Color::DarkGray));
     }
 
     fn status_entry(path: &str, kind: VcsStatusKind) -> VcsEntryStatus {

@@ -367,3 +367,23 @@ select_next = ["n"]
             .any(|warning| warning.contains("keybindings.refresh"))
     );
 }
+
+#[test]
+fn files_show_ignored_defaults_false_and_parses_both_values() {
+    let default = load("");
+    assert!(!default.config().files().show_ignored());
+    assert!(default.warnings().is_empty());
+
+    let enabled = load("[files]\nshow_ignored = true\n");
+    assert!(enabled.config().files().show_ignored());
+    assert!(enabled.warnings().is_empty());
+
+    let invalid = load("[files]\nshow_ignored = \"yes\"\n");
+    assert!(!invalid.config().files().show_ignored());
+    assert!(
+        invalid
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("files.show_ignored"))
+    );
+}

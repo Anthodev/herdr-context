@@ -156,7 +156,7 @@ fn tabs_and_compact_states_render_in_wide_and_narrow_areas() {
 
     render_shell(&mut model, wide, &mut buffer);
     assert!(line(&buffer, 0).contains("Files"));
-    assert!(line(&buffer, 0).contains("Conversations"));
+    assert!(line(&buffer, 0).contains("History"));
     assert!(line(&buffer, 1).contains("Loading Files"));
     assert_eq!(buffer[(0, 0)].fg, Color::Magenta);
     assert!(buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
@@ -167,17 +167,33 @@ fn tabs_and_compact_states_render_in_wide_and_narrow_areas() {
     let narrow = Rect::new(0, 0, 9, 2);
     let mut narrow_buffer = Buffer::empty(narrow);
     render_shell(&mut model, narrow, &mut narrow_buffer);
-    assert!(line(&narrow_buffer, 1).contains("No conv"));
+    assert!(line(&narrow_buffer, 1).contains("No hist"));
 
     model.conversations_mut().set_source_errors(vec![
-        "UnsupportedFormat: conversation source codex-cli: malformed record".to_owned(),
-        "PermissionDenied: conversation source pi: unreadable store".to_owned(),
+        herdr_context::model::VisibleError::quiet(
+            "UnsupportedFormat: conversation source codex-cli: malformed record".to_owned(),
+        ),
+        herdr_context::model::VisibleError::alert(
+            "PermissionDenied: conversation source pi: unreadable store".to_owned(),
+        ),
     ]);
     let mut warning_buffer = Buffer::empty(wide);
     render_shell(&mut model, wide, &mut warning_buffer);
     assert!(line(&warning_buffer, 1).contains("Warning"));
     assert!(line(&warning_buffer, 1).contains("(+1 more)"));
-    assert_eq!(warning_buffer[(0, 1)].fg, Color::Yellow);
+    // Parse-level rejections stay quiet: muted gray, not alarm yellow.
+    assert_eq!(warning_buffer[(0, 1)].fg, Color::DarkGray);
+
+    model
+        .conversations_mut()
+        .set_source_errors(vec![herdr_context::model::VisibleError::alert(
+            "PermissionDenied: conversation source pi: unreadable store".to_owned(),
+        )]);
+    let mut alert_buffer = Buffer::empty(wide);
+    render_shell(&mut model, wide, &mut alert_buffer);
+    assert!(line(&alert_buffer, 1).contains("Warning"));
+    assert!(!line(&alert_buffer, 1).contains("(+"));
+    assert_eq!(alert_buffer[(0, 1)].fg, Color::Yellow);
 }
 
 #[test]

@@ -102,6 +102,7 @@ fn map_normal_key(key: KeyEvent) -> Option<Intent> {
         KeyCode::Enter | KeyCode::Char(' ') => Some(Intent::ToggleSelected),
         KeyCode::Char('r') => Some(Intent::Refresh),
         KeyCode::Char('w') => Some(Intent::SwitchFilesPane),
+        KeyCode::Char('i') => Some(Intent::ToggleIgnoredFiles),
         KeyCode::Char('/') => Some(Intent::BeginFileSearch),
         _ => None,
     }
@@ -206,6 +207,25 @@ mod tests {
             crate::config::KeyBindings::default()
                 .map_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
             Some(Intent::SwitchFilesPane)
+        );
+    }
+
+    #[test]
+    fn i_maps_to_the_ignored_files_toggle() {
+        let geometry = UiGeometry::default();
+
+        assert_eq!(
+            map_event(
+                key(KeyCode::Char('i'), KeyModifiers::NONE),
+                InputMode::Normal,
+                &geometry,
+            ),
+            Some(Intent::ToggleIgnoredFiles)
+        );
+        assert_eq!(
+            crate::config::KeyBindings::default()
+                .map_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
+            Some(Intent::ToggleIgnoredFiles)
         );
     }
 }

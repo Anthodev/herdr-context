@@ -160,6 +160,49 @@ enum ConversationRowTarget {
     },
 }
 
+/// Presentation weight of a surfaced conversation notice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NoticeSeverity {
+    /// Expected, parse-level rejections: shown, but quiet.
+    Quiet,
+    /// Environmental failures that deserve attention.
+    Alert,
+}
+
+/// A surfaced conversation error with its presentation weight.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VisibleError {
+    severity: NoticeSeverity,
+    message: String,
+}
+
+impl VisibleError {
+    #[must_use]
+    pub const fn new(severity: NoticeSeverity, message: String) -> Self {
+        Self { severity, message }
+    }
+
+    #[must_use]
+    pub const fn quiet(message: String) -> Self {
+        Self::new(NoticeSeverity::Quiet, message)
+    }
+
+    #[must_use]
+    pub const fn alert(message: String) -> Self {
+        Self::new(NoticeSeverity::Alert, message)
+    }
+
+    #[must_use]
+    pub const fn severity(&self) -> NoticeSeverity {
+        self.severity
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
 #[derive(Debug)]
 pub struct ConversationsViewState {
     items: Vec<Conversation>,
@@ -170,10 +213,10 @@ pub struct ConversationsViewState {
     scroll: usize,
     filter: String,
     loading: LoadingState,
-    source_errors: Vec<String>,
+    source_errors: Vec<VisibleError>,
     live_error: Option<String>,
     launch_error: Option<String>,
-    visible_errors: Vec<String>,
+    visible_errors: Vec<VisibleError>,
     live_loading: bool,
     requested_generation: u64,
     applied_generation: u64,
@@ -287,16 +330,16 @@ impl ConversationsViewState {
     }
 
     #[must_use]
-    pub fn source_errors(&self) -> &[String] {
+    pub fn source_errors(&self) -> &[VisibleError] {
         &self.source_errors
     }
 
     #[must_use]
-    pub fn visible_errors(&self) -> &[String] {
+    pub fn visible_errors(&self) -> &[VisibleError] {
         &self.visible_errors
     }
 
-    pub fn set_source_errors(&mut self, source_errors: Vec<String>) {
+    pub fn set_source_errors(&mut self, source_errors: Vec<VisibleError>) {
         self.source_errors = source_errors;
         self.rebuild_visible_errors();
     }
@@ -314,8 +357,12 @@ impl ConversationsViewState {
     fn rebuild_visible_errors(&mut self) {
         self.visible_errors.clone_from(&self.source_errors);
         for error in [&self.live_error, &self.launch_error].into_iter().flatten() {
-            if !self.visible_errors.contains(error) {
-                self.visible_errors.push(error.clone());
+            if !self
+                .visible_errors
+                .iter()
+                .any(|existing| existing.message() == error)
+            {
+                self.visible_errors.push(VisibleError::alert(error.clone()));
             }
         }
     }
@@ -404,6 +451,7 @@ impl ConversationsViewState {
                 action,
             } => self.handle_pointer(*column, *row, *action, area, warning_height),
             Intent::Scroll(delta) => self.move_row_selection(isize::from(*delta), viewport_height),
+            Intent::ToggleIgnoredFiles => false,
             Intent::Quit
             | Intent::SwitchView(_)
             | Intent::NextView

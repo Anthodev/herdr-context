@@ -101,26 +101,29 @@ impl FilesModel {
     pub fn with_visibility_policy(
         root: PathBuf,
         visibility: Arc<dyn VisibilityPolicy>,
+        show_ignored: bool,
     ) -> io::Result<Self> {
-        Self::for_workspace_with_visibility(root.clone(), root, visibility)
+        Self::for_workspace_with_visibility(root.clone(), root, visibility, show_ignored)
     }
 
     pub fn for_workspace(files_root: PathBuf, workspace_root: PathBuf) -> io::Result<Self> {
-        Self::build(files_root, workspace_root, None)
+        Self::build(files_root, workspace_root, None, false)
     }
 
     pub fn for_workspace_with_visibility(
         files_root: PathBuf,
         workspace_root: PathBuf,
         visibility: Arc<dyn VisibilityPolicy>,
+        show_ignored: bool,
     ) -> io::Result<Self> {
-        Self::build(files_root, workspace_root, Some(visibility))
+        Self::build(files_root, workspace_root, Some(visibility), show_ignored)
     }
 
     fn build(
         files_root: PathBuf,
         workspace_root: PathBuf,
         visibility: Option<Arc<dyn VisibilityPolicy>>,
+        show_ignored: bool,
     ) -> io::Result<Self> {
         let files_root = std::fs::canonicalize(files_root)?;
         let workspace_root = std::fs::canonicalize(workspace_root)?;
@@ -134,10 +137,14 @@ impl FilesModel {
             })?
             .to_path_buf();
         let tree = match visibility {
-            Some(visibility) => {
-                FilesTree::for_workspace_with_visibility(files_root, workspace_root, visibility)?
-            }
-            None => FilesTree::for_workspace(files_root, workspace_root)?,
+            Some(visibility) => FilesTree::for_workspace_with_visibility(
+                files_root,
+                workspace_root,
+                visibility,
+                show_ignored,
+            )?,
+            None => FilesTree::for_workspace(files_root, workspace_root)?
+                .with_show_ignored(show_ignored),
         };
         Ok(Self {
             tree,
@@ -281,6 +288,13 @@ impl FilesModel {
         self.tree.load_directory(directory)?;
         self.tree_revision = self.tree_revision.saturating_add(1);
         Ok(())
+    }
+
+    /// Swaps in a rescoped tree, bumping the revision so in-flight status
+    /// merges for the previous revision are rejected.
+    pub(crate) fn replace_tree(&mut self, tree: FilesTree) {
+        self.tree = tree;
+        self.tree_revision = self.tree_revision.saturating_add(1);
     }
 }
 
