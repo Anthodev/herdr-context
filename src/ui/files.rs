@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
@@ -33,6 +33,8 @@ pub struct FilesView<'a> {
     expanded: Option<&'a BTreeSet<PathBuf>>,
     search: Option<FileSearchDisplay<'a>>,
     display_mode: DisplayMode,
+    icon_colors: bool,
+    header: Option<&'a str>,
 }
 impl<'a> FilesView<'a> {
     #[must_use]
@@ -50,6 +52,8 @@ impl<'a> FilesView<'a> {
             expanded: None,
             search: None,
             display_mode: DisplayMode::Ascii,
+            icon_colors: true,
+            header: None,
         }
     }
 
@@ -70,6 +74,18 @@ impl<'a> FilesView<'a> {
         self.display_mode = display_mode;
         self
     }
+
+    #[must_use]
+    pub const fn with_icon_colors(mut self, icon_colors: bool) -> Self {
+        self.icon_colors = icon_colors;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_header(mut self, header: &'a str) -> Self {
+        self.header = Some(header);
+        self
+    }
 }
 
 impl Widget for FilesView<'_> {
@@ -79,10 +95,12 @@ impl Widget for FilesView<'_> {
         }
         let search_height = u16::from(self.search.is_some());
         let notice_height = u16::from(self.notice.is_some());
+        let header_height = u16::from(self.header.is_some());
         let row_limit = area
             .height
             .saturating_sub(search_height)
-            .saturating_sub(notice_height) as usize;
+            .saturating_sub(notice_height)
+            .saturating_sub(header_height) as usize;
         if let Some(search) = self.search {
             render_search(search, Rect::new(area.x, area.y, area.width, 1), buffer);
         }
@@ -102,6 +120,20 @@ impl Widget for FilesView<'_> {
                 )
             };
             Span::styled(message, theme::inactive()).render(
+                Rect::new(
+                    area.x,
+                    area.y
+                        .saturating_add(search_height)
+                        .saturating_add(header_height),
+                    area.width,
+                    1,
+                ),
+                buffer,
+            );
+        }
+        if let Some(header) = self.header {
+            render_header(
+                header,
                 Rect::new(area.x, area.y.saturating_add(search_height), area.width, 1),
                 buffer,
             );
@@ -116,6 +148,7 @@ impl Widget for FilesView<'_> {
             let y = area
                 .y
                 .saturating_add(search_height)
+                .saturating_add(header_height)
                 .saturating_add(offset as u16);
             let (marker, marker_style) = status_marker(node.status());
             let row_style = if node.is_ignored() && node.status().is_none() {
@@ -127,14 +160,28 @@ impl Widget for FilesView<'_> {
                 .expanded
                 .is_some_and(|expanded| expanded.contains(node.path()));
             let depth = self.tree.display_depth(node.path());
-            let mut spans = Vec::with_capacity(depth.saturating_add(7));
+            let mut spans = Vec::with_capacity(depth.saturating_add(8));
             spans.push(Span::styled(marker, marker_style));
             spans.push(Span::raw(" "));
-            push_tree_prefix(&mut spans, self.tree, node.path(), self.display_mode, depth);
+            for _ in 0..depth {
+                spans.push(Span::raw("  "));
+            }
             spans.push(Span::styled(
-                file_display::icon(self.display_mode, node, expanded),
+                file_display::state_glyph(self.display_mode, node.kind(), expanded),
                 row_style,
             ));
+            let icon_accent = (self.display_mode == DisplayMode::Nerd && self.icon_colors)
+                .then(|| file_display::icon_rgb(node.kind(), node.path()))
+                .flatten()
+                .filter(|_| !(node.is_ignored() && node.status().is_none()));
+            if self.display_mode == DisplayMode::Nerd {
+                let icon_style =
+                    icon_accent.map_or(row_style, |(r, g, b)| Style::new().fg(Color::Rgb(r, g, b)));
+                spans.push(Span::styled(
+                    file_display::icon(self.display_mode, node, expanded),
+                    icon_style,
+                ));
+            }
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
                 sanitize_terminal_cow(self.tree.display_path(node.path()).to_string_lossy()),
@@ -143,11 +190,10 @@ impl Widget for FilesView<'_> {
             if node.kind() == TreeNodeKind::Virtual {
                 spans.push(Span::styled(" (missing)", theme::inactive()));
             }
-            let mut line = Line::from(spans);
+            Line::from(spans).render(Rect::new(area.x, y, area.width, 1), buffer);
             if self.selected == Some(node.path()) {
-                line = line.style(theme::selected_neutral());
+                buffer.set_style(Rect::new(area.x, y, area.width, 1), theme::selection_band());
             }
-            line.render(Rect::new(area.x, y, area.width, 1), buffer);
         }
 
         if let Some((label, message)) = self.notice {
@@ -232,33 +278,15 @@ pub(crate) fn render_search(search: FileSearchDisplay<'_>, area: Rect, buffer: &
     );
 }
 
-fn push_tree_prefix<'a>(
-    spans: &mut Vec<Span<'a>>,
-    tree: &FilesTree,
-    path: &Path,
-    mode: DisplayMode,
-    depth: usize,
-) {
-    let prefix_start = spans.len();
-    for _ in 0..depth {
-        spans.push(Span::raw(""));
+/// Renders the uppercase project header above the tree viewport. Overflow
+/// past the pane width clips; the name is the root directory's own.
+fn render_header(header: &str, area: Rect, buffer: &mut Buffer) {
+    if area.is_empty() {
+        return;
     }
-    let mut prefix_index = depth;
-    let mut parent = tree.display_parent_of(path);
-    while let Some(current) = parent.filter(|parent| !parent.as_os_str().is_empty()) {
-        prefix_index = prefix_index.saturating_sub(1);
-        spans[prefix_start.saturating_add(prefix_index)] = Span::raw(file_display::ancestor(
-            mode,
-            tree.is_last_display_child(current),
-        ));
-        parent = tree.display_parent_of(current);
-    }
-    spans.push(Span::raw(file_display::branch(
-        mode,
-        tree.is_last_display_child(path),
-    )));
+    let label = sanitize_terminal_text(header).to_uppercase();
+    Span::styled(label, Style::new().fg(theme::ACCENT).bold()).render(area, buffer);
 }
-
 const fn status_marker(status: Option<VcsStatusKind>) -> (&'static str, Style) {
     match status {
         Some(VcsStatusKind::Added) => ("A", Style::new().fg(theme::VCS_ADDED)),
@@ -313,11 +341,10 @@ pub(crate) fn render_changed_pane(pane: ChangedPane<'_>, area: Rect, buffer: &mu
         if file.is_missing() {
             spans.push(Span::styled(" (missing)", theme::inactive()));
         }
-        let mut line = Line::from(spans);
+        Line::from(spans).render(Rect::new(area.x, y, area.width, 1), buffer);
         if pane.selected == Some(file.path()) {
-            line = line.style(theme::selected_neutral());
+            buffer.set_style(Rect::new(area.x, y, area.width, 1), theme::selection_band());
         }
-        line.render(Rect::new(area.x, y, area.width, 1), buffer);
     }
 }
 
@@ -448,20 +475,13 @@ mod tests {
         let second = (0..area.width)
             .map(|x| buffer[(x, 1)].symbol())
             .collect::<String>();
-        assert!(first.starts_with("D `- ! deleted file (missing)"));
+        assert!(first.starts_with("D ! deleted file (missing)"));
         assert!(second.starts_with("VCS: status failed"));
-        assert!(
-            buffer[(0, 0)]
-                .modifier
-                .contains(ratatui::style::Modifier::REVERSED)
-        );
-        assert_eq!(buffer[(2, 0)].fg, Color::Reset);
-        assert!(
-            buffer[(2, 0)]
-                .modifier
-                .contains(ratatui::style::Modifier::REVERSED)
-        );
+        // Selection is a full-width neutral band; foregrounds survive it.
+        assert_eq!(buffer[(0, 0)].bg, theme::SELECTION);
+        assert_eq!(buffer[(39, 0)].bg, theme::SELECTION);
         assert_eq!(buffer[(0, 0)].fg, Color::Rgb(248, 81, 73));
+        assert_eq!(buffer[(2, 0)].fg, Color::Rgb(248, 81, 73));
         assert_eq!(buffer[(7, 0)].fg, Color::Rgb(248, 81, 73));
         assert_eq!(buffer[(20, 0)].fg, Color::DarkGray);
         assert_eq!(buffer[(0, 1)].fg, Color::Red);
@@ -531,15 +551,15 @@ mod tests {
         let first = (0..area.width)
             .map(|x| buffer[(x, 0)].symbol())
             .collect::<String>();
-        assert!(first.starts_with("! `- f conflicted"));
+        assert!(first.starts_with("! f conflicted"));
         assert_eq!(buffer[(0, 0)].fg, Color::Rgb(248, 81, 73));
     }
 
     #[test]
     fn renders_ascii_unicode_and_nerd_tree_modes() {
         let temp = TempDir::new().expect("tempdir");
-        fs::create_dir(temp.path().join("collapsed")).expect("collapsed directory");
         fs::create_dir(temp.path().join("expanded")).expect("expanded directory");
+        fs::create_dir(temp.path().join("collapsed")).expect("collapsed directory");
         fs::write(temp.path().join("expanded/child.rs"), []).expect("nested Rust file");
         fs::write(temp.path().join("main.rs"), []).expect("root Rust file");
         let mut tree = FilesTree::new(temp.path().to_path_buf()).expect("tree");
@@ -570,22 +590,83 @@ mod tests {
         };
 
         let ascii = render(DisplayMode::Ascii);
-        assert!(ascii[0].starts_with("  |- + collapsed"));
-        assert!(ascii[1].starts_with("  |- - expanded"));
-        assert!(ascii[2].starts_with("  |  `- f child.rs"));
-        assert!(ascii[3].starts_with("  `- f main.rs"));
+        assert!(ascii[0].starts_with("  + collapsed"));
+        assert!(ascii[1].starts_with("  - expanded"));
+        assert!(ascii[2].starts_with("    f child.rs"));
+        assert!(ascii[3].starts_with("  f main.rs"));
 
         let unicode = render(DisplayMode::Unicode);
-        assert!(unicode[0].starts_with("  ├── ▸ collapsed"));
-        assert!(unicode[1].starts_with("  ├── ▾ expanded"));
-        assert!(unicode[2].starts_with("  │   └── • child.rs"));
-        assert!(unicode[3].starts_with("  └── • main.rs"));
+        assert!(unicode[0].starts_with("  ▸ collapsed"));
+        assert!(unicode[1].starts_with("  ▾ expanded"));
+        assert!(unicode[2].starts_with("    • child.rs"));
+        assert!(unicode[3].starts_with("  • main.rs"));
 
+        // Nerd rows keep the typed icons (private-use glyphs stay untyped
+        // here); buffer rows are space-padded, so trim before anchoring.
         let nerd = render(DisplayMode::Nerd);
-        assert!(nerd[0].starts_with("  ├──  collapsed"));
-        assert!(nerd[1].starts_with("  ├──  expanded"));
-        assert!(nerd[2].starts_with("  │   └──  child.rs"));
-        assert!(nerd[3].starts_with("  └──  main.rs"));
+        assert!(
+            nerd[0].trim_end().starts_with("  ▸") && nerd[0].trim_end().ends_with(" collapsed")
+        );
+        assert!(nerd[1].trim_end().starts_with("  ▾") && nerd[1].trim_end().ends_with(" expanded"));
+        assert!(
+            nerd[2].trim_end().starts_with("       ") && nerd[2].trim_end().ends_with(" child.rs")
+        );
+        assert!(
+            nerd[3].trim_end().starts_with("     ") && nerd[3].trim_end().ends_with(" main.rs")
+        );
+    }
+
+    #[test]
+    fn renders_the_project_header_above_the_tree() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("main.rs"), []).expect("rust file");
+        let mut tree = FilesTree::new(temp.path().to_path_buf()).expect("tree");
+        tree.load_directory(Path::new("")).expect("root");
+        let rows = [PathBuf::from("main.rs")];
+        let area = Rect::new(0, 0, 20, 2);
+        let mut buffer = Buffer::empty(area);
+
+        FilesView::new(&tree, &rows, None, None)
+            .with_header("proj")
+            .render(area, &mut buffer);
+
+        let header = (0..area.width)
+            .map(|column| buffer[(column, 0)].symbol())
+            .collect::<String>();
+        assert!(header.starts_with("PROJ"));
+        assert_eq!(buffer[(0, 0)].fg, theme::ACCENT);
+        assert!(
+            buffer[(0, 0)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        let row = (0..area.width)
+            .map(|column| buffer[(column, 1)].symbol())
+            .collect::<String>();
+        assert!(row.starts_with("  f main.rs"));
+    }
+
+    #[test]
+    fn nerd_icon_colors_follow_the_configuration() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("main.rs"), []).expect("rust file");
+        let mut tree = FilesTree::new(temp.path().to_path_buf()).expect("tree");
+        tree.load_directory(Path::new("")).expect("root");
+        let rows = [PathBuf::from("main.rs")];
+        let area = Rect::new(0, 0, 24, 1);
+
+        let mut colored = Buffer::empty(area);
+        FilesView::new(&tree, &rows, None, None)
+            .with_display_mode(DisplayMode::Nerd)
+            .render(area, &mut colored);
+        assert_eq!(colored[(5, 0)].fg, Color::Rgb(222, 165, 132));
+
+        let mut monochrome = Buffer::empty(area);
+        FilesView::new(&tree, &rows, None, None)
+            .with_display_mode(DisplayMode::Nerd)
+            .with_icon_colors(false)
+            .render(area, &mut monochrome);
+        assert_eq!(monochrome[(5, 0)].fg, Color::Reset);
     }
 
     #[test]
@@ -627,15 +708,16 @@ mod tests {
         FilesView::new(&tree, &rows, None, None)
             .with_expanded(&expanded)
             .render(area, &mut buffer);
-
-        assert_eq!(buffer[(5, 0)].fg, Color::Rgb(210, 153, 34));
-        assert_eq!(buffer[(7, 0)].fg, Color::Rgb(210, 153, 34));
-        assert_eq!(buffer[(8, 1)].fg, Color::Rgb(210, 153, 34));
-        assert_eq!(buffer[(10, 1)].fg, Color::Rgb(210, 153, 34));
-        assert_eq!(buffer[(5, 2)].fg, Color::Rgb(63, 185, 80));
-        assert_eq!(buffer[(7, 2)].fg, Color::Rgb(63, 185, 80));
+        // New row anatomy: [marker][space][indent][state][space][name].
+        assert_eq!(buffer[(0, 0)].fg, Color::Rgb(210, 153, 34));
+        assert_eq!(buffer[(2, 0)].fg, Color::Rgb(210, 153, 34));
+        assert_eq!(buffer[(4, 0)].fg, Color::Rgb(210, 153, 34));
+        assert_eq!(buffer[(4, 1)].fg, Color::Rgb(210, 153, 34));
+        assert_eq!(buffer[(6, 1)].fg, Color::Rgb(210, 153, 34));
+        assert_eq!(buffer[(0, 2)].fg, Color::Rgb(63, 185, 80));
+        assert_eq!(buffer[(2, 2)].fg, Color::Rgb(63, 185, 80));
+        assert_eq!(buffer[(4, 2)].fg, Color::Rgb(63, 185, 80));
     }
-
     #[test]
     fn renders_search_status_and_empty_result_message_in_the_files_view() {
         let temp = TempDir::new().expect("tempdir");

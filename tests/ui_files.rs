@@ -30,7 +30,7 @@ fn narrow_and_wide_rendering_only_draws_the_supplied_viewport_rows() {
 
         FilesView::new(&tree, &viewport, Some(Path::new("middle")), None).render(area, &mut buffer);
 
-        assert!(line(&buffer, 0).starts_with("  `- f "));
+        assert!(line(&buffer, 0).starts_with("  f "));
         assert!(line(&buffer, 1).trim().is_empty());
         assert!(line(&buffer, 2).trim().is_empty());
         let rendered = buffer

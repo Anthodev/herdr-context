@@ -468,14 +468,6 @@ impl FilesTree {
         depth
     }
 
-    #[must_use]
-    pub(crate) fn is_last_display_child(&self, path: &Path) -> bool {
-        self.display_parent_of(path)
-            .and_then(|parent| self.children.get(parent))
-            .and_then(|children| children.last())
-            .is_some_and(|last| last == path)
-    }
-
     fn display_parent<'a>(&'a self, node: &'a TreeNode) -> &'a Path {
         if node.kind != TreeNodeKind::Virtual {
             return parent_path(&node.path);

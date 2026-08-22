@@ -25,10 +25,10 @@ fn argv_client_queries_identity_and_executes_dock_operations()
 printf '%s\n' "$*" >> '{}'
 case "$*" in
   "pane list --workspace workspace")
-    printf '%s\n' '{{"id":"test","result":{{"type":"pane_list","panes":[{{"pane_id":"dock-primary","tab_id":"tab","cwd":"/project","focused":false,"label":"herdr-context dock"}},{{"pane_id":"dock-secondary","tab_id":"tab","cwd":"/project","focused":false,"terminal_title_stripped":"herdr-context dock"}},{{"pane_id":"false-label","tab_id":"tab","cwd":"/project","focused":false,"label":"herdr-context dock"}},{{"pane_id":"cwd-unavailable","tab_id":"tab","cwd":null,"focused":false}},{{"pane_id":"other-tab","tab_id":"other","cwd":null,"focused":true}}]}}}}'
+    printf '%s\n' '{{"id":"test","result":{{"type":"pane_list","panes":[{{"pane_id":"dock-primary","tab_id":"tab","cwd":"/project","focused":false,"label":"herdr-context"}},{{"pane_id":"dock-secondary","tab_id":"tab","cwd":"/project","focused":false,"terminal_title_stripped":"herdr-context"}},{{"pane_id":"false-label","tab_id":"tab","cwd":"/project","focused":false,"label":"herdr-context"}},{{"pane_id":"cwd-unavailable","tab_id":"tab","cwd":null,"focused":false}},{{"pane_id":"other-tab","tab_id":"other","cwd":null,"focused":true}}]}}}}'
     ;;
   "pane get dock-primary")
-    printf '%s\n' '{{"id":"test","result":{{"type":"pane_info","pane":{{"pane_id":"dock-primary","tab_id":"tab","cwd":"/project","focused":false,"label":"herdr-context dock"}}}}}}'
+    printf '%s\n' '{{"id":"test","result":{{"type":"pane_info","pane":{{"pane_id":"dock-primary","tab_id":"tab","cwd":"/project","focused":false,"label":"herdr-context"}}}}}}'
     ;;
   plugin\ pane\ open*)
     printf '%s\n' '{{"id":"test","result":{{"type":"plugin_pane_opened","plugin_pane":{{"plugin_id":"herdr-context","entrypoint":"dock","pane":{{"pane_id":"opened","tab_id":"tab","cwd":"/project with space","focused":true}}}}}}}}'

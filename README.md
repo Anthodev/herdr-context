@@ -60,6 +60,9 @@ conversations — without leaving the tab.**
 - **Two views, one process** — switch between Files and History without
   restarting the dock; selection, scroll position, and collapsed groups
   survive tab switches.
+- **Guide-free tree** — two-column indent and a single state chevron per
+  row, under a bold uppercase project header; the focused row is a
+  full-width neutral band that keeps status colors readable.
 - **VCS-aware tree** — added, modified, and deleted paths light up green,
   yellow, or red; directories inherit the strongest status of their
   descendants, and deleted files remain visible even though they left disk.
@@ -82,6 +85,8 @@ conversations — without leaving the tab.**
 
 - browse the directory the dock was opened from;
 - expand and collapse directories with keyboard or mouse;
+- show the project name — the root directory's own — as a bold uppercase
+  header above the tree;
 - honor `.gitignore` and configurable hidden-file visibility;
 - search paths across collapsed directories; the index follows the same
   visibility and ignore rules as the tree;
@@ -159,67 +164,22 @@ the plugin. This path needs `git` and a Rust toolchain (the crate pins
 1.97.1). There is no separate update command in plugin v1 — reinstall to
 refresh.
 
-### Packaged release
+### Requirements
 
-Version `0.18.0` supports these release targets:
+- Herdr `0.8.0` or newer and a POSIX shell.
+- `git` plus a Rust toolchain (the crate pins 1.97.1) for the source
+  install; the build runs `cargo build --release --locked` on your machine.
+- Git is optional at runtime; Jujutsu status needs `jj` `0.37` or newer,
+  and missing VCS tools degrade the affected status view without closing
+  the dock.
 
-| Platform | Architecture | Artifact target |
-|---|---|---|
-| Linux with glibc 2.35 or newer | x86_64 | `x86_64-unknown-linux-gnu` |
-| Linux with glibc 2.39 or newer | AArch64 | `aarch64-unknown-linux-gnu` |
-| macOS 15 | Intel | `x86_64-apple-darwin` |
-| macOS 14 or newer | Apple silicon | `aarch64-apple-darwin` |
+### Upgrade and uninstall
 
-Prerequisites are Herdr `0.8.0` or newer and a POSIX shell. The packaged
-binary needs neither Rust nor a source checkout. Git is optional; Jujutsu
-status needs `jj` `0.37` or newer, and missing VCS tools degrade the affected
-status view without closing the dock.
-
-Download the archive and adjacent `.sha256` file for your target from the
-`v0.18.0` GitHub release, then verify and install:
-
-```sh
-target=x86_64-unknown-linux-gnu # choose a target from the table
-
-# Linux checksum tool:
-sha256sum -c "herdr-context-v0.18.0-$target.tar.gz.sha256"
-# macOS checksum tool:
-shasum -a 256 -c "herdr-context-v0.18.0-$target.tar.gz.sha256"
-
-tar -xzf "herdr-context-v0.18.0-$target.tar.gz"
-cd "herdr-context-v0.18.0-$target"
-./install.sh
-```
-
-The installer copies the package to
-`${XDG_DATA_HOME:-$HOME/.local/share}/herdr-context/plugin` and registers it
-through Herdr's public `plugin link` command. Override the location with an
-absolute `HERDR_CONTEXT_INSTALL_DIR`; set `HERDR_SESSION` when installing
-into a named Herdr session.
-
-### First use
-
-Invoke the `herdr-context.toggle` action from a workspace, tab, or pane
-context. Each tab gets at most one rightmost dock (40 columns by default);
-repeated invocation opens, focuses, then closes it.
-
-### Upgrade
-
-Verify and extract the new version, then run its `install.sh`. Upgrade
-replaces only the installation directory and restores the previous files and
-registration if the new link fails. Herdr-managed config and state are
-preserved.
-
-### Uninstall
-
-```sh
-${XDG_DATA_HOME:-$HOME/.local/share}/herdr-context/plugin/uninstall.sh
-```
-
-Uninstall unregisters the plugin and removes only the owned installation
-directory. Project files, conversation histories, and Herdr-managed
-config/state are deliberately preserved; remove those manually only if the
-data is no longer wanted.
+There is no separate update command in plugin v1 — run
+`herdr plugin install Anthodev/herdr-context` again to refresh the managed
+checkout, and `herdr plugin uninstall herdr-context` to remove it. Reinstall
+and uninstall preserve Herdr-managed config, state, and conversation
+histories.
 
 ## Controls
 
@@ -247,6 +207,7 @@ initial_width = 40       # 24..60
 
 [ui]
 display_mode = "ascii" # ascii, unicode, or nerd
+colored_icons = true   # nerd mode only: type-colored file icons
 
 [files]
 show_hidden = false
@@ -291,13 +252,17 @@ Every configured root remains subject to its adapter's version, layout, and
 metadata bounds, and unreadable roots are isolated so healthy sources stay
 visible.
 
-`ui.display_mode` controls glyphs in both views:
+Rows share one anatomy in every mode — status marker, two-column indent,
+state glyph, optional icon, name — with no tree guide connectors:
 
 | Mode | Look | Requires |
 |---|---|---|
-| `ascii` | Tree connectors with `+` / `-` directories and `f` files; `*` / `-` / `?` session states | Nothing — the compact default |
-| `unicode` | `├──` / `└──` connectors, `▸` / `▾` groups, Unicode bullets | A Unicode-capable terminal |
-| `nerd` | Unicode tree plus Nerd Font folder and typed-file icons | A Nerd Font |
+| `ascii` | `+` / `-` directories, `f` / `l` files; `*` / `-` / `?` History states | Nothing — the compact default |
+| `unicode` | `▸` / `▾` chevrons, Unicode file and session bullets | A Unicode-capable terminal |
+| `nerd` | Chevrons plus Nerd Font folder and typed-file icons, colored by type (`colored_icons = false` for monochrome) | A Nerd Font |
+
+Selection is a full-width neutral band in both views; markers and names
+keep their colors on top of it.
 
 Changing modes reuses cached state — no additional filesystem reads or
 traversal.
@@ -314,21 +279,20 @@ is non-zero and always renders status as potentially stale.
   `${XDG_CONFIG_HOME:-$HOME/.config}/herdr/plugins/config/herdr-context/`.
 - State and metadata-only conversation cache: normally below
   `${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/herdr-context/`.
-- Installed binary and manifest:
-  `${XDG_DATA_HOME:-$HOME/.local/share}/herdr-context/plugin/`.
+- Managed source checkout: shown by `herdr plugin list` for the
+  `herdr-context` entry.
 
-Release archives contain only the binary, manifest, installer, uninstaller,
-README, and license — no cache, history, credentials, telemetry, developer
-paths, or performance fixtures. Conversation content never leaves the
-machine; the disposable cache stores display, provenance, resume, and
-watermark metadata only, with private permissions and atomic generation
-replacement. Platforms that cannot enforce owner-only cache permissions fail
-closed instead of persisting external metadata.
+Nothing is packaged or shipped: the install path is a source checkout built
+on your machine. Conversation content never leaves the machine; the
+disposable cache stores display, provenance, resume, and watermark metadata
+only, with private permissions and atomic generation replacement. Platforms
+that cannot enforce owner-only cache permissions fail closed instead of
+persisting external metadata.
 
 ## Limitations
 
-- Windows, musl Linux, older glibc releases, and architectures outside the
-  target table are not release targets.
+- The manifest declares Linux and macOS only; Windows is unsupported, and
+  the source build targets whatever the pinned Rust toolchain builds.
 - External history discovery is restricted to the fixture-validated provider
   versions above; undocumented, encrypted, or remote-only histories need a
   dedicated adapter and cannot be inferred safely.
@@ -370,18 +334,18 @@ test suite.
 
 ## Release status
 
-Version `0.18.0` is the V1 packaging contract. Tag `v0.18.0`, Cargo metadata,
-both manifests, the binary name, minimum Herdr version, archive names, and
-checksums are validated together. CI builds from `Cargo.lock` and blocks
-publication on formatting, Clippy, tests, release build, manifest, archive,
-checksum, clean-install, and packaged smoke failures.
+Version `0.19.0` is the current release line. Tag `v0.19.0`, Cargo
+metadata, both manifests, and the minimum Herdr version are validated
+together; pushing a `v*` tag runs formatting, Clippy, the full test suite,
+and the contract checks, then publishes generated GitHub release notes.
+There are no packaged assets to install.
 
 Every performance budget has a retained independent review in
-`release/performance-review.toml`; a failed budget blocks packaging unless
-its record names the accepting authority, rationale, scope, and follow-up
-issue. Ratatui measurements exclude terminal-driver and multiplexer transport
-latency — see [docs/performance.md](docs/performance.md) for budgets,
-baselines, and residual risks.
+`release/performance-review.toml`; a failed budget blocks a tagged release
+unless its record names the accepting authority, rationale, scope, and
+follow-up issue. Ratatui measurements exclude terminal-driver and
+multiplexer transport latency — see [docs/performance.md](docs/performance.md)
+for budgets, baselines, and residual risks.
 
 ## Acknowledgements
 

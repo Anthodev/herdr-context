@@ -1977,7 +1977,7 @@ esac
             );
         }
         assert!(files.handle_intent(&Intent::ExpandOrDescend, &mut workers));
-        let area = Rect::new(0, 0, 20, 1);
+        let area = Rect::new(0, 0, 20, 2);
         files.render(area, &mut Buffer::empty(area));
         let selected = files.selection().map(Path::to_path_buf);
         let scroll = files.scroll();
@@ -2006,7 +2006,7 @@ esac
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("  |  `- f child"));
+        assert!(rendered.contains("f child"));
     }
     #[test]
     fn low_priority_orchestration_loads_project_local_conversations() {

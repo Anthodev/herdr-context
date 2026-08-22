@@ -57,6 +57,25 @@ fn accepts_every_display_mode() {
 }
 
 #[test]
+fn colored_icons_default_to_true_and_accept_false() {
+    let absent = load("");
+    assert!(absent.config().ui().colored_icons());
+
+    let disabled = load("[ui]\ncolored_icons = false\n");
+    assert!(!disabled.config().ui().colored_icons());
+    assert!(disabled.warnings().is_empty());
+
+    let invalid = load("[ui]\ncolored_icons = \"yes\"\n");
+    assert!(invalid.config().ui().colored_icons());
+    assert!(
+        invalid
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("ui.colored_icons"))
+    );
+}
+
+#[test]
 fn non_array_enabled_sources_warns_and_uses_the_default_set() {
     let loaded = load("[conversations]\nenabled_sources = \"pi\"\n");
 

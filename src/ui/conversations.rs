@@ -38,19 +38,17 @@ pub(crate) fn render(
         }
         let collapsed = state.provider_is_collapsed(provider);
         if absolute_row >= state.scroll() && rendered_rows < area.height {
-            let mut header = Line::from(vec![
+            let header = Line::from(vec![
                 Span::raw(conversation_display::provider(display_mode, collapsed)),
                 Span::raw(" "),
                 Span::raw(sanitize_terminal_text(provider)),
                 Span::raw(format!(" ({})", state.provider_count(provider))),
             ]);
+            let row = Rect::new(area.x, area.y.saturating_add(rendered_rows), area.width, 1);
+            header.render(row, buffer);
             if state.selected_provider() == Some(provider.as_str()) {
-                header = header.style(theme::selected());
+                buffer.set_style(row, theme::selection_band());
             }
-            header.render(
-                Rect::new(area.x, area.y.saturating_add(rendered_rows), area.width, 1),
-                buffer,
-            );
             rendered_rows = rendered_rows.saturating_add(1);
         }
         absolute_row = absolute_row.saturating_add(1);
@@ -61,18 +59,13 @@ pub(crate) fn render(
             conversation.tool().as_str() == provider
                 && state.conversation_matches_filter(conversation, provider_matches)
         }) {
-            if rendered_rows == area.height {
-                return;
-            }
             if absolute_row >= state.scroll() {
-                let mut line = conversation_line(conversation, display_mode, area.width >= 96);
+                let line = conversation_line(conversation, display_mode, area.width >= 96);
+                let row = Rect::new(area.x, area.y.saturating_add(rendered_rows), area.width, 1);
+                line.render(row, buffer);
                 if state.selection() == Some(conversation.session_reference()) {
-                    line = line.style(theme::selected());
+                    buffer.set_style(row, theme::selection_band());
                 }
-                line.render(
-                    Rect::new(area.x, area.y.saturating_add(rendered_rows), area.width, 1),
-                    buffer,
-                );
                 rendered_rows = rendered_rows.saturating_add(1);
             }
             absolute_row = absolute_row.saturating_add(1);
