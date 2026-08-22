@@ -1,7 +1,45 @@
-# herdr-context
+<h1 align="center">herdr-context</h1>
 
-`herdr-context` is a [Herdr](https://herdr.dev) plugin that adds a project
-context dock to the right of the active terminal or coding agent.
+<p align="center">
+  <strong>Project context, docked next to your terminal.</strong><br>
+  A Herdr plugin that puts your files and LLM conversation history in a narrow
+  pane beside the active terminal or coding agent.
+</p>
+
+<p align="center">
+  <a href="#about">About</a>
+  ·
+  <a href="#highlights">Highlights</a>
+  ·
+  <a href="#install">Install</a>
+  ·
+  <a href="#controls">Controls</a>
+  ·
+  <a href="#configuration">Configuration</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Anthodev/herdr-context/releases"><img src="https://img.shields.io/github/v/release/Anthodev/herdr-context?label=release" alt="Latest release"></a>
+  <a href="https://github.com/Anthodev/herdr-context/actions/workflows/ci.yml"><img src="https://github.com/Anthodev/herdr-context/actions/workflows/ci.yml/badge.svg?branch=develop" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Anthodev/herdr-context" alt="License"></a>
+  <img src="https://img.shields.io/badge/Herdr-0.8.0%2B-1D99F3" alt="Requires Herdr 0.8.0 or newer">
+  <img src="https://img.shields.io/badge/platforms-linux%20%7C%20macOS-6B7280" alt="Linux and macOS">
+</p>
+
+> [!NOTE]
+> herdr-context is an independent plugin built entirely on Herdr's public
+> plugin surface, and is discoverable through the
+> [community marketplace](https://herdr.dev/plugins/). External history
+> discovery covers exactly the provider versions listed below; anything else
+> degrades gracefully instead of closing the dock.
+
+## About
+
+**herdr-context** docks two views to the right of your work: a **Files**
+browser colored by Git/Jujutsu status, and a **History** browser for LLM
+conversations tied to the current project. Both render in one Ratatui process,
+and the project context is captured from the originating terminal before the
+dock ever takes focus.
 
 ```text
 ┌────────────────┬──────────────────────────────────┬────────────────────────┐
@@ -11,10 +49,117 @@ context dock to the right of the active terminal or coding agent.
 ```
 
 The dock is a narrow Herdr pane rather than an extension of the native
-sidebar. This uses Herdr's public plugin surface, preserves compatibility with
-upstream Herdr, and keeps the plugin independently installable.
+sidebar. That keeps the plugin on Herdr's public plugin surface, compatible
+with upstream Herdr, and independently installable.
 
-## Install a packaged release
+The goal is simple: **know where the project stands — files, changes,
+conversations — without leaving the tab.**
+
+## Highlights
+
+- **Two views, one process** — switch between Files and History without
+  restarting the dock; selection, scroll position, and collapsed groups
+  survive tab switches.
+- **VCS-aware tree** — added, modified, and deleted paths light up green,
+  yellow, or red; directories inherit the strongest status of their
+  descendants, and deleted files remain visible even though they left disk.
+- **Modified-files list** — every changed path in one flat list beneath the
+  tree, with green `+N` / red `-N` workspace diff totals on the divider.
+- **History across tools** — Claude Code, Codex CLI, Pi, OMP, and OpenCode
+  sessions associated with the project, merged with live Herdr sessions.
+- **Resume in one keystroke** — `Enter` on a session opens it in a new
+  focused tab of the current workspace.
+- **File references** — `Enter` on a file row inserts its project-relative
+  `@path` into the originating pane and hands focus back to it.
+- **Path filter** — `/` searches project-relative paths across collapsed
+  directories through a bounded background index.
+- **Responsive by construction** — disk reads, Git/Jujutsu commands, and
+  transcript parsing never block the rendering thread.
+- **Read-only and local** — the plugin never modifies project files or VCS
+  history, sends nothing over the network, and caches metadata only.
+
+## Files
+
+- browse the directory the dock was opened from;
+- expand and collapse directories with keyboard or mouse;
+- honor `.gitignore` and configurable hidden-file visibility;
+- search paths across collapsed directories; the index follows the same
+  visibility and ignore rules as the tree;
+- support Git and Jujutsu (`jj`) workspaces behind one normalized status
+  model — added, modified, deleted, renamed, copied, untracked, conflicted;
+- split into a top tree and a bottom flat list of every file carrying a
+  status, separated by a rule showing `+N` / `-N` tracked line totals
+  (file count when the diff is unavailable); the rule lights up while the
+  flat pane holds focus, and the flat pane hides while the path filter is
+  active;
+- color names from semantic theme slots, with deterministic truecolor
+  overrides for VCS green/yellow/red so terminal palette remapping cannot
+  turn a red deletion green;
+- never intentionally modify project files or VCS history.
+
+Jujutsu status requires `jj` 0.37 or newer and is integration-tested against
+`jj` 0.44.0. The default `Fresh` mode snapshots only when Files activates or
+you press `r` — it never polls in the background. The opt-in `Passive` mode
+adds `--ignore-working-copy` and always marks the shown status as potentially
+stale. The plugin never issues commit, bookmark, or rewrite commands.
+
+## History
+
+- list conversations associated with the current project or worktree;
+- prefer histories stored inside the project, then discover external stores
+  elsewhere on the filesystem through canonical project metadata;
+- merge filesystem history with live Herdr sessions as enrichment, never as
+  the sole source;
+- group providers alphabetically with most-recent sessions first; collapsing
+  a provider group loads and exposes no transcript content;
+- isolate failures per source, so one unreadable store cannot hide the
+  others.
+
+| Source | Kind |
+|---|---|
+| Claude Code `2.1.232` | external store |
+| Codex CLI `0.147.0` | external store |
+| Pi `0.84.1` | external store |
+| OMP `17.3.2` | external store |
+| OpenCode `1.18.18` | external store |
+| Project-local records | `.herdr/conversations/`, `.jsonl`, `.json` |
+| Live Herdr sessions | runtime enrichment |
+
+Project-local records are read shallowly — direct children of
+`.herdr/conversations/` plus two fixed filenames, never a recursive scan.
+Each record needs `session_id`, the canonical project-root `cwd`, an RFC 3339
+`timestamp`, a `role`, and a string `message`. Message bodies are validated
+and never returned to the UI or diagnostics.
+
+External stores are only hints until verified: encoded directory layouts and
+filenames count for nothing unless native session IDs, timestamps, and
+canonical `cwd` evidence agree. Live sessions match by tool plus native ID,
+then transcript path plus fingerprint, then verified path identity — titles,
+timestamps, and prefixes are never identities. Unmatched live rows appear
+transiently and survive until the filesystem transcript appears; Herdr
+failures are warnings while filesystem history stays visible.
+
+Discovery runs in bounded recent-first pages on the low-priority worker.
+Large JSONL sessions advance through complete-record cursors instead of being
+loaded whole, and sessions disappear only after a refresh proves they were
+deleted or replaced. Incomplete inventories keep prior metadata, and
+source-scoped warnings stay visible beside healthy adapters.
+
+## Install
+
+### From GitHub
+
+```sh
+herdr plugin install Anthodev/herdr-context
+```
+
+Herdr clones the repository, runs the manifest build
+(`cargo build --release --locked`), stores a managed checkout, and registers
+the plugin. This path needs `git` and a Rust toolchain (the crate pins
+1.97.1). There is no separate update command in plugin v1 — reinstall to
+refresh.
+
+### Packaged release
 
 Version `0.18.0` supports these release targets:
 
@@ -27,11 +172,11 @@ Version `0.18.0` supports these release targets:
 
 Prerequisites are Herdr `0.8.0` or newer and a POSIX shell. The packaged
 binary needs neither Rust nor a source checkout. Git is optional; Jujutsu
-status needs `jj` `0.37` or newer. Missing optional VCS tools degrade the
-affected status view without closing the dock.
+status needs `jj` `0.37` or newer, and missing VCS tools degrade the affected
+status view without closing the dock.
 
-Download the archive and adjacent `.sha256` file for the host target from the
-`v0.18.0` GitHub release, then verify and install it:
+Download the archive and adjacent `.sha256` file for your target from the
+`v0.18.0` GitHub release, then verify and install:
 
 ```sh
 target=x86_64-unknown-linux-gnu # choose a target from the table
@@ -46,214 +191,55 @@ cd "herdr-context-v0.18.0-$target"
 ./install.sh
 ```
 
-The installer copies the checksummed package to
-`${XDG_DATA_HOME:-$HOME/.local/share}/herdr-context/plugin` and registers that
-directory through Herdr's public `plugin link` command. Override the location
-with an absolute `HERDR_CONTEXT_INSTALL_DIR`. For a named Herdr session, set
-`HERDR_SESSION` while installing or uninstalling.
+The installer copies the package to
+`${XDG_DATA_HOME:-$HOME/.local/share}/herdr-context/plugin` and registers it
+through Herdr's public `plugin link` command. Override the location with an
+absolute `HERDR_CONTEXT_INSTALL_DIR`; set `HERDR_SESSION` when installing
+into a named Herdr session.
 
-Invoke `herdr-context.toggle` from a workspace, tab, or pane context. Each tab
-gets at most one rightmost 40-column dock by default; repeated invocation
-opens, focuses, then closes it.
+### First use
+
+Invoke the `herdr-context.toggle` action from a workspace, tab, or pane
+context. Each tab gets at most one rightmost dock (40 columns by default);
+repeated invocation opens, focuses, then closes it.
 
 ### Upgrade
 
-Verify and extract the new version, then run its `install.sh`. Upgrade replaces
-only the package installation directory and restores the previous files and
-registration if the new link fails. Herdr's plugin config and state directories
-are preserved.
+Verify and extract the new version, then run its `install.sh`. Upgrade
+replaces only the installation directory and restores the previous files and
+registration if the new link fails. Herdr-managed config and state are
+preserved.
 
 ### Uninstall
-
-Run `uninstall.sh` from either the extracted archive or the installed package
-while the target Herdr session is running:
 
 ```sh
 ${XDG_DATA_HOME:-$HOME/.local/share}/herdr-context/plugin/uninstall.sh
 ```
 
 Uninstall unregisters the plugin and removes only the owned installation
-directory. It deliberately preserves project files, conversation histories,
-and Herdr-managed config/state. Remove retained config or state manually only
-if that data is no longer wanted.
+directory. Project files, conversation histories, and Herdr-managed
+config/state are deliberately preserved; remove those manually only if the
+data is no longer wanted.
 
-### Paths and privacy
+## Controls
 
-- Config: `herdr plugin config-dir herdr-context`, normally below
-  `${XDG_CONFIG_HOME:-$HOME/.config}/herdr/plugins/config/herdr-context/`.
-- State and metadata-only conversation cache: normally below
-  `${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/herdr-context/`.
-- Installed binary and manifest:
-  `${XDG_DATA_HOME:-$HOME/.local/share}/herdr-context/plugin/`.
-
-Release archives contain only the binary, manifest, installer, uninstaller,
-README, and license. They contain no cache, history, credentials, telemetry,
-developer paths, or performance fixtures. Conversation content stays local;
-the disposable cache stores metadata only.
-
-### Limitations
-
-Windows, musl Linux, older glibc releases, and architectures outside the table
-are not release targets. External conversation discovery remains restricted to
-the fixture-validated provider versions and local readable metadata.
-The History view can resume fixture-backed Claude Code, Codex CLI, Pi, OMP,
-and OpenCode sessions, but does not edit, delete, summarize, or upload them.
-Ratatui measurement excludes terminal-driver and multiplexer transport latency;
-see the retained performance evidence below.
-
-
-## Features
-
-### Files
-
-- browse the directory from which the terminal opened the dock;
-- expand and collapse directories with the keyboard or mouse;
-- honor VCS ignore rules, including `.gitignore`, and configurable hidden-file
-  visibility;
-- search project-relative file paths across collapsed directories with a
-  bounded background index that follows the same visibility and ignore rules;
-- support both Git and Jujutsu (`jj`) workspaces;
-- normalize VCS states such as added, modified, deleted, renamed, copied,
-  untracked, and conflicted;
-- color file and directory icons/names from normalized status: added is green,
-  modified is yellow or yellow-orange, and deleted is red; directories inherit
-  the highest-priority status of their descendants;
-- represent deleted files even though they no longer exist on disk;
-- split the Files area into a top tree and a bottom flat list of every file
-  carrying a VCS status (modified, added, untracked, renamed, copied, deleted,
-  conflicted), derived from the latest status snapshot; a muted labeled rule
-  separates the panes and shows the workspace diff totals as green `+N` and
-  red `-N` line counts (tracked changes only; untracked files contribute no
-  line totals), falling back to the file count when the diff is unavailable;
-  the rule lights up while the flat pane owns keyboard focus, and the flat
-  pane hides while the path filter is active;
-- never intentionally modify project files or VCS history.
-
-Jujutsu status requires `jj` 0.37 or newer and is integration-tested against
-`jj` 0.44.0, the latest upstream release when this adapter was implemented.
-The default `Fresh` mode follows Jujutsu's documented automatic working-copy
-snapshot semantics only when Files is activated or manually refreshed with
-`r`; it never polls in the background.
-The injectable `Passive` mode adds `--ignore-working-copy` and marks the
-displayed status as potentially stale. The plugin never issues commit,
-bookmark, operation-rewrite, or other explicit mutation commands.
-
-### History
-
-- list LLM conversations associated with the current project or worktree;
-- discover histories stored inside the project as the preferred source;
-- discover external histories stored elsewhere on the filesystem and associate
-  them through canonical project metadata;
-- merge filesystem history with active Herdr sessions, using Herdr as runtime
-  enrichment rather than as the sole history source;
-- support an extensible set of LLM tools instead of a closed provider list;
-- show at least the title, tool, timestamp, source, and live/archived state;
-- resume supported sessions in a new focused tab of the current Herdr workspace;
-- isolate source-specific failures so one unreadable history cannot hide the
-  others.
-
-Automatic discovery is possible only when a tool exposes readable local
-history or project metadata. Undocumented, encrypted, or remote-only histories
-require a dedicated adapter and cannot be inferred safely.
-
-## Target experience
-
-- `Files` and `History` are two views rendered by the same TUI process;
-- the dock remains the rightmost pane in its tab;
-- at most one dock instance is open per tab;
-- one shortcut toggles between open, focus, and close;
-- each view preserves its selection and scroll position across tab switches;
-  History also preserves collapsed provider groups across refreshes;
-- general UI colors use semantic ANSI slots resolved by Herdr's active user
-  theme; primary VCS colors use deterministic truecolor overrides so terminal
-  palette remapping cannot turn green/yellow/red states into unrelated colors;
-- the project context is captured from the originating terminal before the
-  plugin receives focus.
-
-### Controls
-
-- `Tab` / `Shift+Tab` or `1` / `2`: switch views without restarting the dock;
-- arrow keys or `h` / `j` / `k` / `l`: navigate the focused Files pane (tree or
-  flat modified-files list) or visible Conversation provider/session rows;
-  the flat list shows full project-relative paths with the same status markers;
-- `Home` / `End`: select the first or last visible row;
-- `Enter` / `Space`: expand or collapse the selected directory or Conversation
-  provider; on a Files file row, insert its project-relative `@path` reference
-  followed by a space into the originating pane, then focus that pane; on a
-  resumable Conversation session, open a new focused tab in the current Herdr
-  workspace and launch its harness with that session;
-- `w`: move keyboard focus between the Files tree pane and its flat
-  modified-files pane; activating a missing file there is reported in the
-  notice line instead of inserting a reference;
-- `/`: edit a live Files path filter; `Enter` keeps the filter and returns to
-  result navigation, `Ctrl+U` clears the query while editing, and `Esc` clears
-  an active filter before it can close the TUI;
-- left click selects and focuses whichever Files or Conversation row was
-  clicked, including the flat modified-files pane; right click toggles a Files
-  tree row or Conversation provider, and clicking a Conversation disclosure
-  marker also toggles its group; the mouse wheel navigates the focused pane;
-- `q`, `Esc` with no active Files filter, or `Ctrl+C`: close the TUI and restore
-  the terminal.
-
-### Project-local generic conversations
-
-The History view checks only these registered project-relative locations:
-`.herdr/conversations/` (direct children only), `.herdr/conversations.jsonl`,
-and `.herdr/conversations.json`. It never scans the project recursively.
-
-Generic JSONL records require `session_id`, the canonical project-root `cwd`, an
-RFC 3339 `timestamp`, a `role` (`user`, `assistant`, `system`, or `tool`), and a
-string `message`. A `.json` file contains one record with the same schema.
-Discovery is read-only and bounded; message bodies are validated but never
-returned to the UI or diagnostics.
-Conversations are grouped alphabetically by provider, with sessions ordered
-most-recent-first inside each expanded group. Provider groups can be collapsed
-without loading or exposing transcript content.
-
-### Live Herdr conversations
-
-Conversation history remains filesystem-first. A separate coalesced background
-job reads Herdr's normalized `agent list` session references, associates them
-with the canonical project, and enriches matching rows without writing live
-metadata to the conversation cache. Matching uses, in order, the tool plus
-native session ID, an exact canonical transcript path plus file fingerprint,
-then a verified tool-specific path identity. Titles, timestamps, and path
-prefixes are never identities.
-
-Unmatched active sessions appear as transient live-only rows. Their stable
-documented identity lets selection survive when the filesystem transcript
-appears later. Herdr failures are warnings: filesystem history remains visible.
-The browser exposes status and resumability metadata only; it provides no
-resume, launch, edit, delete, summarize, or upload action.
-
-### Verified external conversations
-
-When Herdr provides `HERDR_PLUGIN_STATE_DIR`, the Conversations worker also
-checks exactly the fixture-backed Claude Code `2.1.232`, Codex CLI `0.147.0`,
-Pi `0.84.1`, OMP `17.3.2`, and OpenCode `1.18.18` stores.
-Encoded directories, date paths, and filenames are only hints: native session
-IDs, timestamps, and canonical `cwd` evidence must agree before metadata is
-accepted.
-
-Discovery runs in bounded recent-first pages on the low-priority worker. Its
-disposable cache below `HERDR_PLUGIN_STATE_DIR/conversations/` uses private
-permissions and atomic generation replacement. It contains only display,
-provenance, resume, fingerprint, and source-watermark metadata—never transcript
-content or opaque provider payloads.
-Large JSONL sessions advance through complete-record cursors instead of being
-loaded or rejected as one file; deleted or replaced sessions are removed after
-a conclusive source refresh. Incomplete bounded inventories preserve prior
-metadata, and source-scoped warnings remain visible beside healthy adapters.
-Platforms where owner-only cache permissions cannot be enforced fail closed
-instead of persisting external metadata.
-
+| Input | Action |
+|---|---|
+| `Tab` / `Shift+Tab`, `1` / `2` | Switch views without restarting the dock |
+| Arrows or `h` `j` `k` `l` | Navigate the focused pane (tree, modified-files list, or conversation rows) |
+| `Home` / `End` | Select the first or last visible row |
+| `Enter` / `Space` | Expand or collapse directories and provider groups; insert `@path` from a file row; resume a resumable session in a new focused tab |
+| `w` | Move focus between the Files tree and its modified-files list; activating a missing file reports in the notice line instead of inserting a reference |
+| `/` | Edit a live path filter — `Enter` keeps it, `Ctrl+U` clears the query while editing, `Esc` clears an active filter before it can close the TUI |
+| Mouse | Click selects and focuses a row, right-click toggles, wheel scrolls the focused pane |
+| `q`, `Esc` with no filter, `Ctrl+C` | Close the dock and restore the terminal |
 
 ## Configuration
 
-The plugin reads `config.toml` from `HERDR_PLUGIN_CONFIG_DIR`. Loading is
-read-only, byte-bounded, and performed on a worker after the first frame.
-An absent file silently uses safe defaults. Malformed files and invalid fields
-fall back independently and produce a sanitized warning in the dock.
+The plugin reads `config.toml` from `HERDR_PLUGIN_CONFIG_DIR` on a worker,
+after the first frame. An absent file silently uses safe defaults; malformed
+files and invalid fields fall back field-by-field and produce a sanitized
+warning in the dock.
 
 ```toml
 [dock]
@@ -300,74 +286,122 @@ toggle_ignored_files = ["i"]
 quit = ["q", "esc", "ctrl+c"]
 ```
 
-Configured history roots remain subject to each adapter's version, layout,
-canonical-project, and metadata bounds. Extra project roots are
-project-relative; extra external roots are absolute. Unsupported or unreadable
-roots are isolated so healthy sources and cached metadata remain visible.
+Extra project roots are project-relative; extra external roots are absolute.
+Every configured root remains subject to its adapter's version, layout, and
+metadata bounds, and unreadable roots are isolated so healthy sources stay
+visible.
 
-`ui.display_mode` controls glyphs in both Files and History:
+`ui.display_mode` controls glyphs in both views:
 
-- `ascii` is the compact terminal-safe default. Files uses ASCII tree
-  connectors with `+` / `-` directories and `f` files; History uses
-  `+` / `-` provider groups and `*` / `-` / `?` session states;
-- `unicode` uses `├──` / `└──` Files connectors, `▸` / `▾` expandable groups,
-  and Unicode file/session bullets;
-- `nerd` keeps the Unicode Files tree and uses Nerd Font folder, typed-file,
-  provider-group, live-session, and history glyphs. Common source,
-  configuration, document, archive, image, and database extensions get a
-  type-specific file icon; unknown files use a generic icon. This mode requires
-  a Nerd Font in the terminal rendering Herdr.
+| Mode | Look | Requires |
+|---|---|---|
+| `ascii` | Tree connectors with `+` / `-` directories and `f` files; `*` / `-` / `?` session states | Nothing — the compact default |
+| `unicode` | `├──` / `└──` connectors, `▸` / `▾` groups, Unicode bullets | A Unicode-capable terminal |
+| `nerd` | Unicode tree plus Nerd Font folder and typed-file icons | A Nerd Font |
 
-All three modes reuse cached state. Changing glyphs adds no filesystem reads,
-conversation discovery, or eager traversal.
+Changing modes reuses cached state — no additional filesystem reads or
+traversal.
 
-Files and VCS refresh immediately when the Files view is activated or `refresh`
-is invoked. Adaptive Git polling starts at the configured minimum, doubles
-while status is unchanged up to the maximum, and resets when status changes.
-It is suspended outside the Files view. Fresh Jujutsu never polls; passive
-Jujutsu polls only when `passive_jujutsu_interval_ms` is non-zero and always
-renders status as potentially stale.
+Files and VCS refresh immediately when Files activates or `refresh` fires.
+Adaptive Git polling starts at the minimum interval, doubles while status is
+unchanged up to the maximum, resets on change, and suspends outside the Files
+view. Fresh Jujutsu never polls; passive Jujutsu polls only when its interval
+is non-zero and always renders status as potentially stale.
+
+## Privacy
+
+- Config: `herdr plugin config-dir herdr-context`, normally below
+  `${XDG_CONFIG_HOME:-$HOME/.config}/herdr/plugins/config/herdr-context/`.
+- State and metadata-only conversation cache: normally below
+  `${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/herdr-context/`.
+- Installed binary and manifest:
+  `${XDG_DATA_HOME:-$HOME/.local/share}/herdr-context/plugin/`.
+
+Release archives contain only the binary, manifest, installer, uninstaller,
+README, and license — no cache, history, credentials, telemetry, developer
+paths, or performance fixtures. Conversation content never leaves the
+machine; the disposable cache stores display, provenance, resume, and
+watermark metadata only, with private permissions and atomic generation
+replacement. Platforms that cannot enforce owner-only cache permissions fail
+closed instead of persisting external metadata.
+
+## Limitations
+
+- Windows, musl Linux, older glibc releases, and architectures outside the
+  target table are not release targets.
+- External history discovery is restricted to the fixture-validated provider
+  versions above; undocumented, encrypted, or remote-only histories need a
+  dedicated adapter and cannot be inferred safely.
+- History can resume sessions but never edits, deletes, summarizes, or
+  uploads them.
 
 ## Design principles
 
-- **Public Herdr integration**: manifest, injected context, CLI, and socket API.
-- **One Rust/Ratatui binary**: no cross-pane IPC for the core user experience.
-- **Filesystem-first conversation discovery**: project-local and external
-  histories are indexed independently from Herdr's session lifecycle.
-- **Responsive by construction**: disk reads, Git/Jujutsu commands, and
-  transcript parsing never block the rendering thread.
-- **Bounded work**: lazy tree expansion, coalesced background jobs, limited
-  caches, incremental history indexing, and suspended inactive-view refreshes.
-- **VCS-neutral core**: Git and Jujutsu adapters feed one normalized status
-  model without leaking backend-specific behavior into the tree or UI.
-- **Read-only and resilient**: a directory without a supported VCS, malformed
-  transcript, or missing tool must never close the dock.
-- **Local privacy**: conversation content is not sent over the network, and
-  the cache stores only the metadata required for discovery and display.
+- **Public Herdr integration** — manifest, injected context, CLI, and socket
+  API only.
+- **One Rust/Ratatui binary** — no cross-pane IPC for the core experience.
+- **Filesystem-first history** — project-local and external conversations are
+  indexed independently of Herdr's session lifecycle.
+- **Responsive by construction** — nothing slow ever runs on the rendering
+  thread.
+- **Bounded work** — lazy expansion, coalesced jobs, limited caches,
+  incremental indexing, suspended refreshes for inactive views.
+- **VCS-neutral core** — Git and Jujutsu feed one normalized model without
+  leaking backend specifics into the UI.
+- **Read-only and resilient** — a missing VCS, malformed transcript, or
+  absent tool must never close the dock.
+- **Local privacy** — conversation content stays off the network; caches hold
+  only what discovery and display require.
+
+## Build from source
+
+Requirements: Rust 1.97.1 (pinned in `Cargo.toml`) and a POSIX shell; `git`
+and `jj` 0.37+ are optional at runtime.
+
+```sh
+git clone https://github.com/Anthodev/herdr-context.git
+cd herdr-context
+cargo build --release --locked
+herdr plugin link "$PWD"
+```
+
+CI gates every change on rustfmt, Clippy with warnings denied, and the full
+test suite.
 
 ## Release status
 
 Version `0.18.0` is the V1 packaging contract. Tag `v0.18.0`, Cargo metadata,
-the source and packaged manifests, binary name, minimum Herdr version, archive
-names, and checksums are validated together. CI builds from `Cargo.lock` and
-blocks publication on formatting, Clippy, tests, release build, manifest,
-archive, checksum, clean-install, and packaged Herdr smoke failures.
+both manifests, the binary name, minimum Herdr version, archive names, and
+checksums are validated together. CI builds from `Cargo.lock` and blocks
+publication on formatting, Clippy, tests, release build, manifest, archive,
+checksum, clean-install, and packaged smoke failures.
 
-Every HDC-15 performance verdict has a retained independent review in
-`release/performance-review.toml`. A failed budget blocks packaging unless its
-record names the accepting authority, rationale, scope, and follow-up issue.
+Every performance budget has a retained independent review in
+`release/performance-review.toml`; a failed budget blocks packaging unless
+its record names the accepting authority, rationale, scope, and follow-up
+issue. Ratatui measurements exclude terminal-driver and multiplexer transport
+latency — see [docs/performance.md](docs/performance.md) for budgets,
+baselines, and residual risks.
 
-## References
+## Acknowledgements
 
-- [Herdr plugins](https://herdr.dev/docs/plugins/)
-- [Herdr socket API](https://herdr.dev/docs/socket-api/)
-- [V1 performance measurement](docs/performance.md) for reproducible budgets,
-  synthetic workloads, retained baselines, and residual risks.
-- [herdr-beads](https://github.com/miiraheart/herdr-beads) for the docked-pane
+- [herdr-beads](https://github.com/miiraheart/herdr-beads) — the docked-pane
   integration pattern
-- [Jujutsu CLI reference](https://docs.jj-vcs.dev/latest/cli-reference/)
-- [Jujutsu templates](https://docs.jj-vcs.dev/latest/templates/)
-- [herdr-file-viewer](https://github.com/smarzban/herdr-file-viewer) for the
+- [herdr-file-viewer](https://github.com/smarzban/herdr-file-viewer) — the
   Git-aware tree and repository trust boundaries
-- [herdr-agent-inbox](https://github.com/douglascorrea/herdr-agent-inbox) for
-  active-session enrichment and examples of native transcript formats
+- [herdr-agent-inbox](https://github.com/douglascorrea/herdr-agent-inbox) —
+  active-session enrichment and native transcript formats
+- [Herdr plugin docs](https://herdr.dev/docs/plugins/) and
+  [socket API](https://herdr.dev/docs/socket-api/)
+- [Jujutsu CLI reference](https://docs.jj-vcs.dev/latest/cli-reference/) and
+  [templates](https://docs.jj-vcs.dev/latest/templates/)
+
+## Contributing
+
+Issues and pull requests are welcome. Bug reports should include the Herdr
+version, OS, terminal, and VCS backend, with steps to reproduce — and no
+conversation content or other personal data.
+
+## License
+
+[MIT](LICENSE).
