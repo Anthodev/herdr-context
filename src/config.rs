@@ -233,6 +233,7 @@ impl UiConfig {
 pub struct FilesConfig {
     show_hidden: bool,
     show_ignored: bool,
+    search_ignored: bool,
     exclusions: Vec<PathBuf>,
 }
 
@@ -245,6 +246,11 @@ impl FilesConfig {
     #[must_use]
     pub const fn show_ignored(&self) -> bool {
         self.show_ignored
+    }
+
+    #[must_use]
+    pub const fn search_ignored(&self) -> bool {
+        self.search_ignored
     }
 
     #[must_use]
@@ -723,7 +729,12 @@ fn parse_config(value: &toml::Value) -> ConfigLoad {
     if let Some(table) = optional_table(root, "files", &mut warnings) {
         warn_unknown_fields(
             table,
-            &["show_hidden", "show_ignored", "exclusions"],
+            &[
+                "show_hidden",
+                "show_ignored",
+                "search_ignored",
+                "exclusions",
+            ],
             "files.unknown_field",
             &mut warnings,
         );
@@ -733,6 +744,12 @@ fn parse_config(value: &toml::Value) -> ConfigLoad {
         config.files.show_ignored = parse_bool(
             table.get("show_ignored"),
             "files.show_ignored",
+            &mut warnings,
+        )
+        .unwrap_or(false);
+        config.files.search_ignored = parse_bool(
+            table.get("search_ignored"),
+            "files.search_ignored",
             &mut warnings,
         )
         .unwrap_or(false);

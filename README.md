@@ -212,6 +212,7 @@ colored_icons = true   # nerd mode only: type-colored file icons
 [files]
 show_hidden = false
 show_ignored = false          # `i` toggles ignored files in-session
+search_ignored = false        # search ignored paths without showing them normally
 exclusions = ["target", "generated/cache"] # project-relative paths
 
 [conversations]
@@ -334,7 +335,7 @@ test suite.
 
 ## Release status
 
-Version `0.19.0` is the current release line. Tag `v0.19.0`, Cargo
+Version `0.19.1` is the current release line. Tag `v0.19.1`, Cargo
 metadata, both manifests, and the minimum Herdr version are validated
 together; pushing a `v*` tag runs formatting, Clippy, the full test suite,
 and the contract checks, then publishes generated GitHub release notes.

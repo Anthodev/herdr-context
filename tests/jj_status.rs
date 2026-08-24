@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use herdr_context::files::FilesModel;
 use herdr_context::files::refresh::RefreshResult;
-use herdr_context::files::tree::TreeNodeKind;
+use herdr_context::files::tree::{FilesTree, TreeNodeKind};
 use herdr_context::vcs::git::GitService;
 use herdr_context::vcs::jj::{JjService, JujutsuMode};
 use herdr_context::vcs::{VcsErrorKind, VcsService, VcsStatusKind};
@@ -94,6 +94,44 @@ fn templated_diff_maps_statuses_types_conflicts_copies_and_renames() {
     assert_eq!(find("typed").kind(), VcsStatusKind::TypeChanged);
     assert_eq!(find("conflicted").kind(), VcsStatusKind::Conflicted);
     assert!(!snapshot.is_stale());
+}
+
+#[test]
+fn deleted_descendant_marks_present_directories_modified() {
+    let temp = TempDir::new().expect("tempdir");
+    fs::create_dir_all(temp.path().join("src/nested")).expect("directories");
+    let script = temp.path().join("fake-jj");
+    executable(
+        &script,
+        "#!/bin/sh\nprintf 'D\\000src/nested/deleted.rs\\000src/nested/deleted.rs\\000false\\000false\\000file\\000\\000'\n",
+    );
+    let mut service =
+        JjService::with_executable(script, JujutsuMode::Fresh, Duration::from_secs(1));
+    let workspace = herdr_context::vcs::VcsWorkspace::new(
+        temp.path().to_path_buf(),
+        herdr_context::vcs::VcsBackendMetadata::new("jj", "Jujutsu", true).expect("metadata"),
+    )
+    .expect("workspace");
+    let snapshot = service.refresh_status(&workspace).expect("status");
+    let mut tree = FilesTree::new(temp.path().to_path_buf()).expect("tree");
+    tree.load_directory(Path::new("")).expect("root");
+    tree.merge_status(&snapshot).expect("status overlay");
+
+    assert_eq!(
+        tree.node(Path::new("src")).expect("src").status(),
+        Some(VcsStatusKind::Modified)
+    );
+    tree.load_directory(Path::new("src")).expect("src");
+    assert_eq!(
+        tree.node(Path::new("src/nested")).expect("nested").status(),
+        Some(VcsStatusKind::Modified)
+    );
+    assert_eq!(
+        tree.node(Path::new("src/nested/deleted.rs"))
+            .expect("deleted")
+            .status(),
+        Some(VcsStatusKind::Deleted)
+    );
 }
 
 #[test]

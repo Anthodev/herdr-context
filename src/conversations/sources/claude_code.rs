@@ -5,9 +5,9 @@ use serde::Deserialize;
 use serde::de::IgnoredAny;
 
 use super::known_stores::{
-    EntryKind, FormatFailure, KnownFormat, KnownJsonlSource, KnownStore, ParsedMetadata,
-    canonical_cwd, claude_project_directory, parse_rfc3339, push_listing_error, push_shape_error,
-    validate_uuid,
+    EntryKind, FormatFailure, KnownFormat, KnownJsonlSource, KnownStore, MAX_CANDIDATE_PATHS,
+    ParsedMetadata, canonical_cwd, claude_project_directory, parse_rfc3339, push_inventory_error,
+    push_listing_error, push_shape_error, validate_tool_version, validate_uuid,
 };
 use super::{
     ConversationCandidate, ConversationSource, ConversationSourceError, DiscoveryBatch,
@@ -18,7 +18,8 @@ use crate::conversations::Conversation;
 use crate::project::ProjectIdentity;
 
 const SOURCE_ID: &str = "claude-code";
-const VERSION: &str = "2.1.232";
+const MAX_PROJECT_DIRECTORIES: usize = 2_000;
+const MAX_VISITED_ENTRIES: usize = MAX_CANDIDATE_PATHS + MAX_PROJECT_DIRECTORIES;
 
 #[derive(Debug)]
 pub struct ClaudeCodeSource {
@@ -107,6 +108,14 @@ impl KnownFormat for ClaudeCodeFormat {
         SOURCE_ID
     }
 
+    fn report_project_mismatch(&self) -> bool {
+        false
+    }
+
+    fn adapter_revision(&self) -> u32 {
+        1
+    }
+
     fn list_candidates(
         &self,
         store: &KnownStore,
@@ -114,42 +123,110 @@ impl KnownFormat for ClaudeCodeFormat {
         errors: &mut Vec<ConversationSourceError>,
         cancelled: &AtomicBool,
     ) -> Vec<PathBuf> {
-        let directory = PathBuf::from(claude_project_directory(project.root()));
-        let entries = match store.list_directory(&directory) {
+        let expected = PathBuf::from(claude_project_directory(project.root()));
+        let entries = match store.list_directory(Path::new("")) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
             Err(error) => {
                 push_listing_error(
                     errors,
                     SOURCE_ID,
-                    store.absolute(&directory),
-                    "Claude project store cannot be listed",
+                    store.absolute(Path::new(".")),
+                    "Claude projects store cannot be listed",
                     &error,
                 );
                 return Vec::new();
             }
         };
-        let mut files = Vec::new();
+        let mut directories = Vec::new();
+        let mut visited_entries = 0_usize;
         for (name, kind) in entries {
-            let relative = directory.join(&name);
+            if cancelled.load(Ordering::Relaxed) {
+                return Vec::new();
+            }
+            visited_entries = visited_entries.saturating_add(1);
+            let relative = PathBuf::from(&name);
+            if kind == EntryKind::Directory {
+                directories.push(relative);
+            } else {
+                push_shape_error(
+                    errors,
+                    SOURCE_ID,
+                    store.absolute(&relative),
+                    "Claude projects store contains a non-directory entry",
+                );
+            }
+        }
+        directories.sort_unstable_by(|left, right| {
+            (left != &expected)
+                .cmp(&(right != &expected))
+                .then_with(|| left.cmp(right))
+        });
+        if directories.len() > MAX_PROJECT_DIRECTORIES {
+            push_inventory_error(
+                errors,
+                SOURCE_ID,
+                store.absolute(Path::new(".")),
+                "Claude projects store exceeds the bounded directory inventory",
+            );
+            directories.truncate(MAX_PROJECT_DIRECTORIES);
+        }
+
+        let mut files = Vec::new();
+        for directory in directories {
             if cancelled.load(Ordering::Relaxed) {
                 break;
             }
-            match kind {
-                EntryKind::File
-                    if Path::new(&name)
-                        .extension()
-                        .is_some_and(|value| value == "jsonl") =>
-                {
-                    files.push(relative);
+            let entries = match store.list_directory(&directory) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    push_listing_error(
+                        errors,
+                        SOURCE_ID,
+                        store.absolute(&directory),
+                        "Claude project store cannot be listed",
+                        &error,
+                    );
+                    continue;
                 }
-                EntryKind::File | EntryKind::Directory | EntryKind::Symlink | EntryKind::Other => {
+            };
+            for (name, kind) in entries {
+                if cancelled.load(Ordering::Relaxed) {
+                    return files;
+                }
+                if visited_entries == MAX_VISITED_ENTRIES {
+                    push_inventory_error(
+                        errors,
+                        SOURCE_ID,
+                        store.absolute(Path::new(".")),
+                        "Claude projects store exceeds the bounded traversal budget",
+                    );
+                    return files;
+                }
+                visited_entries += 1;
+                let relative = directory.join(&name);
+                if kind == EntryKind::File
+                    && Path::new(&name)
+                        .extension()
+                        .is_some_and(|value| value == "jsonl")
+                {
+                    if files.len() == MAX_CANDIDATE_PATHS {
+                        push_inventory_error(
+                            errors,
+                            SOURCE_ID,
+                            store.absolute(Path::new(".")),
+                            "Claude projects store exceeds the bounded session inventory",
+                        );
+                        return files;
+                    }
+                    files.push(relative);
+                } else {
                     push_shape_error(
                         errors,
                         SOURCE_ID,
                         store.absolute(&relative),
                         "Claude store entry is outside the verified flat JSONL layout",
-                    )
+                    );
                 }
             }
         }
@@ -164,12 +241,8 @@ impl KnownFormat for ClaudeCodeFormat {
         cancelled: &AtomicBool,
         previous: Option<&ParsedMetadata>,
     ) -> Result<ParsedMetadata, FormatFailure> {
-        let expected_directory = claude_project_directory(project.root());
-        if relative.parent().and_then(Path::file_name) != Some(expected_directory.as_os_str()) {
-            return Err(FormatFailure::project_mismatch(
-                "Claude encoded project directory conflicts with canonical cwd",
-            ));
-        }
+        let encoded_directory_matches = relative.parent().and_then(Path::file_name)
+            == Some(claude_project_directory(project.root()).as_os_str());
         let expected_id = relative
             .file_stem()
             .and_then(|value| value.to_str())
@@ -202,35 +275,48 @@ impl KnownFormat for ClaudeCodeFormat {
             }
 
             let carries_identity = match record.kind.as_str() {
-                "user" | "assistant" => true,
-                "attachment" => false,
+                "user" | "assistant" | "system" => true,
+                "attachment" => {
+                    record.session_id.is_some()
+                        || record.cwd.is_some()
+                        || record.version.is_some()
+                        || record.is_sidechain.is_some()
+                }
+                "last-prompt"
+                | "permission-mode"
+                | "ai-title"
+                | "file-history-snapshot"
+                | "queue-operation" => false,
                 _ => {
                     return Err(FormatFailure::unsupported(
-                        "Claude record type is outside the verified current set",
+                        "Claude record type is outside the validated current set",
                     ));
                 }
             };
             if carries_identity {
-                if record.message.is_none() || record.attachment.is_some() {
+                let payload_shape_valid = match record.kind.as_str() {
+                    "user" | "assistant" => record.message.is_some() && record.attachment.is_none(),
+                    "attachment" => record.attachment.is_some() && record.message.is_none(),
+                    "system" => {
+                        record
+                            .subtype
+                            .as_deref()
+                            .is_some_and(|value| !value.is_empty())
+                            && record.message.is_none()
+                            && record.attachment.is_none()
+                    }
+                    _ => false,
+                };
+                if !payload_shape_valid {
                     return Err(FormatFailure::unsupported(
-                        "Claude transcript record has an invalid message payload shape",
+                        "Claude transcript record has an invalid payload shape",
                     ));
                 }
-                let native_id = record.session_id.as_deref().ok_or_else(|| {
-                    FormatFailure::unsupported(
-                        "Claude transcript record is missing its native session identifier",
-                    )
-                })?;
-                validate_uuid(native_id, 4)?;
-                if native_id != expected_id {
+                let native_id = validate_claude_session(&record, expected_id)?;
+                validate_tool_version(record.version.as_deref())?;
+                if record.is_sidechain != Some(false) {
                     return Err(FormatFailure::unsupported(
-                        "Claude filename and native session identifier conflict",
-                    ));
-                }
-                if record.version.as_deref() != Some(VERSION) || record.is_sidechain != Some(false)
-                {
-                    return Err(FormatFailure::unsupported(
-                        "Claude record version or sidechain shape is unsupported",
+                        "Claude sidechain transcript records are unsupported",
                     ));
                 }
                 if session_id.as_deref().is_some_and(|id| id != native_id) {
@@ -239,14 +325,22 @@ impl KnownFormat for ClaudeCodeFormat {
                     ));
                 }
 
-                let cwd = canonical_cwd(
-                    record.cwd.as_deref().ok_or_else(|| {
+                let cwd = match record.cwd.as_deref() {
+                    Some(cwd) => canonical_cwd(cwd, project)?,
+                    None if encoded_directory_matches => crate::project::CanonicalPath::new(
+                        project.root().to_path_buf(),
+                    )
+                    .map_err(|_| {
                         FormatFailure::project_mismatch(
-                            "Claude transcript record is missing canonical cwd",
+                            "Claude encoded project directory cannot be canonicalized",
                         )
                     })?,
-                    project,
-                )?;
+                    None => {
+                        return Err(FormatFailure::project_mismatch(
+                            "Claude record has neither canonical cwd nor matching project directory",
+                        ));
+                    }
+                };
                 if canonical
                     .as_ref()
                     .is_some_and(|current: &crate::project::CanonicalPath| {
@@ -285,32 +379,101 @@ impl KnownFormat for ClaudeCodeFormat {
                 previous_uuid = Some(uuid.to_owned());
                 canonical = Some(cwd);
             } else {
-                if record.attachment.is_none() || record.message.is_some() {
-                    return Err(FormatFailure::unsupported(
-                        "Claude attachment record has an invalid payload shape",
-                    ));
+                match record.kind.as_str() {
+                    "attachment" => {
+                        if record.attachment.is_none()
+                            || record.message.is_some()
+                            || record.version.is_some()
+                            || record.cwd.is_some()
+                            || record.session_id.is_some()
+                            || record.is_sidechain.is_some()
+                            || record.parent_uuid.is_some()
+                        {
+                            return Err(FormatFailure::unsupported(
+                                "Claude attachment record has an invalid payload shape",
+                            ));
+                        }
+                        validate_uuid(
+                            record.uuid.as_deref().ok_or_else(|| {
+                                FormatFailure::unsupported(
+                                    "Claude attachment is missing its native entry identifier",
+                                )
+                            })?,
+                            4,
+                        )?;
+                        let timestamp =
+                            parse_rfc3339(record.timestamp.as_deref().ok_or_else(|| {
+                                FormatFailure::unsupported(
+                                    "Claude attachment is missing its timestamp",
+                                )
+                            })?)?;
+                        created_at =
+                            Some(created_at.map_or(timestamp, |current| current.min(timestamp)));
+                        updated_at =
+                            Some(updated_at.map_or(timestamp, |current| current.max(timestamp)));
+                    }
+                    "last-prompt" => {
+                        validate_claude_session(&record, expected_id)?;
+                        validate_uuid(
+                            record.leaf_uuid.as_deref().ok_or_else(|| {
+                                FormatFailure::unsupported(
+                                    "Claude last-prompt record is missing its leaf UUID",
+                                )
+                            })?,
+                            4,
+                        )?;
+                    }
+                    "permission-mode" => {
+                        validate_claude_session(&record, expected_id)?;
+                        if record.permission_mode.is_none() {
+                            return Err(FormatFailure::unsupported(
+                                "Claude permission-mode record is missing its mode",
+                            ));
+                        }
+                    }
+                    "ai-title" => {
+                        validate_claude_session(&record, expected_id)?;
+                        if record.ai_title.is_none() {
+                            return Err(FormatFailure::unsupported(
+                                "Claude ai-title record is missing its title",
+                            ));
+                        }
+                    }
+                    "queue-operation" => {
+                        validate_claude_session(&record, expected_id)?;
+                        if record.operation.is_none() {
+                            return Err(FormatFailure::unsupported(
+                                "Claude queue-operation record is missing its operation",
+                            ));
+                        }
+                        let timestamp =
+                            parse_rfc3339(record.timestamp.as_deref().ok_or_else(|| {
+                                FormatFailure::unsupported(
+                                    "Claude queue-operation record is missing its timestamp",
+                                )
+                            })?)?;
+                        created_at =
+                            Some(created_at.map_or(timestamp, |current| current.min(timestamp)));
+                        updated_at =
+                            Some(updated_at.map_or(timestamp, |current| current.max(timestamp)));
+                    }
+                    "file-history-snapshot" => {
+                        validate_uuid(
+                            record.message_id.as_deref().ok_or_else(|| {
+                                FormatFailure::unsupported(
+                                    "Claude file-history snapshot is missing its message UUID",
+                                )
+                            })?,
+                            4,
+                        )?;
+                        if record.snapshot.is_none() || record.is_snapshot_update.is_none() {
+                            return Err(FormatFailure::unsupported(
+                                "Claude file-history snapshot has an invalid payload shape",
+                            ));
+                        }
+                    }
+                    _ => unreachable!("record kind classified above"),
                 }
-                if record.version.is_some()
-                    || record.cwd.is_some()
-                    || record.session_id.is_some()
-                    || record.is_sidechain.is_some()
-                    || record.parent_uuid.is_some()
-                {
-                    return Err(FormatFailure::unsupported(
-                        "Claude attachment unexpectedly contains transcript identity fields",
-                    ));
-                }
-                let uuid = record.uuid.as_deref().ok_or_else(|| {
-                    FormatFailure::unsupported(
-                        "Claude attachment is missing its native entry identifier",
-                    )
-                })?;
-                validate_uuid(uuid, 4)?;
-                let timestamp = parse_rfc3339(record.timestamp.as_deref().ok_or_else(|| {
-                    FormatFailure::unsupported("Claude attachment is missing its timestamp")
-                })?)?;
-                created_at = Some(created_at.map_or(timestamp, |current| current.min(timestamp)));
-                updated_at = Some(updated_at.map_or(timestamp, |current| current.max(timestamp)));
             }
             record_count = record_count.saturating_add(1);
         }
@@ -356,4 +519,33 @@ struct ClaudeRecord {
     kind: String,
     uuid: Option<String>,
     timestamp: Option<String>,
+    subtype: Option<String>,
+    #[serde(rename = "leafUuid")]
+    leaf_uuid: Option<String>,
+    #[serde(rename = "permissionMode")]
+    permission_mode: Option<IgnoredAny>,
+    #[serde(rename = "aiTitle")]
+    ai_title: Option<IgnoredAny>,
+    #[serde(rename = "messageId")]
+    message_id: Option<String>,
+    snapshot: Option<IgnoredAny>,
+    #[serde(rename = "isSnapshotUpdate")]
+    is_snapshot_update: Option<bool>,
+    operation: Option<IgnoredAny>,
+}
+
+fn validate_claude_session<'a>(
+    record: &'a ClaudeRecord,
+    expected_id: &str,
+) -> Result<&'a str, FormatFailure> {
+    let native_id = record.session_id.as_deref().ok_or_else(|| {
+        FormatFailure::unsupported("Claude record is missing its native session identifier")
+    })?;
+    validate_uuid(native_id, 4)?;
+    if native_id != expected_id {
+        return Err(FormatFailure::unsupported(
+            "Claude filename and native session identifier conflict",
+        ));
+    }
+    Ok(native_id)
 }

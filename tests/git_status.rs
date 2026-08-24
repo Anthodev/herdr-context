@@ -7,6 +7,7 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+use herdr_context::files::tree::FilesTree;
 use herdr_context::vcs::git::GitService;
 use herdr_context::vcs::{VcsService, VcsStatusKind};
 use tempfile::TempDir;
@@ -72,6 +73,42 @@ fn real_worktree_produces_normalized_modified_deleted_renamed_and_untracked_entr
     assert_eq!(renamed.kind(), VcsStatusKind::Renamed);
     assert_eq!(renamed.source_path(), Some(Path::new("old name.txt")));
     assert_eq!(find("untracked space.txt").kind(), VcsStatusKind::Untracked);
+}
+
+#[test]
+fn deleted_descendant_marks_present_directories_modified() {
+    let repository = repository();
+    fs::create_dir_all(repository.path().join("src/nested")).expect("directories");
+    fs::write(repository.path().join("src/nested/deleted.rs"), "before").expect("fixture");
+    git(repository.path(), &["add", "."]);
+    git(repository.path(), &["commit", "--quiet", "-m", "fixture"]);
+    fs::remove_file(repository.path().join("src/nested/deleted.rs")).expect("delete");
+
+    let mut service = GitService::new(Duration::from_secs(5));
+    let workspace = service
+        .detect(repository.path())
+        .expect("detect")
+        .expect("Git workspace");
+    let snapshot = service.refresh_status(&workspace).expect("status");
+    let mut tree = FilesTree::new(repository.path().to_path_buf()).expect("tree");
+    tree.load_directory(Path::new("")).expect("root");
+    tree.merge_status(&snapshot).expect("status overlay");
+
+    assert_eq!(
+        tree.node(Path::new("src")).expect("src").status(),
+        Some(VcsStatusKind::Modified)
+    );
+    tree.load_directory(Path::new("src")).expect("src");
+    assert_eq!(
+        tree.node(Path::new("src/nested")).expect("nested").status(),
+        Some(VcsStatusKind::Modified)
+    );
+    assert_eq!(
+        tree.node(Path::new("src/nested/deleted.rs"))
+            .expect("deleted")
+            .status(),
+        Some(VcsStatusKind::Deleted)
+    );
 }
 
 #[test]

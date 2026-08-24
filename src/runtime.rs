@@ -253,6 +253,7 @@ pub struct FilesRuntime {
     display_mode: DisplayMode,
     colored_icons: bool,
     show_ignored: bool,
+    search_ignored: bool,
     search: Option<FileSearchState>,
 }
 
@@ -426,6 +427,7 @@ impl FilesRuntime {
             display_mode: ui.display_mode(),
             colored_icons: ui.colored_icons(),
             show_ignored: files_config.show_ignored(),
+            search_ignored: files_config.search_ignored(),
             search: None,
         };
         runtime.rebuild_visible_rows();
@@ -678,7 +680,11 @@ impl FilesRuntime {
         let changed = if let Some(search) = &mut self.search {
             !std::mem::replace(&mut search.editing, true)
         } else {
-            let index = self.model.tree().search_index(MAX_INDEX_ENTRIES);
+            let tree = self
+                .model
+                .tree()
+                .with_show_ignored(self.show_ignored || self.search_ignored);
+            let index = tree.search_index(MAX_INDEX_ENTRIES);
             self.search = Some(FileSearchState::new(index));
             true
         };
@@ -3126,6 +3132,96 @@ mod tests {
     }
 
     #[test]
+    fn configured_search_finds_ignored_paths_only_in_projection() {
+        let project = TempDir::new().expect("project");
+        fs::create_dir(project.path().join(".git")).expect("Git marker");
+        fs::write(
+            project.path().join(".gitignore"),
+            "ignored.txt\nignored-dir/\n",
+        )
+        .expect("gitignore");
+        fs::write(project.path().join("visible.txt"), []).expect("visible file");
+        fs::write(project.path().join("ignored.txt"), []).expect("ignored file");
+        fs::create_dir(project.path().join("ignored-dir")).expect("ignored directory");
+        fs::write(project.path().join("ignored-dir/needle.txt"), []).expect("ignored descendant");
+        fs::create_dir(project.path().join("hard")).expect("excluded directory");
+        fs::write(project.path().join("hard/needle.txt"), []).expect("excluded descendant");
+        fs::create_dir(project.path().join(".hidden")).expect("hidden directory");
+        fs::write(project.path().join(".hidden/needle.txt"), []).expect("hidden descendant");
+        let config_dir = TempDir::new().expect("config");
+        fs::write(
+            config_dir.path().join("config.toml"),
+            "[files]\nsearch_ignored = true\nexclusions = [\"hard\"]\n",
+        )
+        .expect("config file");
+        let config = PluginConfig::load_from_dir(config_dir.path()).into_config();
+        let context = LaunchContext::from_vars([(
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            format!(
+                r#"{{"workspace_id":"workspace","tab_id":"tab","pane_id":"pane","cwd":"{}"}}"#,
+                project.path().display()
+            ),
+        )])
+        .expect("context");
+        let mut runtime =
+            FilesRuntime::bootstrap_with_config(&context, &config).expect("configured runtime");
+        let mut workers = workers();
+
+        assert!(
+            runtime
+                .model
+                .tree()
+                .node(Path::new("ignored.txt"))
+                .is_none()
+        );
+        assert!(
+            runtime
+                .model
+                .tree()
+                .node(Path::new("ignored-dir"))
+                .is_none()
+        );
+        assert!(runtime.model.tree().node(Path::new("hard")).is_none());
+        assert!(runtime.handle_intent(&Intent::BeginFileSearch, &mut workers));
+        assert!(runtime.handle_intent(&Intent::FileSearchInput("needle".to_owned()), &mut workers));
+        while runtime
+            .search
+            .as_ref()
+            .is_some_and(FileSearchState::scanning)
+        {
+            runtime.complete_background(receive(&mut workers), &mut workers);
+        }
+
+        assert_eq!(
+            runtime.visible_rows,
+            [
+                PathBuf::from("ignored-dir"),
+                PathBuf::from("ignored-dir/needle.txt")
+            ]
+        );
+        let search = runtime.search.as_ref().expect("search");
+        assert!(
+            search
+                .index
+                .node(Path::new("ignored-dir/needle.txt"))
+                .is_some_and(|node| node.is_ignored())
+        );
+        assert!(search.index.node(Path::new("hard/needle.txt")).is_none());
+        assert!(search.index.node(Path::new(".hidden/needle.txt")).is_none());
+
+        assert!(runtime.handle_intent(&Intent::FileSearchCancel, &mut workers));
+        assert!(!runtime.visible_rows.contains(&PathBuf::from("ignored-dir")));
+        assert!(
+            runtime
+                .model
+                .tree()
+                .node(Path::new("ignored-dir"))
+                .is_none()
+        );
+        workers.shutdown();
+    }
+
+    #[test]
     fn empty_file_search_redraws_when_indexing_finishes() {
         let temp = TempDir::new().expect("tempdir");
         fs::write(temp.path().join("main.rs"), []).expect("file");
@@ -3223,7 +3319,7 @@ mod tests {
         runtime.render(area, &mut Buffer::empty(area));
         let mut buffer = Buffer::empty(area);
         runtime.render(area, &mut buffer);
-        assert!(rendered_lines(&buffer, area)[2].starts_with("- Changed (0)"));
+        assert!(rendered_lines(&buffer, area)[2].starts_with("- Changes (0)"));
         assert!(rendered_lines(&buffer, area)[3].starts_with("VCS status unavailable"));
 
         complete_status(
@@ -3247,7 +3343,7 @@ mod tests {
             .to_uppercase();
         assert!(lines[0].starts_with(&project_label));
         assert!(lines[1].contains("src"));
-        assert!(lines[2].starts_with("- Changed +2 -1"));
+        assert!(lines[2].starts_with("- Changes +2 -1"));
         assert!(lines[3].starts_with("? fresh.rs"));
         // The flat pane is viewport-bounded: rows beyond the half stay hidden.
         assert!(!lines.iter().any(|line| line.contains("kept.rs")));

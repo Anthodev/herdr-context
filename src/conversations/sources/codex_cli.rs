@@ -7,7 +7,7 @@ use serde::de::IgnoredAny;
 use super::known_stores::{
     EntryKind, FormatFailure, KnownFormat, KnownJsonlSource, KnownStore, MAX_CANDIDATE_PATHS,
     ParsedMetadata, canonical_cwd, parse_rfc3339, push_inventory_error, push_listing_error,
-    push_shape_error, validate_uuid,
+    push_shape_error, validate_tool_version, validate_uuid,
 };
 use super::{
     ConversationCandidate, ConversationSource, ConversationSourceError, DiscoveryBatch,
@@ -18,7 +18,6 @@ use crate::conversations::Conversation;
 use crate::project::ProjectIdentity;
 
 const SOURCE_ID: &str = "codex-cli";
-const VERSION: &str = "0.147.0";
 const MAX_LAYOUT_DIRECTORIES: usize = 2_000;
 const MAX_VISITED_ENTRIES: usize = MAX_CANDIDATE_PATHS + 3 * MAX_LAYOUT_DIRECTORIES;
 
@@ -109,6 +108,14 @@ impl KnownFormat for CodexCliFormat {
         SOURCE_ID
     }
 
+    fn report_project_mismatch(&self) -> bool {
+        false
+    }
+
+    fn adapter_revision(&self) -> u32 {
+        1
+    }
+
     fn list_candidates(
         &self,
         store: &KnownStore,
@@ -118,6 +125,7 @@ impl KnownFormat for CodexCliFormat {
     ) -> Vec<PathBuf> {
         let mut directories = vec![PathBuf::new()];
         let mut files = Vec::new();
+        let mut compressed_seen = false;
         let mut visited_entries = 0_usize;
         for depth in 0..3 {
             let mut children = Vec::new();
@@ -221,6 +229,16 @@ impl KnownFormat for CodexCliFormat {
                         return files;
                     }
                     files.push(relative);
+                } else if kind == EntryKind::File && codex_compressed_file_name(Path::new(&name)) {
+                    if !compressed_seen {
+                        push_shape_error(
+                            errors,
+                            SOURCE_ID,
+                            store.absolute(&relative),
+                            "Codex compressed rollouts are not readable; keep the JSONL rollout available",
+                        );
+                        compressed_seen = true;
+                    }
                 } else {
                     push_shape_error(
                         errors,
@@ -276,11 +294,7 @@ impl KnownFormat for CodexCliFormat {
                         "Codex session_meta thread and session identifiers conflict",
                     ));
                 }
-                if header.payload.cli_version.as_deref() != Some(VERSION) {
-                    return Err(FormatFailure::unsupported(
-                        "Codex CLI version is outside the committed inventory",
-                    ));
-                }
+                validate_tool_version(header.payload.cli_version.as_deref())?;
                 let history = CodexHistory::from_header(
                     header.payload.history_mode.as_deref(),
                     header.ordinal,
@@ -430,6 +444,12 @@ fn valid_date_component(depth: usize, value: &std::ffi::OsStr) -> bool {
 fn codex_file_name(path: &Path) -> Option<&str> {
     let name = path.file_name()?.to_str()?;
     (name.starts_with("rollout-") && name.ends_with(".jsonl")).then_some(name)
+}
+
+fn codex_compressed_file_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl.zst"))
 }
 
 fn validate_codex_path(relative: &Path, id: &str) -> Result<(), FormatFailure> {
