@@ -285,7 +285,9 @@ fn render_header(header: &str, area: Rect, buffer: &mut Buffer) {
         return;
     }
     let label = sanitize_terminal_text(header).to_uppercase();
-    Span::styled(label, Style::new().fg(theme::ACCENT).bold()).render(area, buffer);
+    let style = Style::new().fg(theme::ACCENT).bold();
+    buffer.set_style(area, style);
+    Span::raw(label).render(area, buffer);
 }
 const fn status_marker(status: Option<VcsStatusKind>) -> (&'static str, Style) {
     match status {
@@ -387,8 +389,8 @@ pub(crate) fn render_changed_divider(
     let mut plain_width = glyph.chars().count() + 2;
     labeled.push(Span::styled(glyph, line_style));
     labeled.push(Span::raw(" "));
-    plain_width += "Changed".chars().count();
-    labeled.push(Span::styled("Changed", label_style));
+    plain_width += "Changes".chars().count();
+    labeled.push(Span::styled("Changes", label_style));
     match diff {
         Some(stats) if stats.insertions() != 0 || stats.deletions() != 0 => {
             let insertions = format!(" +{}", stats.insertions());
@@ -640,6 +642,12 @@ mod tests {
                 .modifier
                 .contains(ratatui::style::Modifier::BOLD)
         );
+        assert_eq!(buffer[(area.width - 1, 0)].fg, theme::ACCENT);
+        assert!(
+            buffer[(area.width - 1, 0)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
         let row = (0..area.width)
             .map(|column| buffer[(column, 1)].symbol())
             .collect::<String>();
@@ -840,7 +848,7 @@ mod tests {
                 .map(|x| buffer[(x, 0)].symbol())
                 .collect::<String>()
         };
-        assert!(line(&muted).starts_with("- Changed +12 -4 -"));
+        assert!(line(&muted).starts_with("- Changes +12 -4 -"));
         assert!(line(&muted).ends_with('-'));
         // Same glyphs in both states; only the label styling changes.
         assert_eq!(line(&muted), line(&focused));
@@ -856,7 +864,7 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         super::render_changed_divider(3, None, false, DisplayMode::Ascii, None, area, &mut buffer);
         let line: String = (0..area.width).map(|x| buffer[(x, 0)].symbol()).collect();
-        assert!(line.starts_with("- Changed (3) -"));
+        assert!(line.starts_with("- Changes (3) -"));
 
         // Zeroed totals stay quiet instead of showing "+0 -0".
         let mut zeroed = Buffer::empty(area);
@@ -870,7 +878,7 @@ mod tests {
             &mut zeroed,
         );
         let line: String = (0..area.width).map(|x| zeroed[(x, 0)].symbol()).collect();
-        assert!(line.starts_with("- Changed -"));
+        assert!(line.starts_with("- Changes -"));
     }
 
     #[test]
@@ -887,7 +895,7 @@ mod tests {
             &mut buffer,
         );
         let line: String = (0..area.width).map(|x| buffer[(x, 0)].symbol()).collect();
-        assert!(line.starts_with("─ Changed (1) ─"));
+        assert!(line.starts_with("─ Changes (1) ─"));
     }
 
     #[test]
@@ -913,7 +921,7 @@ mod tests {
             &mut buffer,
         );
         let line: String = (0..area.width).map(|x| buffer[(x, 0)].symbol()).collect();
-        assert!(line.starts_with("- Changed (3) "));
+        assert!(line.starts_with("- Changes (3) "));
         assert!(line.ends_with(" manual"));
 
         // Too narrow for the hint: it disappears before the label does.

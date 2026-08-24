@@ -8,7 +8,7 @@ use herdr_context::conversations::discovery::discover_conversations;
 use herdr_context::conversations::sources::{
     ClaudeCodeSource, CodexCliSource, ConversationSource, ConversationSourceErrorKind,
     DiscoveryLimit, KnownStoreRoots, MetadataBudget, OmpSource, OpenCodeSource, PiSource,
-    SourceRegistry,
+    SourceRegistry, SourceWatermark,
 };
 use herdr_context::conversations::{ProvenanceKind, ResumeCapability};
 use herdr_context::project::ProjectIdentity;
@@ -625,7 +625,7 @@ fn partial_final_records_are_ignored_but_complete_prefixes_are_indexed() {
 }
 
 #[test]
-fn conflicting_cwd_and_unverified_versions_are_adapter_scoped_errors() {
+fn conflicting_cwd_and_malformed_versions_are_adapter_scoped() {
     let (_project_dir, project) = project();
     let foreign = TempDir::new().expect("foreign project");
     let foreign = fs::canonicalize(foreign.path()).expect("canonical foreign path");
@@ -650,8 +650,8 @@ fn conflicting_cwd_and_unverified_versions_are_adapter_scoped_errors() {
         .join("2026/01/02/rollout-2026-01-02T03-04-05-019b7c3b-af88-7000-8001-000000000001.jsonl");
     let codex = fs::read_to_string(&codex_path)
         .expect("Codex fixture")
-        .replace("0.147.0", "0.148.0");
-    fs::write(&codex_path, codex).expect("unsupported Codex fixture");
+        .replace("0.147.0", "0.149-current");
+    fs::write(&codex_path, codex).expect("malformed Codex fixture");
 
     let registry =
         SourceRegistry::new(roots.sources(project.clone()).expect("sources")).expect("registry");
@@ -676,7 +676,7 @@ fn conflicting_cwd_and_unverified_versions_are_adapter_scoped_errors() {
             .collect::<Vec<_>>(),
         ["omp", "opencode", "pi"]
     );
-    assert!(discovery.errors().iter().any(|error| {
+    assert!(!discovery.errors().iter().any(|error| {
         error.source_id().as_str() == "claude-code"
             && error.kind() == ConversationSourceErrorKind::ProjectMismatch
     }));
@@ -686,6 +686,296 @@ fn conflicting_cwd_and_unverified_versions_are_adapter_scoped_errors() {
     }));
 }
 
+#[test]
+fn compatible_patch_versions_are_accepted_by_validated_shape() {
+    let (_project_dir, project) = project();
+    let home = TempDir::new().expect("home");
+    install_valid_fixtures(home.path(), &project);
+    let roots = KnownStoreRoots::under_home(home.path());
+
+    let claude_path = roots
+        .claude_code()
+        .join(claude_directory(&project))
+        .join("11111111-1111-4111-8111-111111111111.jsonl");
+    let claude = fs::read_to_string(&claude_path)
+        .expect("Claude fixture")
+        .replace("2.1.232", "2.1.140");
+    fs::write(&claude_path, claude).expect("compatible Claude fixture");
+
+    let codex_path = roots
+        .codex_cli()
+        .join("2026/01/02/rollout-2026-01-02T03-04-05-019b7c3b-af88-7000-8001-000000000001.jsonl");
+    let codex = fs::read_to_string(&codex_path)
+        .expect("Codex fixture")
+        .replace("0.147.0", "0.149.1");
+    fs::write(&codex_path, codex).expect("compatible Codex fixture");
+
+    let registry =
+        SourceRegistry::new(roots.sources(project.clone()).expect("sources")).expect("registry");
+    let discovery = discover_conversations(
+        &registry,
+        &project,
+        &HashMap::new(),
+        DiscoveryLimit::new(8).expect("limit"),
+        MetadataBudget::new(512 * 1024).expect("budget"),
+    );
+
+    assert_eq!(discovery.conversations().len(), 5);
+    assert!(discovery.errors().is_empty(), "{:?}", discovery.errors());
+}
+
+#[test]
+fn adapter_revision_revisits_legacy_cached_rejections() {
+    let (_project_dir, project) = project();
+    let home = TempDir::new().expect("home");
+    install_valid_fixtures(home.path(), &project);
+    let roots = KnownStoreRoots::under_home(home.path());
+    let source =
+        CodexCliSource::new(project.clone(), roots.codex_cli().to_path_buf()).expect("source");
+    let first = source
+        .discover(
+            &project,
+            None,
+            DiscoveryLimit::new(8).expect("discovery limit"),
+        )
+        .expect("initial discovery");
+    let mut legacy = serde_json::from_str::<serde_json::Value>(
+        first.next_watermark().expect("watermark").token(),
+    )
+    .expect("watermark JSON");
+    for entry in legacy.as_object_mut().expect("watermark map").values_mut() {
+        entry
+            .as_object_mut()
+            .expect("watermark entry")
+            .remove("adapter_revision");
+    }
+    let legacy = SourceWatermark::new(
+        source.source_id().clone(),
+        serde_json::to_string(&legacy).expect("legacy watermark"),
+    )
+    .expect("source watermark");
+
+    let refreshed = source
+        .discover(
+            &project,
+            Some(&legacy),
+            DiscoveryLimit::new(8).expect("discovery limit"),
+        )
+        .expect("refreshed discovery");
+
+    assert_eq!(refreshed.candidates().len(), 1);
+    assert!(refreshed.errors().is_empty(), "{:?}", refreshed.errors());
+}
+
+#[test]
+fn global_store_overrides_resolve_without_home_scans() {
+    let home = TempDir::new().expect("home");
+    let codex = TempDir::new().expect("Codex home");
+    let claude = TempDir::new().expect("Claude config");
+
+    let roots =
+        KnownStoreRoots::with_overrides(home.path(), Some(codex.path()), Some(claude.path()));
+
+    assert_eq!(roots.codex_cli(), codex.path().join("sessions"));
+    assert_eq!(roots.claude_code(), claude.path().join("projects"));
+    assert_eq!(roots.pi(), home.path().join(".pi/agent/sessions"));
+}
+
+#[test]
+fn claude_uses_transcript_cwd_when_project_directory_is_overridden() {
+    let (_project_dir, project) = project();
+    let home = TempDir::new().expect("home");
+    let destination = home
+        .path()
+        .join(".claude/projects/custom-project-key")
+        .join("11111111-1111-4111-8111-111111111111.jsonl");
+    fs::create_dir_all(destination.parent().expect("fixture parent")).expect("store");
+    fs::write(
+        destination,
+        fixture_text(
+            "claude-code/-workspace-project/11111111-1111-4111-8111-111111111111.jsonl",
+            &project,
+        ),
+    )
+    .expect("Claude fixture");
+
+    let source = ClaudeCodeSource::new(project.clone(), home.path().join(".claude/projects"))
+        .expect("Claude source");
+
+    assert_eq!(
+        discover_one(&source, &project).session_reference().id(),
+        "11111111-1111-4111-8111-111111111111"
+    );
+}
+
+#[test]
+fn claude_accepts_current_auxiliary_record_shapes() {
+    let (_project_dir, project) = project();
+    let home = TempDir::new().expect("home");
+    let session_id = "11111111-1111-4111-8111-111111111111";
+    let destination = home
+        .path()
+        .join(".claude/projects/custom-project-key")
+        .join(format!("{session_id}.jsonl"));
+    fs::create_dir_all(destination.parent().expect("fixture parent")).expect("store");
+    let cwd = project.root();
+    let records = [
+        serde_json::json!({
+            "type": "last-prompt",
+            "leafUuid": "22222222-2222-4222-8222-222222222222",
+            "sessionId": session_id,
+        }),
+        serde_json::json!({
+            "type": "permission-mode",
+            "permissionMode": "default",
+            "sessionId": session_id,
+        }),
+        serde_json::json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "attachment": {"type": "hook_success"},
+            "cwd": cwd,
+            "sessionId": session_id,
+            "version": "2.1.140",
+            "type": "attachment",
+            "uuid": "22222222-2222-4222-8222-222222222222",
+            "timestamp": "2026-05-13T17:13:35.288Z",
+        }),
+        serde_json::json!({
+            "type": "file-history-snapshot",
+            "messageId": "33333333-3333-4333-8333-333333333333",
+            "snapshot": {"trackedFileBackups": {}},
+            "isSnapshotUpdate": false,
+        }),
+        serde_json::json!({
+            "type": "ai-title",
+            "aiTitle": "sanitized title",
+            "sessionId": session_id,
+        }),
+        serde_json::json!({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "sessionId": session_id,
+            "timestamp": "2026-05-13T17:13:35.788Z",
+        }),
+        serde_json::json!({
+            "parentUuid": "22222222-2222-4222-8222-222222222222",
+            "isSidechain": false,
+            "subtype": "compact_boundary",
+            "cwd": cwd,
+            "sessionId": session_id,
+            "version": "2.1.140",
+            "type": "system",
+            "uuid": "44444444-4444-4444-8444-444444444444",
+            "timestamp": "2026-05-13T17:13:36.288Z",
+        }),
+    ];
+    let transcript = records
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(destination, format!("{transcript}\n")).expect("Claude fixture");
+    let source = ClaudeCodeSource::new(project.clone(), home.path().join(".claude/projects"))
+        .expect("Claude source");
+
+    assert_eq!(
+        discover_one(&source, &project).session_reference().id(),
+        session_id
+    );
+}
+
+#[test]
+fn codex_retains_distinct_canonical_origin_directories() {
+    let (project_dir, project) = project();
+    let origins = [
+        project_dir.path().join("one"),
+        project_dir.path().join("two"),
+    ];
+    for origin in &origins {
+        fs::create_dir(origin).expect("origin directory");
+    }
+    let home = TempDir::new().expect("home");
+    let store = home.path().join(".codex/sessions");
+    let fixture = fixture_text(
+        "codex-cli/2026/01/02/rollout-2026-01-02T03-04-05-019b7c3b-af88-7000-8001-000000000001.jsonl",
+        &project,
+    );
+    for (index, origin) in origins.iter().enumerate() {
+        let id = format!("019b7c3b-af88-7000-8001-{:012}", index + 1);
+        let path = store.join(format!(
+            "2026/01/02/rollout-2026-01-02T03-04-0{}-{id}.jsonl",
+            index + 5
+        ));
+        fs::create_dir_all(path.parent().expect("fixture parent")).expect("store");
+        fs::write(
+            path,
+            fixture
+                .replace("019b7c3b-af88-7000-8001-000000000001", id.as_str())
+                .replace(
+                    project.root().to_str().expect("project root"),
+                    origin.to_str().expect("origin"),
+                ),
+        )
+        .expect("Codex fixture");
+    }
+    let source = CodexCliSource::new(project.clone(), store).expect("Codex source");
+    let batch = source
+        .discover(
+            &project,
+            None,
+            DiscoveryLimit::new(8).expect("discovery limit"),
+        )
+        .expect("discovery");
+    assert!(batch.errors().is_empty(), "{:?}", batch.errors());
+    assert_eq!(batch.candidates().len(), 2);
+
+    let mut discovered_origins = batch
+        .candidates()
+        .iter()
+        .map(|candidate| {
+            source
+                .project_evidence(candidate, &project)
+                .expect("evidence")[0]
+                .canonical_path()
+                .to_path_buf()
+        })
+        .collect::<Vec<_>>();
+    discovered_origins.sort_unstable();
+    let mut expected_origins =
+        origins.map(|path| fs::canonicalize(path).expect("canonical origin"));
+    expected_origins.sort_unstable();
+    assert_eq!(discovered_origins, expected_origins);
+}
+
+#[test]
+fn compressed_codex_rollouts_emit_one_actionable_diagnostic() {
+    let (_project_dir, project) = project();
+    let home = TempDir::new().expect("home");
+    install_valid_fixtures(home.path(), &project);
+    let roots = KnownStoreRoots::under_home(home.path());
+    let directory = roots.codex_cli().join("2026/01/02");
+    for id in ["one", "two"] {
+        fs::write(directory.join(format!("rollout-{id}.jsonl.zst")), []).expect("cold rollout");
+    }
+    let source =
+        CodexCliSource::new(project.clone(), roots.codex_cli().to_path_buf()).expect("source");
+
+    let batch = source
+        .discover(
+            &project,
+            None,
+            DiscoveryLimit::new(8).expect("discovery limit"),
+        )
+        .expect("discovery");
+
+    assert_eq!(batch.candidates().len(), 1);
+    assert_eq!(batch.errors().len(), 1);
+    assert_eq!(
+        batch.errors()[0].kind(),
+        ConversationSourceErrorKind::UnsupportedFormat
+    );
+}
 #[test]
 fn native_filename_hints_must_match_the_verified_exact_grammar() {
     let (_project_dir, project) = project();

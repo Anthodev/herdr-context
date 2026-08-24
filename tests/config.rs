@@ -406,3 +406,27 @@ fn files_show_ignored_defaults_false_and_parses_both_values() {
             .any(|warning| warning.contains("files.show_ignored"))
     );
 }
+
+#[test]
+fn files_search_ignored_defaults_false_and_parses_both_values() {
+    let default = load("");
+    assert!(!default.config().files().search_ignored());
+    assert!(default.warnings().is_empty());
+
+    let enabled = load("[files]\nsearch_ignored = true\n");
+    assert!(enabled.config().files().search_ignored());
+    assert!(enabled.warnings().is_empty());
+
+    let disabled = load("[files]\nsearch_ignored = false\n");
+    assert!(!disabled.config().files().search_ignored());
+    assert!(disabled.warnings().is_empty());
+
+    let invalid = load("[files]\nsearch_ignored = \"yes\"\n");
+    assert!(!invalid.config().files().search_ignored());
+    assert!(
+        invalid
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("files.search_ignored"))
+    );
+}

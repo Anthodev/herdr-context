@@ -49,10 +49,23 @@ pub struct KnownStoreRoots {
 impl KnownStoreRoots {
     #[must_use]
     pub fn under_home(home: impl AsRef<Path>) -> Self {
+        Self::with_overrides(home, None, None)
+    }
+
+    #[must_use]
+    pub fn with_overrides(
+        home: impl AsRef<Path>,
+        codex_home: Option<&Path>,
+        claude_config_dir: Option<&Path>,
+    ) -> Self {
         let home = home.as_ref();
         Self {
-            claude_code: home.join(".claude/projects"),
-            codex_cli: home.join(".codex/sessions"),
+            claude_code: claude_config_dir
+                .map_or_else(|| home.join(".claude"), Path::to_path_buf)
+                .join("projects"),
+            codex_cli: codex_home
+                .map_or_else(|| home.join(".codex"), Path::to_path_buf)
+                .join("sessions"),
             pi: home.join(".pi/agent/sessions"),
             omp: home.join(".omp/agent/sessions"),
             opencode: home.join(".local/share/opencode/opencode.db"),
@@ -104,6 +117,15 @@ impl KnownStoreRoots {
 pub(super) trait KnownFormat: std::fmt::Debug + Send + Sync + 'static {
     fn source_id(&self) -> &'static str;
     fn tool_id(&self) -> &'static str;
+
+    fn report_project_mismatch(&self) -> bool {
+        true
+    }
+
+    /// Increment when a format starts accepting records previously cached as rejected.
+    fn adapter_revision(&self) -> u32 {
+        0
+    }
 
     fn list_candidates(
         &self,
@@ -386,6 +408,7 @@ impl<F: KnownFormat> KnownJsonlSource<F> {
                 content_hash,
                 summary: Some(summary),
                 identity,
+                adapter_revision: self.format.adapter_revision(),
             },
         })
     }
@@ -715,6 +738,7 @@ impl<F: KnownFormat> ConversationSource for KnownJsonlSource<F> {
                                 content_hash: FNV_OFFSET,
                                 summary: None,
                                 identity: state.identity(),
+                                adapter_revision: self.format.adapter_revision(),
                             },
                             changed: false,
                             error: Some(error),
@@ -739,7 +763,11 @@ impl<F: KnownFormat> ConversationSource for KnownJsonlSource<F> {
         for file in prepared {
             let mut file = file;
             if let Some(error) = file.error {
-                errors.push(error);
+                if error.kind() != ConversationSourceErrorKind::ProjectMismatch
+                    || self.format.report_project_mismatch()
+                {
+                    errors.push(error);
+                }
                 next.insert(file.key, file.watermark);
                 continue;
             }
@@ -1069,6 +1097,8 @@ struct WatermarkEntry {
     content_hash: u64,
     summary: Option<StoredMetadata>,
     identity: String,
+    #[serde(default)]
+    adapter_revision: u32,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -1120,6 +1150,8 @@ struct StoredMetadata {
     chain_updated_at: Option<(bool, u64, u32)>,
     chain_tail: Option<String>,
     record_count: u64,
+    #[serde(default)]
+    cwd: Option<PathBuf>,
 }
 
 impl StoredMetadata {
@@ -1131,6 +1163,7 @@ impl StoredMetadata {
             updated_at: system_time_parts(metadata.updated_at),
             chain_updated_at: Some(system_time_parts(metadata.chain_updated_at)),
             chain_tail: metadata.chain_tail.clone(),
+            cwd: Some(metadata.cwd.as_path().to_path_buf()),
             record_count: metadata.record_count,
         }
     }
@@ -1147,13 +1180,19 @@ impl StoredMetadata {
         {
             return None;
         }
+        let cwd = self
+            .cwd
+            .as_ref()
+            .and_then(|cwd| CanonicalPath::new(cwd.clone()).ok())
+            .filter(|cwd| crate::project::path_is_within(project.root(), cwd.as_path()))
+            .or_else(|| CanonicalPath::new(project.root().to_path_buf()).ok())?;
         Some(ParsedMetadata {
             session_id: self.session_id.clone(),
             title: self.title.clone(),
             created_at: system_time_from_parts(self.created_at)?,
             updated_at: system_time_from_parts(self.updated_at)?,
             chain_updated_at: system_time_from_parts(chain_updated_at)?,
-            cwd: CanonicalPath::new(project.root().to_path_buf()).ok()?,
+            cwd,
             chain_tail: self.chain_tail.clone(),
             record_count: self.record_count,
         })
@@ -1405,6 +1444,26 @@ pub(super) fn parse_rfc3339(value: &str) -> Result<SystemTime, FormatFailure> {
     }
 }
 
+pub(super) fn validate_tool_version(value: Option<&str>) -> Result<(), FormatFailure> {
+    let Some(value) = value else {
+        return Err(FormatFailure::unsupported(
+            "tool version is missing from the validated record shape",
+        ));
+    };
+    let mut components = value.split('.');
+    if (0..3).any(|_| {
+        components
+            .next()
+            .is_none_or(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    }) || components.next().is_some()
+    {
+        return Err(FormatFailure::unsupported(
+            "tool version is not a dotted numeric release",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn canonical_cwd(
     value: &str,
     project: &ProjectIdentity,
@@ -1412,9 +1471,9 @@ pub(super) fn canonical_cwd(
     let cwd = CanonicalPath::new(PathBuf::from(value)).map_err(|_| {
         FormatFailure::project_mismatch("native cwd is missing or cannot be canonicalized")
     })?;
-    if cwd.as_path() != project.root() {
+    if !crate::project::path_is_within(project.root(), cwd.as_path()) {
         return Err(FormatFailure::project_mismatch(
-            "native cwd conflicts with the canonical project root",
+            "native cwd is outside the canonical project root",
         ));
     }
     Ok(cwd)
@@ -1634,7 +1693,7 @@ fn decode_watermark<F: KnownFormat>(
             "known source watermark exceeds the byte limit",
         ));
     }
-    let entries = serde_json::from_str::<BTreeMap<String, WatermarkEntry>>(after.token())
+    let mut entries = serde_json::from_str::<BTreeMap<String, WatermarkEntry>>(after.token())
         .map_err(|_| invalid())?;
     if entries.len() > MAX_STORE_FILES {
         return Err(invalid());
@@ -1697,6 +1756,7 @@ fn decode_watermark<F: KnownFormat>(
             return Err(invalid());
         }
     }
+    entries.retain(|_, entry| entry.adapter_revision == source.format.adapter_revision());
     Ok(entries)
 }
 

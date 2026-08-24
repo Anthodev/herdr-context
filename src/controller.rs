@@ -70,6 +70,8 @@ struct LiveSnapshot {
 struct ConversationPaths {
     state_dir: Option<PathBuf>,
     home: Option<PathBuf>,
+    codex_home: Option<PathBuf>,
+    claude_config_dir: Option<PathBuf>,
 }
 
 impl ConversationPaths {
@@ -81,7 +83,18 @@ impl ConversationPaths {
             .or_else(|| env::var_os("USERPROFILE"))
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
-        Self { state_dir, home }
+        let codex_home = env::var_os("CODEX_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let claude_config_dir = env::var_os("CLAUDE_CONFIG_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        Self {
+            state_dir,
+            home,
+            codex_home,
+            claude_config_dir,
+        }
     }
 }
 
@@ -182,6 +195,8 @@ impl Controller {
             conversation_paths: ConversationPaths {
                 state_dir: Some(state_dir),
                 home: Some(home),
+                codex_home: None,
+                claude_config_dir: None,
             },
             host_binary: None,
             filesystem_conversations: None,
@@ -1184,7 +1199,11 @@ fn load_conversations(
         }
     }
     if let Some(home) = &paths.home {
-        let roots = KnownStoreRoots::under_home(home);
+        let roots = KnownStoreRoots::with_overrides(
+            home,
+            paths.codex_home.as_deref(),
+            paths.claude_config_dir.as_deref(),
+        );
         match roots.sources(project.clone()) {
             Ok(external) => sources.extend(
                 external
@@ -2150,6 +2169,7 @@ esac
         let paths = ConversationPaths {
             state_dir: Some(blocked_state),
             home: None,
+            ..ConversationPaths::default()
         };
         let ConversationJobResult::Ready {
             conversations,
@@ -2249,6 +2269,7 @@ esac
         let cached_paths = ConversationPaths {
             state_dir: Some(state.path().join("plugin-state")),
             home: Some(home.path().to_path_buf()),
+            ..ConversationPaths::default()
         };
         let ConversationJobResult::Ready {
             conversations: cached,

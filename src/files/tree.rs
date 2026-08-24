@@ -538,11 +538,19 @@ fn insert_status_with_ancestors(
     path: &Path,
     status: VcsStatusKind,
 ) {
-    for affected in path
+    let mut affected = path
         .ancestors()
-        .take_while(|path| !path.as_os_str().is_empty())
-    {
-        insert_preferred_status(statuses, affected.to_path_buf(), status);
+        .take_while(|path| !path.as_os_str().is_empty());
+    if let Some(entry) = affected.next() {
+        insert_preferred_status(statuses, entry.to_path_buf(), status);
+    }
+    let ancestor_status = if status == VcsStatusKind::Deleted {
+        VcsStatusKind::Modified
+    } else {
+        status
+    };
+    for ancestor in affected {
+        insert_preferred_status(statuses, ancestor.to_path_buf(), ancestor_status);
     }
 }
 
@@ -698,6 +706,40 @@ mod tests {
                 .expect("modified")
                 .status(),
             Some(VcsStatusKind::Modified)
+        );
+    }
+
+    #[test]
+    fn aggregates_deleted_descendants_as_modified_present_directories() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join("src/nested")).expect("directories");
+        let mut tree = FilesTree::new(temp.path().to_path_buf()).expect("tree");
+        tree.load_directory(Path::new("")).expect("root");
+
+        tree.merge_status(&VcsStatusSnapshot::new(
+            vec![status(
+                "src/nested/deleted.rs",
+                None,
+                VcsStatusKind::Deleted,
+            )],
+            false,
+        ))
+        .expect("merge status");
+
+        assert_eq!(
+            tree.node(Path::new("src")).expect("src").status(),
+            Some(VcsStatusKind::Modified)
+        );
+        tree.load_directory(Path::new("src")).expect("src");
+        assert_eq!(
+            tree.node(Path::new("src/nested")).expect("nested").status(),
+            Some(VcsStatusKind::Modified)
+        );
+        assert_eq!(
+            tree.node(Path::new("src/nested/deleted.rs"))
+                .expect("deleted")
+                .status(),
+            Some(VcsStatusKind::Deleted)
         );
     }
 
