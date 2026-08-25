@@ -19,15 +19,15 @@ class ReleaseContractTests(unittest.TestCase):
     def test_repository_contract_is_release_ready(self) -> None:
         contract = release.validate_repository(ROOT)
 
-        self.assertEqual(contract.version, "0.19.1")
+        self.assertEqual(contract.version, "0.19.2")
         self.assertEqual(contract.min_herdr_version, "0.8.0")
         self.assertEqual(len(contract.performance_metrics), 12)
 
     def test_trigger_tag_must_exactly_match_cargo_version(self) -> None:
         contract = release.validate_repository(ROOT)
 
-        release.validate_trigger_tag(contract, "v0.19.1")
-        with self.assertRaisesRegex(release.ReleaseError, "exactly v0.19.1"):
+        release.validate_trigger_tag(contract, "v0.19.2")
+        with self.assertRaisesRegex(release.ReleaseError, "exactly v0.19.2"):
             release.validate_trigger_tag(contract, "vtest")
 
     def test_failed_budget_requires_complete_risk_acceptance(self) -> None:
