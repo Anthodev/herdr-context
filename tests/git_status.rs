@@ -112,6 +112,110 @@ fn deleted_descendant_marks_present_directories_modified() {
 }
 
 #[test]
+fn added_descendant_marks_present_directories_modified_not_added() {
+    let repository = repository();
+    fs::create_dir_all(repository.path().join("src/nested")).expect("directories");
+    fs::write(repository.path().join("src/nested/tracked.rs"), "before").expect("fixture");
+    git(repository.path(), &["add", "."]);
+    git(repository.path(), &["commit", "--quiet", "-m", "fixture"]);
+    fs::write(repository.path().join("src/nested/added.rs"), "new").expect("added file");
+    git(repository.path(), &["add", "src/nested/added.rs"]);
+
+    let mut service = GitService::new(Duration::from_secs(5));
+    let workspace = service
+        .detect(repository.path())
+        .expect("detect")
+        .expect("Git workspace");
+    let snapshot = service.refresh_status(&workspace).expect("status");
+    let mut tree = FilesTree::new(repository.path().to_path_buf()).expect("tree");
+    tree.load_directory(Path::new("")).expect("root");
+    tree.merge_status(&snapshot).expect("status overlay");
+
+    assert_eq!(
+        tree.node(Path::new("src")).expect("src").status(),
+        Some(VcsStatusKind::Modified)
+    );
+    tree.load_directory(Path::new("src")).expect("src");
+    tree.load_directory(Path::new("src/nested"))
+        .expect("nested");
+    assert_eq!(
+        tree.node(Path::new("src/nested")).expect("nested").status(),
+        Some(VcsStatusKind::Modified)
+    );
+    assert_eq!(
+        tree.node(Path::new("src/nested/added.rs"))
+            .expect("added row")
+            .status(),
+        Some(VcsStatusKind::Added)
+    );
+}
+
+#[test]
+fn mixed_non_conflicted_descendants_aggregate_as_modified() {
+    let repository = repository();
+    fs::create_dir_all(repository.path().join("src/nested/untracked-dir")).expect("directories");
+    for name in ["src/modified.rs", "src/nested/moved-source.rs"] {
+        fs::write(repository.path().join(name), "before").expect("tracked fixture");
+    }
+    git(repository.path(), &["add", "."]);
+    git(repository.path(), &["commit", "--quiet", "-m", "fixture"]);
+
+    fs::write(repository.path().join("src/modified.rs"), "after").expect("modify");
+    git(
+        repository.path(),
+        &["mv", "src/nested/moved-source.rs", "src/nested/renamed.rs"],
+    );
+    fs::write(
+        repository.path().join("src/nested/untracked-dir/fresh.rs"),
+        "new",
+    )
+    .expect("untracked file");
+
+    let mut service = GitService::new(Duration::from_secs(5));
+    let workspace = service
+        .detect(repository.path())
+        .expect("detect")
+        .expect("Git workspace");
+    let snapshot = service.refresh_status(&workspace).expect("status");
+    let mut tree = FilesTree::new(repository.path().to_path_buf()).expect("tree");
+    tree.load_directory(Path::new("")).expect("root");
+    tree.merge_status(&snapshot).expect("status overlay");
+
+    tree.load_directory(Path::new("src")).expect("src");
+    tree.load_directory(Path::new("src/nested"))
+        .expect("nested");
+    tree.load_directory(Path::new("src/nested/untracked-dir"))
+        .expect("untracked directory");
+    for directory in ["src", "src/nested", "src/nested/untracked-dir"] {
+        assert_eq!(
+            tree.node(Path::new(directory))
+                .unwrap_or_else(|| panic!("{directory} node"))
+                .status(),
+            Some(VcsStatusKind::Modified),
+            "{directory} aggregates as Modified"
+        );
+    }
+    assert_eq!(
+        tree.node(Path::new("src/modified.rs"))
+            .expect("modified row")
+            .status(),
+        Some(VcsStatusKind::Modified)
+    );
+    assert_eq!(
+        tree.node(Path::new("src/nested/renamed.rs"))
+            .expect("renamed row")
+            .status(),
+        Some(VcsStatusKind::Renamed)
+    );
+    assert_eq!(
+        tree.node(Path::new("src/nested/untracked-dir/fresh.rs"))
+            .expect("untracked row")
+            .status(),
+        Some(VcsStatusKind::Untracked)
+    );
+}
+
+#[test]
 fn jujutsu_marker_prevents_git_from_becoming_authoritative() {
     let repository = repository();
     fs::create_dir_all(repository.path().join(".jj/repo")).expect("jj repo");

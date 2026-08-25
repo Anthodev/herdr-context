@@ -544,10 +544,10 @@ fn insert_status_with_ancestors(
     if let Some(entry) = affected.next() {
         insert_preferred_status(statuses, entry.to_path_buf(), status);
     }
-    let ancestor_status = if status == VcsStatusKind::Deleted {
-        VcsStatusKind::Modified
+    let ancestor_status = if status == VcsStatusKind::Conflicted {
+        VcsStatusKind::Conflicted
     } else {
-        status
+        VcsStatusKind::Modified
     };
     for ancestor in affected {
         insert_preferred_status(statuses, ancestor.to_path_buf(), ancestor_status);
@@ -744,6 +744,120 @@ mod tests {
     }
 
     #[test]
+    fn renders_added_descendant_as_modified_present_directory() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join("src/nested")).expect("directories");
+        fs::write(temp.path().join("src/nested/added.rs"), []).expect("added file");
+        let mut tree = FilesTree::new(temp.path().to_path_buf()).expect("tree");
+        tree.load_directory(Path::new("")).expect("root");
+
+        tree.merge_status(&VcsStatusSnapshot::new(
+            vec![status("src/nested/added.rs", None, VcsStatusKind::Added)],
+            false,
+        ))
+        .expect("merge status");
+
+        assert_eq!(
+            tree.node(Path::new("src")).expect("src").status(),
+            Some(VcsStatusKind::Modified)
+        );
+        tree.load_directory(Path::new("src")).expect("src");
+        tree.load_directory(Path::new("src/nested"))
+            .expect("nested");
+        assert_eq!(
+            tree.node(Path::new("src/nested/added.rs"))
+                .expect("added row")
+                .status(),
+            Some(VcsStatusKind::Added)
+        );
+    }
+
+    #[test]
+    fn aggregates_every_non_conflicted_descendant_kind_as_modified() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join("renamed/copied/untracked")).expect("directories");
+        fs::write(temp.path().join("renamed/target.rs"), []).expect("rename target");
+        fs::write(temp.path().join("renamed/copied/copy.rs"), []).expect("copy target");
+        fs::write(temp.path().join("renamed/copied/origin.rs"), []).expect("copy origin");
+        fs::write(temp.path().join("renamed/copied/untracked/new.rs"), []).expect("untracked");
+        let mut tree = FilesTree::new(temp.path().to_path_buf()).expect("tree");
+        tree.load_directory(Path::new("")).expect("root");
+
+        tree.merge_status(&VcsStatusSnapshot::new(
+            vec![
+                status("renamed/target.rs", Some("old.rs"), VcsStatusKind::Renamed),
+                status(
+                    "renamed/copied/copy.rs",
+                    Some("renamed/copied/origin.rs"),
+                    VcsStatusKind::Copied,
+                ),
+                status(
+                    "renamed/copied/untracked/new.rs",
+                    None,
+                    VcsStatusKind::Untracked,
+                ),
+            ],
+            false,
+        ))
+        .expect("merge status");
+        tree.load_directory(Path::new("renamed")).expect("renamed");
+        tree.load_directory(Path::new("renamed/copied"))
+            .expect("copied");
+        tree.load_directory(Path::new("renamed/copied/untracked"))
+            .expect("untracked directory");
+        for directory in ["renamed", "renamed/copied", "renamed/copied/untracked"] {
+            assert_eq!(
+                tree.node(Path::new(directory))
+                    .unwrap_or_else(|| panic!("{directory} node"))
+                    .status(),
+                Some(VcsStatusKind::Modified),
+                "{directory} aggregates as Modified"
+            );
+        }
+        assert_eq!(
+            tree.node(Path::new("renamed/target.rs"))
+                .expect("renamed row")
+                .status(),
+            Some(VcsStatusKind::Renamed)
+        );
+        assert_eq!(
+            tree.node(Path::new("renamed/copied/copy.rs"))
+                .expect("copied row")
+                .status(),
+            Some(VcsStatusKind::Copied)
+        );
+        assert_eq!(
+            tree.node(Path::new("renamed/copied/untracked/new.rs"))
+                .expect("untracked row")
+                .status(),
+            Some(VcsStatusKind::Untracked)
+        );
+    }
+
+    #[test]
+    fn keeps_backend_reported_directory_status_over_descendant_modified() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join("fresh")).expect("directory");
+        fs::write(temp.path().join("fresh/child.rs"), []).expect("child");
+        let mut tree = FilesTree::new(temp.path().to_path_buf()).expect("tree");
+        tree.load_directory(Path::new("")).expect("root");
+
+        tree.merge_status(&VcsStatusSnapshot::new(
+            vec![
+                status("fresh", None, VcsStatusKind::Added),
+                status("fresh/child.rs", None, VcsStatusKind::Modified),
+            ],
+            false,
+        ))
+        .expect("merge status");
+
+        assert_eq!(
+            tree.node(Path::new("fresh")).expect("fresh").status(),
+            Some(VcsStatusKind::Added)
+        );
+    }
+
+    #[test]
     fn keeps_selection_by_stable_path_and_orders_directories_first() {
         let temp = TempDir::new().expect("tempdir");
         fs::create_dir(temp.path().join("z-dir")).expect("dir");
@@ -917,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregates_missing_rename_source_status_onto_its_directory() {
+    fn aggregates_missing_rename_source_and_target_as_modified_directories() {
         let temp = TempDir::new().expect("tempdir");
         fs::create_dir(temp.path().join("old")).expect("old directory");
         fs::create_dir(temp.path().join("new")).expect("new directory");
@@ -937,11 +1051,11 @@ mod tests {
 
         assert_eq!(
             tree.node(Path::new("old")).expect("old directory").status(),
-            Some(VcsStatusKind::Renamed)
+            Some(VcsStatusKind::Modified)
         );
         assert_eq!(
             tree.node(Path::new("new")).expect("new directory").status(),
-            Some(VcsStatusKind::Renamed)
+            Some(VcsStatusKind::Modified)
         );
     }
 
