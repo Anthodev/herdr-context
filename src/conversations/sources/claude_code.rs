@@ -113,7 +113,9 @@ impl KnownFormat for ClaudeCodeFormat {
     }
 
     fn adapter_revision(&self) -> u32 {
-        1
+        // 2: compact boundaries with a null parent are now accepted, so cached
+        // rejections from revision 1 must be revisited.
+        2
     }
 
     fn list_candidates(
@@ -205,28 +207,34 @@ impl KnownFormat for ClaudeCodeFormat {
                 }
                 visited_entries += 1;
                 let relative = directory.join(&name);
-                if kind == EntryKind::File
-                    && Path::new(&name)
-                        .extension()
-                        .is_some_and(|value| value == "jsonl")
-                {
-                    if files.len() == MAX_CANDIDATE_PATHS {
-                        push_inventory_error(
+                match kind {
+                    EntryKind::File
+                        if Path::new(&name)
+                            .extension()
+                            .is_some_and(|value| value == "jsonl") =>
+                    {
+                        if files.len() == MAX_CANDIDATE_PATHS {
+                            push_inventory_error(
+                                errors,
+                                SOURCE_ID,
+                                store.absolute(Path::new(".")),
+                                "Claude projects store exceeds the bounded session inventory",
+                            );
+                            return files;
+                        }
+                        files.push(relative);
+                    }
+                    // Claude Code writes per-session `<uuid>/tool-results` and
+                    // per-project `memory` directories next to the transcripts.
+                    EntryKind::Directory => {}
+                    _ => {
+                        push_shape_error(
                             errors,
                             SOURCE_ID,
-                            store.absolute(Path::new(".")),
-                            "Claude projects store exceeds the bounded session inventory",
+                            store.absolute(&relative),
+                            "Claude store entry is outside the verified flat JSONL layout",
                         );
-                        return files;
                     }
-                    files.push(relative);
-                } else {
-                    push_shape_error(
-                        errors,
-                        SOURCE_ID,
-                        store.absolute(&relative),
-                        "Claude store entry is outside the verified flat JSONL layout",
-                    );
                 }
             }
         }
@@ -358,10 +366,23 @@ impl KnownFormat for ClaudeCodeFormat {
                     )
                 })?;
                 validate_uuid(uuid, 4)?;
+                let compact_boundary = record.kind == "system"
+                    && record.subtype.as_deref() == Some("compact_boundary");
                 match (previous_uuid.is_some(), record.parent_uuid.as_deref()) {
                     (false, None) => {}
                     (true, Some(parent_uuid)) if parent_uuid != uuid => {
                         validate_uuid(parent_uuid, 4)?;
+                    }
+                    // A compaction boundary deliberately restarts the transcript
+                    // chain: the pre-compact tail moves into `logicalParentUuid`.
+                    (true, None) if compact_boundary => {
+                        let logical_parent =
+                            record.logical_parent_uuid.as_deref().ok_or_else(|| {
+                                FormatFailure::unsupported(
+                                    "Claude compact boundary is missing its logical parent identifier",
+                                )
+                            })?;
+                        validate_uuid(logical_parent, 4)?;
                     }
                     _ => {
                         return Err(FormatFailure::unsupported(
@@ -522,6 +543,8 @@ struct ClaudeRecord {
     subtype: Option<String>,
     #[serde(rename = "leafUuid")]
     leaf_uuid: Option<String>,
+    #[serde(rename = "logicalParentUuid")]
+    logical_parent_uuid: Option<String>,
     #[serde(rename = "permissionMode")]
     permission_mode: Option<IgnoredAny>,
     #[serde(rename = "aiTitle")]
