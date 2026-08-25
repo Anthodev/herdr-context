@@ -886,6 +886,168 @@ fn claude_accepts_current_auxiliary_record_shapes() {
 }
 
 #[test]
+fn claude_accepts_compact_boundaries_that_restart_the_chain() {
+    let (_project_dir, project) = project();
+    let home = TempDir::new().expect("home");
+    let session_id = "11111111-1111-4111-8111-111111111111";
+    let destination = home
+        .path()
+        .join(".claude/projects/custom-project-key")
+        .join(format!("{session_id}.jsonl"));
+    fs::create_dir_all(destination.parent().expect("fixture parent")).expect("store");
+    let cwd = project.root();
+    let records = [
+        serde_json::json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "cwd": cwd,
+            "sessionId": session_id,
+            "version": "2.1.140",
+            "type": "user",
+            "message": {"role": "user", "content": "before compaction"},
+            "uuid": "22222222-2222-4222-8222-222222222222",
+            "timestamp": "2026-05-13T17:13:35.288Z",
+        }),
+        serde_json::json!({
+            "parentUuid": null,
+            "logicalParentUuid": "22222222-2222-4222-8222-222222222222",
+            "isSidechain": false,
+            "subtype": "compact_boundary",
+            "content": "Conversation compacted",
+            "cwd": cwd,
+            "sessionId": session_id,
+            "version": "2.1.140",
+            "type": "system",
+            "uuid": "44444444-4444-4444-8444-444444444444",
+            "timestamp": "2026-05-13T17:13:36.288Z",
+        }),
+        serde_json::json!({
+            "parentUuid": "44444444-4444-4444-8444-444444444444",
+            "isSidechain": false,
+            "cwd": cwd,
+            "sessionId": session_id,
+            "version": "2.1.140",
+            "type": "user",
+            "message": {"role": "user", "content": "after compaction"},
+            "uuid": "55555555-5555-4555-8555-555555555555",
+            "timestamp": "2026-05-13T17:13:37.288Z",
+        }),
+    ];
+    let transcript = records
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(destination, format!("{transcript}\n")).expect("Claude fixture");
+    let source = ClaudeCodeSource::new(project.clone(), home.path().join(".claude/projects"))
+        .expect("Claude source");
+    let batch = source
+        .discover(
+            &project,
+            None,
+            DiscoveryLimit::new(8).expect("discovery limit"),
+        )
+        .expect("discovery");
+    assert!(batch.errors().is_empty(), "{:?}", batch.errors());
+    assert_eq!(batch.candidates().len(), 1, "boundary session detected");
+}
+
+#[test]
+fn claude_compact_boundary_without_logical_parent_is_rejected() {
+    let (_project_dir, project) = project();
+    let home = TempDir::new().expect("home");
+    let session_id = "11111111-1111-4111-8111-111111111111";
+    let destination = home
+        .path()
+        .join(".claude/projects/custom-project-key")
+        .join(format!("{session_id}.jsonl"));
+    fs::create_dir_all(destination.parent().expect("fixture parent")).expect("store");
+    let cwd = project.root();
+    let records = [
+        serde_json::json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "cwd": cwd,
+            "sessionId": session_id,
+            "version": "2.1.140",
+            "type": "user",
+            "message": {"role": "user", "content": "root"},
+            "uuid": "22222222-2222-4222-8222-222222222222",
+            "timestamp": "2026-05-13T17:13:35.288Z",
+        }),
+        serde_json::json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "subtype": "compact_boundary",
+            "content": "Conversation compacted",
+            "cwd": cwd,
+            "sessionId": session_id,
+            "version": "2.1.140",
+            "type": "system",
+            "uuid": "44444444-4444-4444-8444-444444444444",
+            "timestamp": "2026-05-13T17:13:36.288Z",
+        }),
+    ];
+    let transcript = records
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(destination, format!("{transcript}\n")).expect("Claude fixture");
+    let source = ClaudeCodeSource::new(project.clone(), home.path().join(".claude/projects"))
+        .expect("Claude source");
+    let batch = source
+        .discover(
+            &project,
+            None,
+            DiscoveryLimit::new(8).expect("discovery limit"),
+        )
+        .expect("discovery");
+    assert!(
+        batch.candidates().is_empty(),
+        "unanchored boundary must not be detected"
+    );
+}
+
+#[test]
+fn claude_store_directories_are_benign() {
+    let (_project_dir, project) = project();
+    let home = TempDir::new().expect("home");
+    let store = home.path().join(".claude/projects/custom-project-key");
+    let destination = store.join("11111111-1111-4111-8111-111111111111.jsonl");
+    fs::create_dir_all(destination.parent().expect("store parent")).expect("store");
+    fs::write(
+        destination,
+        fixture_text(
+            "claude-code/-workspace-project/11111111-1111-4111-8111-111111111111.jsonl",
+            &project,
+        ),
+    )
+    .expect("Claude fixture");
+    fs::create_dir_all(store.join("11111111-1111-4111-8111-111111111111/tool-results"))
+        .expect("session tool results directory");
+    fs::write(
+        store.join("11111111-1111-4111-8111-111111111111/tool-results/share.jsonl"),
+        [],
+    )
+    .expect("nested artifact");
+    fs::create_dir_all(store.join("memory")).expect("memory directory");
+    fs::write(store.join("memory/MEMORY.md"), "# memory").expect("memory file");
+
+    let source = ClaudeCodeSource::new(project.clone(), home.path().join(".claude/projects"))
+        .expect("Claude source");
+    let batch = source
+        .discover(
+            &project,
+            None,
+            DiscoveryLimit::new(8).expect("discovery limit"),
+        )
+        .expect("discovery");
+    assert_eq!(batch.candidates().len(), 1, "session still discovered");
+    assert!(batch.errors().is_empty(), "{:?}", batch.errors());
+}
+
+#[test]
 fn codex_retains_distinct_canonical_origin_directories() {
     let (project_dir, project) = project();
     let origins = [
