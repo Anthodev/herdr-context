@@ -7,8 +7,8 @@ use serde::de::IgnoredAny;
 use super::known_stores::{
     EntryKind, FormatFailure, KnownFormat, KnownJsonlSource, KnownStore, MAX_CANDIDATE_PATHS,
     ParseOutcome, ParsedMetadata, PendingMetadata, canonical_cwd, claude_project_directory,
-    parse_rfc3339, push_inventory_error, push_listing_error, push_shape_error,
-    validate_tool_version, validate_uuid,
+    normalize_metadata_title, parse_rfc3339, push_inventory_error, push_listing_error,
+    push_shape_error, validate_tool_version, validate_uuid,
 };
 use super::{
     ConversationCandidate, ConversationSource, ConversationSourceError, DiscoveryBatch,
@@ -114,9 +114,9 @@ impl KnownFormat for ClaudeCodeFormat {
     }
 
     fn adapter_revision(&self) -> u32 {
-        // 3: current and future auxiliary metadata plus descendant cwd changes
-        // are accepted, so cached rejections from revision 2 must be revisited.
-        3
+        // 4: Claude titles are now extracted, so cached title-less metadata
+        // from revision 3 must be revisited.
+        4
     }
 
     fn list_candidates(
@@ -260,6 +260,9 @@ impl KnownFormat for ClaudeCodeFormat {
         validate_uuid(expected_id, 4)?;
 
         let mut session_id = previous.map(|metadata| metadata.session_id.clone());
+        let mut title = previous
+            .and_then(|metadata| metadata.title.clone())
+            .or_else(|| previous_pending.and_then(|metadata| metadata.title.clone()));
         let mut created_at = previous
             .map(|metadata| metadata.created_at)
             .or_else(|| previous_pending.and_then(|metadata| metadata.created_at));
@@ -460,10 +463,12 @@ impl KnownFormat for ClaudeCodeFormat {
                     }
                     "ai-title" => {
                         validate_claude_session(&record, expected_id)?;
-                        if record.ai_title.is_none() {
-                            return Err(FormatFailure::unsupported(
-                                "Claude ai-title record is missing its title",
-                            ));
+                        if title.is_none() {
+                            title = record
+                                .ai_title
+                                .as_ref()
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(normalize_metadata_title);
                         }
                     }
                     "queue-operation" => {
@@ -484,16 +489,23 @@ impl KnownFormat for ClaudeCodeFormat {
                         updated_at =
                             Some(updated_at.map_or(timestamp, |current| current.max(timestamp)));
                     }
-                    "mode" | "custom-title" | "agent-name" | "agent-setting" => {
+                    "custom-title" => {
+                        validate_claude_session(&record, expected_id)?;
+                        if let Some(native_title) = record
+                            .custom_title
+                            .as_ref()
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(normalize_metadata_title)
+                        {
+                            title = Some(native_title);
+                        }
+                    }
+                    "mode" | "agent-name" | "agent-setting" => {
                         validate_claude_session(&record, expected_id)?;
                         let (present, message) = match record.kind.as_str() {
                             "mode" => (
                                 record.mode.is_some(),
                                 "Claude mode record is missing its mode",
-                            ),
-                            "custom-title" => (
-                                record.custom_title.is_some(),
-                                "Claude custom-title record is missing its title",
                             ),
                             "agent-name" => (
                                 record.agent_name.is_some(),
@@ -532,6 +544,7 @@ impl KnownFormat for ClaudeCodeFormat {
 
         let Some(session_id) = session_id else {
             return Ok(ParseOutcome::IdentityPending(PendingMetadata {
+                title,
                 created_at,
                 updated_at,
                 record_count,
@@ -539,7 +552,7 @@ impl KnownFormat for ClaudeCodeFormat {
         };
         Ok(ParseOutcome::Metadata(ParsedMetadata {
             session_id,
-            title: None,
+            title,
             created_at: created_at.ok_or_else(|| {
                 FormatFailure::unsupported("Claude JSONL contains no current timestamp")
             })?,
@@ -584,10 +597,10 @@ struct ClaudeRecord {
     #[serde(rename = "permissionMode")]
     permission_mode: Option<IgnoredAny>,
     #[serde(rename = "aiTitle")]
-    ai_title: Option<IgnoredAny>,
+    ai_title: Option<serde_json::Value>,
     mode: Option<IgnoredAny>,
     #[serde(rename = "customTitle")]
-    custom_title: Option<IgnoredAny>,
+    custom_title: Option<serde_json::Value>,
     #[serde(rename = "agentName")]
     agent_name: Option<IgnoredAny>,
     #[serde(rename = "agentSetting")]

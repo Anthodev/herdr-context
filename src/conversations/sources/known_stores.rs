@@ -37,6 +37,15 @@ const MAX_RECORDS: usize = 32_768;
 const MAX_WATERMARK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_METADATA_TITLE_BYTES: usize = 256;
 
+const fn valid_metadata_title(value: &str) -> bool {
+    value.len() <= MAX_METADATA_TITLE_BYTES
+}
+
+pub(super) fn normalize_metadata_title(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && valid_metadata_title(value)).then(|| value.to_owned())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KnownStoreRoots {
     claude_code: PathBuf,
@@ -1104,6 +1113,7 @@ pub(super) struct ParsedMetadata {
 
 #[derive(Clone, Debug)]
 pub(super) struct PendingMetadata {
+    pub(super) title: Option<String>,
     pub(super) created_at: Option<SystemTime>,
     pub(super) updated_at: Option<SystemTime>,
     pub(super) record_count: u64,
@@ -1201,6 +1211,8 @@ impl StoredRejection {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct StoredPendingMetadata {
+    #[serde(default)]
+    title: Option<String>,
     created_at: Option<(bool, u64, u32)>,
     updated_at: Option<(bool, u64, u32)>,
     record_count: u64,
@@ -1209,6 +1221,7 @@ struct StoredPendingMetadata {
 impl StoredPendingMetadata {
     fn from_pending(metadata: &PendingMetadata) -> Self {
         Self {
+            title: metadata.title.clone(),
             created_at: metadata.created_at.map(system_time_parts),
             updated_at: metadata.updated_at.map(system_time_parts),
             record_count: metadata.record_count,
@@ -1217,6 +1230,10 @@ impl StoredPendingMetadata {
 
     fn to_pending(&self) -> Option<PendingMetadata> {
         if self.record_count == 0
+            || self
+                .title
+                .as_deref()
+                .is_some_and(|title| !valid_metadata_title(title))
             || self
                 .created_at
                 .is_some_and(|(_, _, nanos)| nanos >= 1_000_000_000)
@@ -1236,6 +1253,7 @@ impl StoredPendingMetadata {
             return None;
         }
         Some(PendingMetadata {
+            title: self.title.clone(),
             created_at,
             updated_at,
             record_count: self.record_count,
@@ -1279,8 +1297,8 @@ impl StoredMetadata {
             || chain_updated_at.2 >= 1_000_000_000
             || self
                 .title
-                .as_ref()
-                .is_some_and(|title| title.len() > MAX_METADATA_TITLE_BYTES)
+                .as_deref()
+                .is_some_and(|title| !valid_metadata_title(title))
         {
             return None;
         }

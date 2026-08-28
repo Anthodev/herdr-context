@@ -831,6 +831,79 @@ fn claude_adapter_revision_revisits_revision_two_watermarks() {
 }
 
 #[test]
+fn claude_title_revision_revisits_cached_titleless_metadata() {
+    let (_project_dir, project) = project();
+    let home = TempDir::new().expect("home");
+    let session_id = "11111111-1111-4111-8111-111111111111";
+    let destination = home
+        .path()
+        .join(".claude/projects/custom-project-key")
+        .join(format!("{session_id}.jsonl"));
+    fs::create_dir_all(destination.parent().expect("fixture parent")).expect("store");
+    let transcript = format!(
+        "{}\n{}",
+        serde_json::json!({
+            "type": "ai-title",
+            "aiTitle": "generated cached title",
+            "sessionId": session_id,
+        }),
+        fixture_text(
+            "claude-code/-workspace-project/11111111-1111-4111-8111-111111111111.jsonl",
+            &project,
+        )
+    );
+    fs::write(destination, transcript).expect("Claude fixture");
+    let source = ClaudeCodeSource::new(project.clone(), home.path().join(".claude/projects"))
+        .expect("Claude source");
+    let first = source
+        .discover(
+            &project,
+            None,
+            DiscoveryLimit::new(8).expect("discovery limit"),
+        )
+        .expect("initial discovery");
+    let mut revision_three = serde_json::from_str::<serde_json::Value>(
+        first.next_watermark().expect("watermark").token(),
+    )
+    .expect("watermark JSON");
+    for entry in revision_three
+        .as_object_mut()
+        .expect("watermark map")
+        .values_mut()
+    {
+        let entry = entry.as_object_mut().expect("watermark entry");
+        entry.insert("adapter_revision".to_owned(), serde_json::json!(3));
+        entry
+            .get_mut("summary")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("stored summary")
+            .insert("title".to_owned(), serde_json::Value::Null);
+    }
+    let revision_three = SourceWatermark::new(
+        source.source_id().clone(),
+        serde_json::to_string(&revision_three).expect("revision three watermark"),
+    )
+    .expect("source watermark");
+
+    let refreshed = source
+        .discover(
+            &project,
+            Some(&revision_three),
+            DiscoveryLimit::new(8).expect("discovery limit"),
+        )
+        .expect("refreshed discovery");
+
+    assert_eq!(refreshed.candidates().len(), 1);
+    let conversation = source
+        .extract_metadata(
+            &refreshed.candidates()[0],
+            MetadataBudget::new(512 * 1024).expect("metadata budget"),
+        )
+        .expect("refreshed metadata");
+    assert_eq!(conversation.title(), Some("generated cached title"));
+}
+
+#[test]
 fn global_store_overrides_resolve_without_home_scans() {
     let home = TempDir::new().expect("home");
     let codex = TempDir::new().expect("Codex home");
@@ -890,7 +963,22 @@ fn claude_accepts_current_auxiliary_record_shapes() {
         }),
         serde_json::json!({
             "type": "custom-title",
-            "customTitle": "sanitized title",
+            "customTitle": 42,
+            "sessionId": session_id,
+        }),
+        serde_json::json!({
+            "type": "ai-title",
+            "aiTitle": "   ",
+            "sessionId": session_id,
+        }),
+        serde_json::json!({
+            "type": "ai-title",
+            "aiTitle": "generated fallback title",
+            "sessionId": session_id,
+        }),
+        serde_json::json!({
+            "type": "custom-title",
+            "customTitle": "custom conversation title",
             "sessionId": session_id,
         }),
         serde_json::json!({
@@ -936,7 +1024,7 @@ fn claude_accepts_current_auxiliary_record_shapes() {
         }),
         serde_json::json!({
             "type": "ai-title",
-            "aiTitle": "sanitized title",
+            "aiTitle": "generated conversation title",
             "sessionId": session_id,
         }),
         serde_json::json!({
@@ -966,10 +1054,9 @@ fn claude_accepts_current_auxiliary_record_shapes() {
     let source = ClaudeCodeSource::new(project.clone(), home.path().join(".claude/projects"))
         .expect("Claude source");
 
-    assert_eq!(
-        discover_one(&source, &project).session_reference().id(),
-        session_id
-    );
+    let conversation = discover_one(&source, &project);
+    assert_eq!(conversation.session_reference().id(), session_id);
+    assert_eq!(conversation.title(), Some("custom conversation title"));
 }
 
 #[test]
@@ -1030,6 +1117,14 @@ fn claude_resumes_after_a_page_of_unknown_auxiliary_records() {
             "attachment": {"type": "goal_status", "met": false},
         })
     ));
+    transcript.push_str(&format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "ai-title",
+            "aiTitle": "generated paginated title",
+            "sessionId": session_id,
+        })
+    ));
     while transcript.len() <= 512 * 1024 {
         transcript.push_str(&auxiliary);
     }
@@ -1071,6 +1166,7 @@ fn claude_resumes_after_a_page_of_unknown_auxiliary_records() {
         conversation.created_at(),
         Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_139_200))
     );
+    assert_eq!(conversation.title(), Some("generated paginated title"));
 }
 
 #[test]
