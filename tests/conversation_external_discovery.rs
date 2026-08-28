@@ -3,6 +3,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::time::{Duration, SystemTime};
 
 use herdr_context::conversations::discovery::discover_conversations;
 use herdr_context::conversations::sources::{
@@ -296,9 +297,8 @@ fn codex_current_legacy_history_omits_rollout_ordinals() {
 }
 
 #[test]
-fn claude_rejects_records_outside_the_verified_current_shapes() {
+fn claude_rejects_malformed_known_record_shapes() {
     for case in [
-        "unknown type",
         "attachment identity fields",
         "missing message payload",
         "missing attachment payload",
@@ -317,7 +317,6 @@ fn claude_rejects_records_outside_the_verified_current_shapes() {
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("record"))
             .collect::<Vec<_>>();
         match case {
-            "unknown type" => records[1]["type"] = serde_json::json!("unknown"),
             "attachment identity fields" => {
                 records[1]["cwd"] = serde_json::json!(project.root());
             }
@@ -768,6 +767,70 @@ fn adapter_revision_revisits_legacy_cached_rejections() {
 }
 
 #[test]
+fn claude_adapter_revision_revisits_revision_two_watermarks() {
+    let (_project_dir, project) = project();
+    let home = TempDir::new().expect("home");
+    install_valid_fixtures(home.path(), &project);
+    let roots = KnownStoreRoots::under_home(home.path());
+    let source =
+        ClaudeCodeSource::new(project.clone(), roots.claude_code().to_path_buf()).expect("source");
+    let first = source
+        .discover(
+            &project,
+            None,
+            DiscoveryLimit::new(8).expect("discovery limit"),
+        )
+        .expect("initial discovery");
+    let mut revision_two = serde_json::from_str::<serde_json::Value>(
+        first.next_watermark().expect("watermark").token(),
+    )
+    .expect("watermark JSON");
+    for entry in revision_two
+        .as_object_mut()
+        .expect("watermark map")
+        .values_mut()
+    {
+        let entry = entry.as_object_mut().expect("watermark entry");
+        entry.insert("adapter_revision".to_owned(), serde_json::json!(2));
+        entry.insert("fingerprint".to_owned(), serde_json::Value::Null);
+        entry.insert("session_id".to_owned(), serde_json::Value::Null);
+        entry.insert("safe_offset".to_owned(), serde_json::json!(0));
+        entry.insert("complete".to_owned(), serde_json::json!(false));
+        entry.insert("rejected".to_owned(), serde_json::json!(true));
+        entry.insert(
+            "rejection".to_owned(),
+            serde_json::json!({
+                "kind": "unsupported_format",
+                "message": "Claude record type is outside the validated current set",
+            }),
+        );
+        entry.insert("duplicate".to_owned(), serde_json::json!(false));
+        entry.insert("prefix_hash".to_owned(), serde_json::Value::Null);
+        entry.insert(
+            "content_hash".to_owned(),
+            serde_json::json!(14_695_981_039_346_656_037_u64),
+        );
+        entry.insert("summary".to_owned(), serde_json::Value::Null);
+    }
+    let revision_two = SourceWatermark::new(
+        source.source_id().clone(),
+        serde_json::to_string(&revision_two).expect("revision two watermark"),
+    )
+    .expect("source watermark");
+
+    let refreshed = source
+        .discover(
+            &project,
+            Some(&revision_two),
+            DiscoveryLimit::new(8).expect("discovery limit"),
+        )
+        .expect("refreshed discovery");
+
+    assert_eq!(refreshed.candidates().len(), 1);
+    assert!(refreshed.errors().is_empty(), "{:?}", refreshed.errors());
+}
+
+#[test]
 fn global_store_overrides_resolve_without_home_scans() {
     let home = TempDir::new().expect("home");
     let codex = TempDir::new().expect("Codex home");
@@ -820,6 +883,30 @@ fn claude_accepts_current_auxiliary_record_shapes() {
     fs::create_dir_all(destination.parent().expect("fixture parent")).expect("store");
     let cwd = project.root();
     let records = [
+        serde_json::json!({
+            "type": "mode",
+            "mode": "normal",
+            "sessionId": session_id,
+        }),
+        serde_json::json!({
+            "type": "custom-title",
+            "customTitle": "sanitized title",
+            "sessionId": session_id,
+        }),
+        serde_json::json!({
+            "type": "agent-name",
+            "agentName": "sanitized agent",
+            "sessionId": session_id,
+        }),
+        serde_json::json!({
+            "type": "agent-setting",
+            "agentSetting": "sanitized agent",
+            "sessionId": session_id,
+        }),
+        serde_json::json!({
+            "type": "future-auxiliary-metadata",
+            "payload": {"sanitized": true},
+        }),
         serde_json::json!({
             "type": "last-prompt",
             "leafUuid": "22222222-2222-4222-8222-222222222222",
@@ -882,6 +969,187 @@ fn claude_accepts_current_auxiliary_record_shapes() {
     assert_eq!(
         discover_one(&source, &project).session_reference().id(),
         session_id
+    );
+}
+
+#[test]
+fn claude_unknown_auxiliary_records_cannot_establish_a_session() {
+    let (_project_dir, project) = project();
+    let home = TempDir::new().expect("home");
+    let session_id = "11111111-1111-4111-8111-111111111111";
+    let destination = home
+        .path()
+        .join(".claude/projects/custom-project-key")
+        .join(format!("{session_id}.jsonl"));
+    fs::create_dir_all(destination.parent().expect("fixture parent")).expect("store");
+    fs::write(
+        destination,
+        "{\"type\":\"future-auxiliary-metadata\",\"payload\":{\"sanitized\":true}}\n",
+    )
+    .expect("Claude fixture");
+    let source = ClaudeCodeSource::new(project.clone(), home.path().join(".claude/projects"))
+        .expect("Claude source");
+
+    let batch = source
+        .discover(&project, None, DiscoveryLimit::new(8).expect("limit"))
+        .expect("adapter-scoped result");
+
+    assert!(batch.candidates().is_empty());
+    assert!(
+        batch
+            .errors()
+            .iter()
+            .any(|error| matches!(error.kind(), ConversationSourceErrorKind::UnsupportedFormat))
+    );
+}
+
+#[test]
+fn claude_resumes_after_a_page_of_unknown_auxiliary_records() {
+    let (_project_dir, project) = project();
+    let home = TempDir::new().expect("home");
+    let session_id = "11111111-1111-4111-8111-111111111111";
+    let destination = home
+        .path()
+        .join(".claude/projects/custom-project-key")
+        .join(format!("{session_id}.jsonl"));
+    fs::create_dir_all(destination.parent().expect("fixture parent")).expect("store");
+    let auxiliary = format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "future-auxiliary-metadata",
+            "padding": "x".repeat(2_048),
+        })
+    );
+    let mut transcript = String::new();
+    transcript.push_str(&format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "attachment",
+            "uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "timestamp": "2025-12-31T00:00:00.000Z",
+            "attachment": {"type": "goal_status", "met": false},
+        })
+    ));
+    while transcript.len() <= 512 * 1024 {
+        transcript.push_str(&auxiliary);
+    }
+    transcript.push_str(&fixture_text(
+        "claude-code/-workspace-project/11111111-1111-4111-8111-111111111111.jsonl",
+        &project,
+    ));
+    fs::write(destination, transcript).expect("Claude fixture");
+    let source = ClaudeCodeSource::new(project.clone(), home.path().join(".claude/projects"))
+        .expect("Claude source");
+
+    let first = source
+        .discover(
+            &project,
+            None,
+            DiscoveryLimit::new(8).expect("discovery limit"),
+        )
+        .expect("first discovery page");
+    assert!(first.errors().is_empty(), "{:?}", first.errors());
+    assert!(first.candidates().is_empty());
+    assert!(first.has_more());
+
+    let second = source
+        .discover(
+            &project,
+            first.next_watermark(),
+            DiscoveryLimit::new(8).expect("discovery limit"),
+        )
+        .expect("second discovery page");
+    assert!(second.errors().is_empty(), "{:?}", second.errors());
+    assert_eq!(second.candidates().len(), 1);
+    let conversation = source
+        .extract_metadata(
+            &second.candidates()[0],
+            MetadataBudget::new(512 * 1024).expect("metadata budget"),
+        )
+        .expect("conversation metadata");
+    assert_eq!(
+        conversation.created_at(),
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_139_200))
+    );
+}
+
+#[test]
+fn claude_rejects_auxiliary_cwd_outside_the_project() {
+    let (_project_dir, project) = project();
+    let foreign = TempDir::new().expect("foreign project");
+    let foreign = fs::canonicalize(foreign.path()).expect("canonical foreign path");
+    let home = TempDir::new().expect("home");
+    let session_id = "11111111-1111-4111-8111-111111111111";
+    let destination = home
+        .path()
+        .join(".claude/projects/custom-project-key")
+        .join(format!("{session_id}.jsonl"));
+    fs::create_dir_all(destination.parent().expect("fixture parent")).expect("store");
+    let transcript = format!(
+        "{}\n{}",
+        serde_json::json!({
+            "type": "future-auxiliary-metadata",
+            "cwd": foreign,
+        }),
+        fixture_text(
+            "claude-code/-workspace-project/11111111-1111-4111-8111-111111111111.jsonl",
+            &project,
+        )
+    );
+    fs::write(destination, transcript).expect("Claude fixture");
+    let source = ClaudeCodeSource::new(project.clone(), home.path().join(".claude/projects"))
+        .expect("Claude source");
+
+    let batch = source
+        .discover(&project, None, DiscoveryLimit::new(8).expect("limit"))
+        .expect("adapter-scoped result");
+
+    assert!(batch.candidates().is_empty());
+}
+
+#[test]
+fn claude_accepts_descendant_cwd_and_preserves_first_origin() {
+    let (_project_dir, project) = project();
+    let descendant = project.root().join("lockself-src");
+    fs::create_dir(&descendant).expect("project descendant");
+    let home = TempDir::new().expect("home");
+    install_valid_fixtures(home.path(), &project);
+    let roots = KnownStoreRoots::under_home(home.path());
+    let path = roots
+        .claude_code()
+        .join(claude_directory(&project))
+        .join("11111111-1111-4111-8111-111111111111.jsonl");
+    let mut records = fs::read_to_string(&path)
+        .expect("Claude fixture")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("record"))
+        .collect::<Vec<_>>();
+    records[2]["cwd"] = serde_json::json!(descendant);
+    let transcript = records
+        .into_iter()
+        .map(|record| format!("{record}\n"))
+        .collect::<String>();
+    fs::write(&path, transcript).expect("mixed cwd Claude fixture");
+    let source = ClaudeCodeSource::new(project.clone(), roots.claude_code().to_path_buf())
+        .expect("Claude source");
+
+    let batch = source
+        .discover(
+            &project,
+            None,
+            DiscoveryLimit::new(8).expect("discovery limit"),
+        )
+        .expect("discovery");
+    assert!(batch.errors().is_empty(), "{:?}", batch.errors());
+    assert_eq!(batch.candidates().len(), 1);
+    let evidence = source
+        .project_evidence(&batch.candidates()[0], &project)
+        .expect("canonical evidence");
+    assert!(
+        evidence
+            .iter()
+            .all(|item| item.canonical_path() == project.root()),
+        "the first canonical cwd remains the stable origin"
     );
 }
 

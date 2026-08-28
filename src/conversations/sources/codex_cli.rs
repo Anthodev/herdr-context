@@ -6,8 +6,9 @@ use serde::de::IgnoredAny;
 
 use super::known_stores::{
     EntryKind, FormatFailure, KnownFormat, KnownJsonlSource, KnownStore, MAX_CANDIDATE_PATHS,
-    ParsedMetadata, canonical_cwd, parse_rfc3339, push_inventory_error, push_listing_error,
-    push_shape_error, validate_tool_version, validate_uuid,
+    ParseOutcome, ParsedMetadata, PendingMetadata, canonical_cwd, parse_rfc3339,
+    push_inventory_error, push_listing_error, push_shape_error, validate_tool_version,
+    validate_uuid,
 };
 use super::{
     ConversationCandidate, ConversationSource, ConversationSourceError, DiscoveryBatch,
@@ -259,7 +260,8 @@ impl KnownFormat for CodexCliFormat {
         project: &ProjectIdentity,
         cancelled: &AtomicBool,
         previous: Option<&ParsedMetadata>,
-    ) -> Result<ParsedMetadata, FormatFailure> {
+        _previous_pending: Option<&PendingMetadata>,
+    ) -> Result<ParseOutcome, FormatFailure> {
         let (id, cwd, created_at, mut updated_at, append_start, mut record_count, mut history) =
             if let Some(previous) = previous {
                 let history = CodexHistory::from_watermark(previous.chain_tail.as_deref())?;
@@ -351,7 +353,7 @@ impl KnownFormat for CodexCliFormat {
             updated_at = timestamp;
             record_count = record_count.saturating_add(1);
         }
-        Ok(ParsedMetadata {
+        Ok(ParseOutcome::Metadata(ParsedMetadata {
             session_id: id,
             title: None,
             created_at,
@@ -360,7 +362,7 @@ impl KnownFormat for CodexCliFormat {
             cwd,
             chain_tail: Some(history.watermark()),
             record_count,
-        })
+        }))
     }
 }
 

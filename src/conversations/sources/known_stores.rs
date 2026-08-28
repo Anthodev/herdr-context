@@ -114,6 +114,12 @@ impl KnownStoreRoots {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(super) enum ParseOutcome {
+    Metadata(ParsedMetadata),
+    IdentityPending(PendingMetadata),
+}
+
 pub(super) trait KnownFormat: std::fmt::Debug + Send + Sync + 'static {
     fn source_id(&self) -> &'static str;
     fn tool_id(&self) -> &'static str;
@@ -142,7 +148,8 @@ pub(super) trait KnownFormat: std::fmt::Debug + Send + Sync + 'static {
         project: &ProjectIdentity,
         cancelled: &AtomicBool,
         previous: Option<&ParsedMetadata>,
-    ) -> Result<ParsedMetadata, FormatFailure>;
+        previous_pending: Option<&PendingMetadata>,
+    ) -> Result<ParseOutcome, FormatFailure>;
 }
 
 #[derive(Debug)]
@@ -229,10 +236,22 @@ impl<F: KnownFormat> KnownJsonlSource<F> {
         })?;
         let identity = before_state.identity();
         let resume = previous.and_then(|entry| {
-            let summary = entry.summary.as_ref()?.to_parsed(&self.project)?;
+            let summary = entry
+                .summary
+                .as_ref()
+                .and_then(|summary| summary.to_parsed(&self.project));
+            let pending = entry
+                .pending
+                .as_ref()
+                .and_then(StoredPendingMetadata::to_pending);
+            let session_matches = match (&entry.session_id, &summary, &pending) {
+                (Some(session_id), Some(summary), None) => session_id == &summary.session_id,
+                (None, None, Some(_)) => true,
+                _ => false,
+            };
             let structurally_resumable = entry.identity == identity
                 && entry.safe_offset < before_state.len
-                && entry.session_id.as_deref() == Some(summary.session_id.as_str());
+                && session_matches;
             if !structurally_resumable
                 || entry.prefix_hash.is_none()
                 || read_prefix_hash(&mut file, entry.safe_offset).ok() != entry.prefix_hash
@@ -243,13 +262,17 @@ impl<F: KnownFormat> KnownJsonlSource<F> {
                 entry.safe_offset,
                 entry.content_hash,
                 summary,
+                pending,
                 entry.prefix_hash,
             ))
         });
-        let (start, mut content_hash, previous_metadata, prefix_hash) = resume.map_or(
-            (0, FNV_OFFSET, None, None),
-            |(offset, hash, metadata, prefix_hash)| (offset, hash, Some(metadata), prefix_hash),
-        );
+        let (start, mut content_hash, previous_metadata, previous_pending, prefix_hash) = resume
+            .map_or(
+                (0, FNV_OFFSET, None, None, None),
+                |(offset, hash, metadata, pending, prefix_hash)| {
+                    (offset, hash, metadata, pending, prefix_hash)
+                },
+            );
         let remaining = before_state.len.saturating_sub(start);
         let read_len = remaining.min(byte_budget).min(MAX_FILE_BYTES);
         if read_len == 0 {
@@ -340,12 +363,12 @@ impl<F: KnownFormat> KnownJsonlSource<F> {
                 relative,
             ));
         }
-        let metadata = if safe_len == 0 {
-            previous_metadata.expect("incremental scan has prior metadata")
+        let outcome = if safe_len == 0 {
+            ParseOutcome::Metadata(previous_metadata.expect("incremental scan has prior metadata"))
         } else {
             let records = complete_records(&snapshot[..safe_len])
                 .map_err(|failure| self.error(failure.kind, failure.message, relative))?;
-            let metadata = self
+            let outcome = self
                 .format
                 .parse(
                     &records,
@@ -353,10 +376,11 @@ impl<F: KnownFormat> KnownJsonlSource<F> {
                     &self.project,
                     cancelled,
                     previous_metadata.as_ref(),
+                    previous_pending.as_ref(),
                 )
                 .map_err(|failure| self.error(failure.kind, failure.message, relative))?;
             content_hash = fnv1a(&snapshot[..safe_len], content_hash);
-            metadata
+            outcome
         };
         let after = file.metadata().map_err(|error| {
             store_io_error(
@@ -383,22 +407,44 @@ impl<F: KnownFormat> KnownJsonlSource<F> {
         }
         let safe_offset = start.saturating_add(u64::try_from(safe_len).unwrap_or(u64::MAX));
         let complete = start.saturating_add(read_len) >= before_state.len || parked;
+        if complete && matches!(outcome, ParseOutcome::IdentityPending(_)) {
+            return Err(self.error(
+                ConversationSourceErrorKind::UnsupportedFormat,
+                "known JSONL contains no current transcript record",
+                relative,
+            ));
+        }
         let prefix_hash = prefix_hash.or_else(|| {
             let prefix_len =
                 safe_len.min(usize::try_from(PREFIX_GUARD_BYTES).unwrap_or(usize::MAX));
             (prefix_len > 0).then(|| fnv1a(&snapshot[..prefix_len], FNV_OFFSET))
         });
-        let fingerprint =
-            complete.then(|| snapshot_fingerprint(&metadata, &after_state, content_hash));
-        let session_id = metadata.session_id.clone();
-        let summary = StoredMetadata::from_parsed(&metadata);
+        let (metadata, pending) = match outcome {
+            ParseOutcome::Metadata(metadata) => (Some(metadata), None),
+            ParseOutcome::IdentityPending(pending) => {
+                (None, Some(StoredPendingMetadata::from_pending(&pending)))
+            }
+        };
+        let fingerprint = complete.then(|| {
+            snapshot_fingerprint(
+                metadata
+                    .as_ref()
+                    .expect("complete scan has parsed metadata"),
+                &after_state,
+                content_hash,
+            )
+        });
+        let session_id = metadata
+            .as_ref()
+            .map(|metadata| metadata.session_id.clone());
+        let summary = metadata.as_ref().map(StoredMetadata::from_parsed);
         Ok(ScannedFile {
             metadata,
             state: after_state,
             watermark: WatermarkEntry {
                 state: before_state.fingerprint(),
                 fingerprint,
-                session_id: Some(session_id),
+                session_id,
                 safe_offset,
                 complete,
                 rejection: None,
@@ -406,7 +452,8 @@ impl<F: KnownFormat> KnownJsonlSource<F> {
                 duplicate: false,
                 prefix_hash,
                 content_hash,
-                summary: Some(summary),
+                summary,
+                pending,
                 identity,
                 adapter_revision: self.format.adapter_revision(),
             },
@@ -685,7 +732,10 @@ impl<F: KnownFormat> ConversationSource for KnownJsonlSource<F> {
             inspected_changed = inspected_changed.saturating_add(1);
             match self.scan_file(&relative, previous.get(&key), MAX_FILE_BYTES, cancelled) {
                 Ok(scanned) => {
-                    let session_id = scanned.metadata.session_id.clone();
+                    let session_id = scanned
+                        .metadata
+                        .as_ref()
+                        .map(|metadata| metadata.session_id.clone());
                     let changed = scanned.watermark.complete
                         && previous
                             .get(&key)
@@ -696,7 +746,7 @@ impl<F: KnownFormat> ConversationSource for KnownJsonlSource<F> {
                         relative,
                         key,
                         state: scanned.state,
-                        session_id: Some(session_id),
+                        session_id,
                         watermark: scanned.watermark,
                         changed,
                         error: None,
@@ -737,6 +787,7 @@ impl<F: KnownFormat> ConversationSource for KnownJsonlSource<F> {
                                 prefix_hash: None,
                                 content_hash: FNV_OFFSET,
                                 summary: None,
+                                pending: None,
                                 identity: state.identity(),
                                 adapter_revision: self.format.adapter_revision(),
                             },
@@ -1027,7 +1078,7 @@ struct PreparedFile {
 }
 #[derive(Clone, Debug)]
 struct ScannedFile {
-    metadata: ParsedMetadata,
+    metadata: Option<ParsedMetadata>,
     state: FileState,
     watermark: WatermarkEntry,
 }
@@ -1048,6 +1099,13 @@ pub(super) struct ParsedMetadata {
     pub(super) chain_updated_at: SystemTime,
     pub(super) cwd: CanonicalPath,
     pub(super) chain_tail: Option<String>,
+    pub(super) record_count: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PendingMetadata {
+    pub(super) created_at: Option<SystemTime>,
+    pub(super) updated_at: Option<SystemTime>,
     pub(super) record_count: u64,
 }
 
@@ -1096,6 +1154,8 @@ struct WatermarkEntry {
     prefix_hash: Option<u64>,
     content_hash: u64,
     summary: Option<StoredMetadata>,
+    #[serde(default)]
+    pending: Option<StoredPendingMetadata>,
     identity: String,
     #[serde(default)]
     adapter_revision: u32,
@@ -1136,6 +1196,50 @@ impl StoredRejection {
             }
             StoredRejectionKind::ProjectMismatch => ConversationSourceErrorKind::ProjectMismatch,
         }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct StoredPendingMetadata {
+    created_at: Option<(bool, u64, u32)>,
+    updated_at: Option<(bool, u64, u32)>,
+    record_count: u64,
+}
+
+impl StoredPendingMetadata {
+    fn from_pending(metadata: &PendingMetadata) -> Self {
+        Self {
+            created_at: metadata.created_at.map(system_time_parts),
+            updated_at: metadata.updated_at.map(system_time_parts),
+            record_count: metadata.record_count,
+        }
+    }
+
+    fn to_pending(&self) -> Option<PendingMetadata> {
+        if self.record_count == 0
+            || self
+                .created_at
+                .is_some_and(|(_, _, nanos)| nanos >= 1_000_000_000)
+            || self
+                .updated_at
+                .is_some_and(|(_, _, nanos)| nanos >= 1_000_000_000)
+        {
+            return None;
+        }
+        let created_at = self.created_at.and_then(system_time_from_parts);
+        let updated_at = self.updated_at.and_then(system_time_from_parts);
+        if created_at.is_some() != updated_at.is_some()
+            || created_at
+                .zip(updated_at)
+                .is_some_and(|(created_at, updated_at)| updated_at < created_at)
+        {
+            return None;
+        }
+        Some(PendingMetadata {
+            created_at,
+            updated_at,
+            record_count: self.record_count,
+        })
     }
 }
 
@@ -1715,15 +1819,25 @@ fn decode_watermark<F: KnownFormat>(
                 .as_ref()
                 .is_none_or(|value| value.len() <= 512)
             && entry.safe_offset <= file_len;
-        let summary_is_valid = match (&entry.summary, &entry.session_id) {
-            (Some(summary), Some(session_id)) => {
+        let summary_is_valid = match (&entry.summary, &entry.session_id, &entry.pending) {
+            (Some(summary), Some(session_id), None) => {
                 summary.session_id == *session_id
                     && summary.record_count > 0
                     && summary.to_parsed(&source.project).is_some()
                     && SessionReference::new(source.format.tool_id(), session_id).is_ok()
             }
-            (None, None) => {
-                entry.safe_offset == 0 && entry.fingerprint.is_none() && !entry.complete
+            (None, None, Some(pending)) => {
+                !entry.rejected
+                    && !entry.complete
+                    && entry.safe_offset > 0
+                    && entry.fingerprint.is_none()
+                    && pending.to_pending().is_some()
+            }
+            (None, None, None) => {
+                entry.rejected
+                    && !entry.complete
+                    && entry.safe_offset == 0
+                    && entry.fingerprint.is_none()
             }
             _ => false,
         };

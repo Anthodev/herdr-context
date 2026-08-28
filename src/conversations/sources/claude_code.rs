@@ -6,8 +6,9 @@ use serde::de::IgnoredAny;
 
 use super::known_stores::{
     EntryKind, FormatFailure, KnownFormat, KnownJsonlSource, KnownStore, MAX_CANDIDATE_PATHS,
-    ParsedMetadata, canonical_cwd, claude_project_directory, parse_rfc3339, push_inventory_error,
-    push_listing_error, push_shape_error, validate_tool_version, validate_uuid,
+    ParseOutcome, ParsedMetadata, PendingMetadata, canonical_cwd, claude_project_directory,
+    parse_rfc3339, push_inventory_error, push_listing_error, push_shape_error,
+    validate_tool_version, validate_uuid,
 };
 use super::{
     ConversationCandidate, ConversationSource, ConversationSourceError, DiscoveryBatch,
@@ -113,9 +114,9 @@ impl KnownFormat for ClaudeCodeFormat {
     }
 
     fn adapter_revision(&self) -> u32 {
-        // 2: compact boundaries with a null parent are now accepted, so cached
-        // rejections from revision 1 must be revisited.
-        2
+        // 3: current and future auxiliary metadata plus descendant cwd changes
+        // are accepted, so cached rejections from revision 2 must be revisited.
+        3
     }
 
     fn list_candidates(
@@ -248,7 +249,8 @@ impl KnownFormat for ClaudeCodeFormat {
         project: &ProjectIdentity,
         cancelled: &AtomicBool,
         previous: Option<&ParsedMetadata>,
-    ) -> Result<ParsedMetadata, FormatFailure> {
+        previous_pending: Option<&PendingMetadata>,
+    ) -> Result<ParseOutcome, FormatFailure> {
         let encoded_directory_matches = relative.parent().and_then(Path::file_name)
             == Some(claude_project_directory(project.root()).as_os_str());
         let expected_id = relative
@@ -258,11 +260,18 @@ impl KnownFormat for ClaudeCodeFormat {
         validate_uuid(expected_id, 4)?;
 
         let mut session_id = previous.map(|metadata| metadata.session_id.clone());
-        let mut created_at = previous.map(|metadata| metadata.created_at);
-        let mut updated_at = previous.map(|metadata| metadata.updated_at);
+        let mut created_at = previous
+            .map(|metadata| metadata.created_at)
+            .or_else(|| previous_pending.and_then(|metadata| metadata.created_at));
+        let mut updated_at = previous
+            .map(|metadata| metadata.updated_at)
+            .or_else(|| previous_pending.and_then(|metadata| metadata.updated_at));
         let mut previous_uuid = previous.and_then(|metadata| metadata.chain_tail.clone());
         let mut canonical = previous.map(|metadata| metadata.cwd.clone());
-        let mut record_count = previous.map_or(0, |metadata| metadata.record_count);
+        let mut record_count = previous.map_or_else(
+            || previous_pending.map_or(0, |metadata| metadata.record_count),
+            |metadata| metadata.record_count,
+        );
         if session_id.as_deref().is_some_and(|id| id != expected_id) {
             return Err(FormatFailure::unsupported(
                 "Claude incremental state conflicts with the native session identifier",
@@ -281,6 +290,11 @@ impl KnownFormat for ClaudeCodeFormat {
                     "Claude record type must be non-empty",
                 ));
             }
+            let canonical_record_cwd = record
+                .cwd
+                .as_deref()
+                .map(|cwd| canonical_cwd(cwd, project))
+                .transpose()?;
 
             let carries_identity = match record.kind.as_str() {
                 "user" | "assistant" | "system" => true,
@@ -294,12 +308,14 @@ impl KnownFormat for ClaudeCodeFormat {
                 | "permission-mode"
                 | "ai-title"
                 | "file-history-snapshot"
-                | "queue-operation" => false,
-                _ => {
-                    return Err(FormatFailure::unsupported(
-                        "Claude record type is outside the validated current set",
-                    ));
-                }
+                | "queue-operation"
+                | "mode"
+                | "custom-title"
+                | "agent-name"
+                | "agent-setting" => false,
+                // Auxiliary metadata is open-ended in Claude Code. Unknown
+                // records cannot establish any session metadata below.
+                _ => false,
             };
             if carries_identity {
                 let payload_shape_valid = match record.kind.as_str() {
@@ -333,8 +349,8 @@ impl KnownFormat for ClaudeCodeFormat {
                     ));
                 }
 
-                let cwd = match record.cwd.as_deref() {
-                    Some(cwd) => canonical_cwd(cwd, project)?,
+                let cwd = match canonical_record_cwd {
+                    Some(cwd) => cwd,
                     None if encoded_directory_matches => crate::project::CanonicalPath::new(
                         project.root().to_path_buf(),
                     )
@@ -349,16 +365,6 @@ impl KnownFormat for ClaudeCodeFormat {
                         ));
                     }
                 };
-                if canonical
-                    .as_ref()
-                    .is_some_and(|current: &crate::project::CanonicalPath| {
-                        current.as_path() != cwd.as_path()
-                    })
-                {
-                    return Err(FormatFailure::project_mismatch(
-                        "Claude JSONL mixes canonical cwd evidence",
-                    ));
-                }
 
                 let uuid = record.uuid.as_deref().ok_or_else(|| {
                     FormatFailure::unsupported(
@@ -398,7 +404,7 @@ impl KnownFormat for ClaudeCodeFormat {
                 updated_at = Some(updated_at.map_or(timestamp, |current| current.max(timestamp)));
                 session_id = Some(native_id.to_owned());
                 previous_uuid = Some(uuid.to_owned());
-                canonical = Some(cwd);
+                canonical.get_or_insert(cwd);
             } else {
                 match record.kind.as_str() {
                     "attachment" => {
@@ -478,6 +484,31 @@ impl KnownFormat for ClaudeCodeFormat {
                         updated_at =
                             Some(updated_at.map_or(timestamp, |current| current.max(timestamp)));
                     }
+                    "mode" | "custom-title" | "agent-name" | "agent-setting" => {
+                        validate_claude_session(&record, expected_id)?;
+                        let (present, message) = match record.kind.as_str() {
+                            "mode" => (
+                                record.mode.is_some(),
+                                "Claude mode record is missing its mode",
+                            ),
+                            "custom-title" => (
+                                record.custom_title.is_some(),
+                                "Claude custom-title record is missing its title",
+                            ),
+                            "agent-name" => (
+                                record.agent_name.is_some(),
+                                "Claude agent-name record is missing its name",
+                            ),
+                            "agent-setting" => (
+                                record.agent_setting.is_some(),
+                                "Claude agent-setting record is missing its setting",
+                            ),
+                            _ => unreachable!("record kind matched above"),
+                        };
+                        if !present {
+                            return Err(FormatFailure::unsupported(message));
+                        }
+                    }
                     "file-history-snapshot" => {
                         validate_uuid(
                             record.message_id.as_deref().ok_or_else(|| {
@@ -493,16 +524,21 @@ impl KnownFormat for ClaudeCodeFormat {
                             ));
                         }
                     }
-                    _ => unreachable!("record kind classified above"),
+                    _ => {}
                 }
             }
             record_count = record_count.saturating_add(1);
         }
 
-        Ok(ParsedMetadata {
-            session_id: session_id.ok_or_else(|| {
-                FormatFailure::unsupported("Claude JSONL contains no current transcript record")
-            })?,
+        let Some(session_id) = session_id else {
+            return Ok(ParseOutcome::IdentityPending(PendingMetadata {
+                created_at,
+                updated_at,
+                record_count,
+            }));
+        };
+        Ok(ParseOutcome::Metadata(ParsedMetadata {
+            session_id,
             title: None,
             created_at: created_at.ok_or_else(|| {
                 FormatFailure::unsupported("Claude JSONL contains no current timestamp")
@@ -520,7 +556,7 @@ impl KnownFormat for ClaudeCodeFormat {
             })?,
             chain_tail: previous_uuid,
             record_count,
-        })
+        }))
     }
 }
 
@@ -549,6 +585,13 @@ struct ClaudeRecord {
     permission_mode: Option<IgnoredAny>,
     #[serde(rename = "aiTitle")]
     ai_title: Option<IgnoredAny>,
+    mode: Option<IgnoredAny>,
+    #[serde(rename = "customTitle")]
+    custom_title: Option<IgnoredAny>,
+    #[serde(rename = "agentName")]
+    agent_name: Option<IgnoredAny>,
+    #[serde(rename = "agentSetting")]
+    agent_setting: Option<IgnoredAny>,
     #[serde(rename = "messageId")]
     message_id: Option<String>,
     snapshot: Option<IgnoredAny>,
