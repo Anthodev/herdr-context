@@ -1,6 +1,6 @@
 id = "herdr-context"
 name = "herdr-context"
-version = "0.19.3"
+version = "0.19.4"
 min_herdr_version = "0.8.0"
 description = "Per-tab project context dock"
 platforms = ["linux", "macos"]
