@@ -5,9 +5,9 @@ use serde::Deserialize;
 use serde::de::IgnoredAny;
 
 use super::known_stores::{
-    EntryKind, FormatFailure, KnownFormat, KnownJsonlSource, KnownStore, ParsedMetadata,
-    canonical_cwd, parse_rfc3339, pi_project_directory, push_listing_error, push_shape_error,
-    validate_uuid,
+    EntryKind, FormatFailure, KnownFormat, KnownJsonlSource, KnownStore, ParseOutcome,
+    ParsedMetadata, PendingMetadata, canonical_cwd, parse_rfc3339, pi_project_directory,
+    push_listing_error, push_shape_error, validate_uuid,
 };
 use super::{
     ConversationCandidate, ConversationSource, ConversationSourceError, DiscoveryBatch,
@@ -158,7 +158,8 @@ impl KnownFormat for PiFormat {
         project: &ProjectIdentity,
         cancelled: &AtomicBool,
         previous: Option<&ParsedMetadata>,
-    ) -> Result<ParsedMetadata, FormatFailure> {
+        _previous_pending: Option<&PendingMetadata>,
+    ) -> Result<ParseOutcome, FormatFailure> {
         let (
             session_id,
             cwd,
@@ -256,7 +257,7 @@ impl KnownFormat for PiFormat {
             previous_id = Some(record.id);
             record_count = record_count.saturating_add(1);
         }
-        Ok(ParsedMetadata {
+        Ok(ParseOutcome::Metadata(ParsedMetadata {
             session_id,
             title: None,
             created_at,
@@ -265,7 +266,7 @@ impl KnownFormat for PiFormat {
             cwd,
             chain_tail: previous_id,
             record_count,
-        })
+        }))
     }
 }
 

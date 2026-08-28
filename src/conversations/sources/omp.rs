@@ -6,8 +6,9 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Deserializer};
 
 use super::known_stores::{
-    EntryKind, FormatFailure, KnownFormat, KnownJsonlSource, KnownStore, ParsedMetadata,
-    canonical_cwd, parse_rfc3339, push_listing_error, push_shape_error, validate_uuid,
+    EntryKind, FormatFailure, KnownFormat, KnownJsonlSource, KnownStore, ParseOutcome,
+    ParsedMetadata, PendingMetadata, canonical_cwd, parse_rfc3339, push_listing_error,
+    push_shape_error, validate_uuid,
 };
 use super::{
     ConversationCandidate, ConversationSource, ConversationSourceError,
@@ -241,7 +242,8 @@ impl KnownFormat for OmpFormat {
         project: &ProjectIdentity,
         cancelled: &AtomicBool,
         previous: Option<&ParsedMetadata>,
-    ) -> Result<ParsedMetadata, FormatFailure> {
+        _previous_pending: Option<&PendingMetadata>,
+    ) -> Result<ParseOutcome, FormatFailure> {
         let (
             session_id,
             title,
@@ -347,7 +349,7 @@ impl KnownFormat for OmpFormat {
                 ));
             }
         }
-        Ok(ParsedMetadata {
+        Ok(ParseOutcome::Metadata(ParsedMetadata {
             session_id,
             title,
             created_at,
@@ -356,7 +358,7 @@ impl KnownFormat for OmpFormat {
             cwd,
             chain_tail: previous_id,
             record_count,
-        })
+        }))
     }
 }
 
