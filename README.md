@@ -335,7 +335,7 @@ test suite.
 
 ## Release status
 
-Version `0.19.2` is the current release line. Tag `v0.19.2`, Cargo
+Version `0.19.3` is the current release line. Tag `v0.19.3`, Cargo
 metadata, both manifests, and the minimum Herdr version are validated
 together; pushing a `v*` tag runs formatting, Clippy, the full test suite,
 and the contract checks, then publishes generated GitHub release notes.
