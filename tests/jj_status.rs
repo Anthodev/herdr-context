@@ -196,6 +196,47 @@ fn mixed_non_conflicted_descendants_aggregate_as_modified() {
 }
 
 #[test]
+fn added_descendant_tree_records_mark_directories_modified() {
+    let temp = TempDir::new().expect("tempdir");
+    fs::create_dir_all(temp.path().join("src/nested")).expect("directories");
+    fs::write(temp.path().join("src/nested/added.rs"), []).expect("fixture file");
+    let script = temp.path().join("fake-jj");
+    executable(
+        &script,
+        "#!/bin/sh\nprintf 'A\\000\\000src\\000false\\000false\\000\\000tree\\000A\\000\\000src/nested\\000false\\000false\\000\\000tree\\000A\\000\\000src/nested/added.rs\\000false\\000false\\000\\000file\\000'\n",
+    );
+    let mut service =
+        JjService::with_executable(script, JujutsuMode::Fresh, Duration::from_secs(1));
+    let workspace = herdr_context::vcs::VcsWorkspace::new(
+        temp.path().to_path_buf(),
+        herdr_context::vcs::VcsBackendMetadata::new("jj", "Jujutsu", true).expect("metadata"),
+    )
+    .expect("workspace");
+    let snapshot = service.refresh_status(&workspace).expect("status");
+    let mut tree = FilesTree::new(temp.path().to_path_buf()).expect("tree");
+    tree.load_directory(Path::new("")).expect("root");
+    tree.merge_status(&snapshot).expect("status overlay");
+    tree.load_directory(Path::new("src")).expect("src");
+    tree.load_directory(Path::new("src/nested"))
+        .expect("nested");
+
+    assert_eq!(
+        tree.node(Path::new("src")).expect("src").status(),
+        Some(VcsStatusKind::Modified)
+    );
+    assert_eq!(
+        tree.node(Path::new("src/nested")).expect("nested").status(),
+        Some(VcsStatusKind::Modified)
+    );
+    assert_eq!(
+        tree.node(Path::new("src/nested/added.rs"))
+            .expect("added row")
+            .status(),
+        Some(VcsStatusKind::Added)
+    );
+}
+
+#[test]
 fn malformed_templated_output_is_rejected() {
     let temp = TempDir::new().expect("tempdir");
     let script = temp.path().join("fake-jj");
