@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
@@ -265,10 +265,12 @@ fn parse_templated_diff(output: &[u8], stale: bool) -> Result<VcsStatusSnapshot,
     };
     let mut fields = output.split(|byte| *byte == b'\0');
     let mut entries = Vec::new();
+    let mut records = 0usize;
     while let Some(status) = fields.next() {
-        if entries.len() == MAX_STATUS_ENTRIES {
+        if records == MAX_STATUS_ENTRIES {
             return Err(invalid_output("Jujutsu status entry limit exceeded"));
         }
+        records += 1;
         let source_path = next_field(&mut fields)?;
         let target_path = next_field(&mut fields)?;
         let source_conflict = parse_bool(next_field(&mut fields)?)?;
@@ -276,6 +278,14 @@ fn parse_templated_diff(output: &[u8], stale: bool) -> Result<VcsStatusSnapshot,
         let source_type = parse_file_type(next_field(&mut fields)?)?;
         let target_type = parse_file_type(next_field(&mut fields)?)?;
         let base_kind = parse_status(status)?;
+        let renames = matches!(base_kind, VcsStatusKind::Renamed | VcsStatusKind::Copied);
+        validate_status_path(source_path, renames)?;
+        validate_status_path(target_path, true)?;
+        if matches!(source_type, FileType::Absent | FileType::Tree)
+            && matches!(target_type, FileType::Absent | FileType::Tree)
+        {
+            continue;
+        }
         let conflict = source_conflict
             || target_conflict
             || source_type == FileType::Conflict
@@ -291,13 +301,14 @@ fn parse_templated_diff(output: &[u8], stale: bool) -> Result<VcsStatusSnapshot,
         } else {
             base_kind
         };
-        let source_path = if matches!(base_kind, VcsStatusKind::Renamed | VcsStatusKind::Copied) {
+        let target_path = path_from_bytes(target_path)?;
+        let source_path = if renames {
             Some(path_from_bytes(source_path)?)
         } else {
             None
         };
         let entry = VcsEntryStatus::new(
-            path_from_bytes(target_path)?,
+            target_path,
             source_path,
             kind,
             source_conflict.then_some(VcsStatusKind::Conflicted),
@@ -370,6 +381,42 @@ fn path_from_bytes(path: &[u8]) -> Result<PathBuf, VcsError> {
         .map_err(|_| invalid_output("Jujutsu path is not valid UTF-8"))
 }
 
+/// Borrowed view of a raw status template path; on non-unix platforms this
+/// is where encoding validation stays fail-closed.
+#[cfg(unix)]
+fn status_path(path: &[u8]) -> Result<&Path, VcsError> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    Ok(Path::new(OsStr::from_bytes(path)))
+}
+
+#[cfg(not(unix))]
+fn status_path(path: &[u8]) -> Result<&Path, VcsError> {
+    let path =
+        std::str::from_utf8(path).map_err(|_| invalid_output("Jujutsu path is not valid UTF-8"))?;
+    Ok(Path::new(path))
+}
+
+// Validates a raw status path without owning it: platform encoding always,
+// then the VcsEntryStatus normalization invariants whenever the path is
+// carried into an entry (target always, source only for renames/copies).
+fn validate_status_path(path: &[u8], in_entry: bool) -> Result<(), VcsError> {
+    let path = status_path(path)?;
+    if !in_entry {
+        return Ok(());
+    }
+    let mut components = path.components();
+    let Some(first) = components.next() else {
+        return Err(invalid_output("Jujutsu status path is empty"));
+    };
+    if !matches!(first, Component::Normal(_))
+        || components.any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(invalid_output("Jujutsu status path is not normalized"));
+    }
+    Ok(())
+}
+
 fn trim_ascii(mut value: &[u8]) -> &[u8] {
     while value.first().is_some_and(u8::is_ascii_whitespace) {
         value = &value[1..];
@@ -426,6 +473,66 @@ mod tests {
                 VcsErrorKind::InvalidData
             );
         }
+    }
+
+    #[test]
+    fn parser_skips_structural_tree_records() {
+        for output in [
+            b"A\0src\0src\0false\0false\0\0tree\0".as_slice(),
+            b"M\0src\0src\0false\0false\0tree\0tree\0".as_slice(),
+            b"D\0src\0src\0false\0false\0tree\0\0".as_slice(),
+        ] {
+            let snapshot = parse_templated_diff(output, false).expect("status");
+            assert!(snapshot.entries().is_empty());
+        }
+    }
+
+    #[test]
+    fn parser_keeps_file_to_tree_as_type_changed() {
+        let snapshot = parse_templated_diff(b"M\0src\0src\0false\0false\0file\0tree\0", false)
+            .expect("status");
+        assert_eq!(snapshot.entries().len(), 1);
+        assert_eq!(snapshot.entries()[0].kind(), VcsStatusKind::TypeChanged);
+    }
+
+    #[test]
+    fn parser_validates_paths_before_structural_filtering() {
+        for output in [
+            // Structural pair, but the target escapes the workspace root.
+            b"A\0src\0../outside\0false\0false\0\0tree\0".as_slice(),
+            // Structural rename with an empty source path.
+            b"R\0\0src\0false\0false\0tree\0tree\0".as_slice(),
+            // Structural rename with a non-normalized source path.
+            b"R\0../old\0src\0false\0false\0tree\0tree\0".as_slice(),
+        ] {
+            assert_eq!(
+                parse_templated_diff(output, false)
+                    .expect_err("invalid output")
+                    .kind(),
+                VcsErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[test]
+    fn parser_bounds_records_before_structural_filtering() {
+        let record: &[u8] = b"A\0src\0src\0false\0false\0\0tree\0";
+        let at_limit = record.repeat(super::MAX_STATUS_ENTRIES);
+        assert!(
+            parse_templated_diff(&at_limit, false)
+                .expect("status")
+                .entries()
+                .is_empty()
+        );
+
+        let mut over_limit = at_limit;
+        over_limit.extend_from_slice(record);
+        assert_eq!(
+            parse_templated_diff(&over_limit, false)
+                .expect_err("record limit exceeded")
+                .kind(),
+            VcsErrorKind::InvalidData
+        );
     }
 
     #[test]
