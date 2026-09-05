@@ -419,3 +419,42 @@ fn stalled_command_returns_a_bounded_structured_error() -> Result<(), Box<dyn st
     assert!(started.elapsed() < Duration::from_secs(1));
     Ok(())
 }
+
+#[test]
+fn unfocused_open_requests_omit_the_focus_flag() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let log = temp.path().join("argv.log");
+    let script = temp.path().join("fake-herdr");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  plugin\ pane\ open*)
+    printf '%s\n' '{{"id":"test","result":{{"type":"plugin_pane_opened","plugin_pane":{{"plugin_id":"herdr-context","entrypoint":"dock","pane":{{"pane_id":"opened","tab_id":"tab","cwd":"/project","focused":false}}}}}}}}'
+    ;;
+  *)
+    printf '%s\n' '{{"error":{{"code":"operation_failed","message":"unexpected argv"}},"id":"test"}}'
+    exit 1
+    ;;
+esac
+"#,
+            log.display(),
+        ),
+    )?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+
+    let mut client = CommandHostClient::new(script).with_plugin_root(PathBuf::from("/plugin root"));
+    let request = OpenDockRequest::new_unfocused(
+        PaneId::new("origin")?,
+        TabId::new("tab")?,
+        PathBuf::from("/project"),
+        DockWidth::clamped(40),
+    );
+    client.open_dock(&request)?;
+    let argv = fs::read_to_string(log)?;
+    assert!(argv.contains("plugin pane open --plugin herdr-context --entrypoint dock --placement split --target-pane origin --direction right --cwd /plugin root --env HERDR_CONTEXT_ORIGIN_CWD=/project --env HERDR_CONTEXT_ORIGIN_PANE_ID=origin --no-focus\n"));
+    assert!(!argv.contains(" --focus\n"));
+    Ok(())
+}

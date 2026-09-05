@@ -1,3 +1,4 @@
+use std::env;
 use std::error::Error;
 use std::fmt;
 use std::fs::{File, OpenOptions, TryLockError};
@@ -9,9 +10,13 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
+use super::dock_state::{
+    DockRecord, DockStateError, load as load_dock_state, remove_record, replace_socket_records,
+    upsert_record,
+};
 use super::{
-    DEFAULT_DOCK_WIDTH, DockIdentity, DockWidth, HostClient, HostError, HostPane, LaunchContext,
-    OpenDockRequest, PaneId, TabId, WorkspaceId,
+    DEFAULT_DOCK_WIDTH, DockIdentity, DockWidth, HostClient, HostError, HostErrorKind, HostPane,
+    LaunchContext, OpenDockRequest, PaneId, TabId, WorkspaceId,
 };
 
 /// Current dock visibility relative to focused pane.
@@ -64,6 +69,7 @@ pub struct DockLauncher {
     state_dir: PathBuf,
     lock_timeout: Duration,
     width: DockWidth,
+    socket: Option<String>,
 }
 
 impl DockLauncher {
@@ -73,6 +79,7 @@ impl DockLauncher {
             state_dir,
             lock_timeout: Duration::from_secs(2),
             width: DockWidth::clamped(DEFAULT_DOCK_WIDTH),
+            socket: None,
         }
     }
 
@@ -84,6 +91,16 @@ impl DockLauncher {
     #[must_use]
     pub const fn with_width(mut self, width: DockWidth) -> Self {
         self.width = width;
+        self
+    }
+
+    /// Configures best-effort dock persistence for the server behind `socket`.
+    ///
+    /// Without a socket the toggle still opens, focuses, and closes docks; it
+    /// just leaves nothing for a restart restore to re-open.
+    #[must_use]
+    pub fn with_socket(mut self, socket: Option<String>) -> Self {
+        self.socket = socket;
         self
     }
 
@@ -145,6 +162,11 @@ impl DockLauncher {
                     ))
                 })?;
                 let pane_id = dock.pane_id();
+
+                // Persist before placement: a dock that exists but fails
+                // placement must still restore later. Lock order stays
+                // tab lock first, then docks.lock.
+                self.persist_open(context, pane_id, request.width());
                 host.move_to_right_edge(pane_id)?;
                 host.resize_pane(pane_id, request.width())?;
                 host.focus_pane(pane_id)?;
@@ -156,9 +178,262 @@ impl DockLauncher {
             }
             ToggleDecision::Close { pane_id } => {
                 host.close_pane(&pane_id)?;
+                self.persist_close(context);
                 Ok(ToggleOutcome::Closed)
             }
         }
+    }
+
+    /// Re-opens docks persisted for `socket` after a Herdr server restart.
+    ///
+    /// Best-effort per record: vanished tabs prune their record, transient
+    /// failures keep it for the next restart, and the pane holding focus when
+    /// the hook ran keeps it — docks open with an explicit no-focus request
+    /// and the captured focused pane is re-focused after identity probes.
+    pub fn restore(&self, socket: &str, host: &mut impl HostClient) -> Result<(), LauncherError> {
+        let records = load_dock_state(&self.state_dir)
+            .records_for(socket)
+            .to_vec();
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut kept = Vec::with_capacity(records.len());
+        for record in records {
+            match self.restore_record(host, &record) {
+                RecordOutcome::Kept(record) => kept.push(record),
+                RecordOutcome::Dropped => {}
+            }
+        }
+        replace_socket_records(&self.state_dir, socket, kept)?;
+        Ok(())
+    }
+
+    fn restore_record(&self, host: &mut impl HostClient, record: &DockRecord) -> RecordOutcome {
+        let Some((workspace_id, tab_id)) = record_ids(record) else {
+            return RecordOutcome::Dropped;
+        };
+        let _lock =
+            match TabLock::acquire(&self.state_dir, &workspace_id, &tab_id, self.lock_timeout) {
+                Ok(lock) => lock,
+                Err(error) => {
+                    note_restore_deferred(&workspace_id, &tab_id, &error);
+                    return RecordOutcome::Kept(record.clone());
+                }
+            };
+        let panes = match host.panes_in_tab(&workspace_id, &tab_id) {
+            Ok(panes) => panes,
+            Err(error) if error.kind() == HostErrorKind::NotFound => {
+                return RecordOutcome::Dropped;
+            }
+            Err(error) => {
+                note_restore_deferred(&workspace_id, &tab_id, &error);
+                return RecordOutcome::Kept(record.clone());
+            }
+        };
+        if panes.is_empty() {
+            return RecordOutcome::Dropped;
+        }
+
+        // Capture focus before reconcile: the identity probes below focus
+        // candidate panes as a side effect of verifying them.
+        let focused_pane_id = panes
+            .iter()
+            .find(|pane| pane.is_focused())
+            .map(|pane| pane.pane_id().clone());
+        // The identity probes focus candidate panes as a side effect of
+        // verifying them, and a partially opened dock leaves them focused, so
+        // every post-capture path pins focus back to the pane the server had.
+        let focused = focused_pane_id.as_ref();
+        let keeper = match reconcile_docks(host, &panes) {
+            Ok(Some(dock)) => dock.pane_id().clone(),
+            Ok(None) => {
+                match self.open_restored_dock(host, &workspace_id, &tab_id, &panes, record) {
+                    Ok(keeper) => keeper,
+                    Err(error) => {
+                        return self.defer_record(
+                            host,
+                            &workspace_id,
+                            &tab_id,
+                            focused,
+                            &error,
+                            record,
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                return self.defer_record(host, &workspace_id, &tab_id, focused, &error, record);
+            }
+        };
+        refocus_focused_pane(host, &workspace_id, &tab_id, focused);
+        RecordOutcome::Kept(DockRecord {
+            workspace_id: record.workspace_id.clone(),
+            tab_id: record.tab_id.clone(),
+            dock_pane_id: keeper.as_str().to_owned(),
+            width: record.width,
+        })
+    }
+
+    /// Keeps a record for the next restart after a transient failure: pins
+    /// focus back to the pane the server had, notes the deferral.
+    fn defer_record(
+        &self,
+        host: &impl HostClient,
+        workspace_id: &WorkspaceId,
+        tab_id: &TabId,
+        focused: Option<&PaneId>,
+        error: impl fmt::Display,
+        record: &DockRecord,
+    ) -> RecordOutcome {
+        refocus_focused_pane(host, workspace_id, tab_id, focused);
+        note_restore_deferred(workspace_id, tab_id, &error);
+        RecordOutcome::Kept(record.clone())
+    }
+
+    /// Opens a restored dock with an explicit no-focus request, mirroring
+    /// `toggle`'s open invariants minus the focus handoff. Placement (edge
+    /// move and resize) is best-effort and never fails the open: a dock that
+    /// exists but sits at an imperfect width must still own the record, or
+    /// every restart would open another dock beside the leftovers.
+    fn open_restored_dock(
+        &self,
+        host: &mut impl HostClient,
+        workspace_id: &WorkspaceId,
+        tab_id: &TabId,
+        panes: &[HostPane],
+        record: &DockRecord,
+    ) -> Result<PaneId, LauncherError> {
+        let target = panes
+            .iter()
+            .find(|pane| pane.is_focused())
+            .or_else(|| panes.first())
+            .ok_or_else(|| {
+                LauncherError::Invariant("target tab has no pane to split".to_owned())
+            })?;
+        let cwd = target
+            .cwd()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+        let request = OpenDockRequest::new_unfocused(
+            target.pane_id().clone(),
+            tab_id.clone(),
+            cwd,
+            DockWidth::clamped(record.width),
+        );
+        let opened_pane_id = host.open_dock(&request)?;
+        let panes = host.panes_in_tab(workspace_id, tab_id)?;
+        let dock = reconcile_docks(host, &panes)?.ok_or_else(|| {
+            LauncherError::Invariant(format!(
+                "opened dock {} was absent from the post-open pane query",
+                opened_pane_id.as_str()
+            ))
+        })?;
+        let pane_id = dock.pane_id();
+        if let Err(error) = host.move_to_right_edge(pane_id) {
+            eprintln!(
+                "herdr-context: restore could not move {}: {error}",
+                pane_id.as_str()
+            );
+        }
+        if let Err(error) = host.resize_pane(pane_id, request.width()) {
+            eprintln!(
+                "herdr-context: restore could not resize {} to {} columns: {error}",
+                pane_id.as_str(),
+                request.width().columns()
+            );
+        }
+        Ok(pane_id.clone())
+    }
+
+    /// Records an opened dock for `restore`. Persistence is best-effort:
+    /// failures degrade to "not restored" and never fail the finished toggle.
+    fn persist_open(&self, context: &LaunchContext, dock_pane_id: &PaneId, width: DockWidth) {
+        let Some(socket) = self.socket.as_deref() else {
+            return;
+        };
+        let record = DockRecord {
+            workspace_id: context.workspace_id().as_str().to_owned(),
+            tab_id: context.tab_id().as_str().to_owned(),
+            dock_pane_id: dock_pane_id.as_str().to_owned(),
+            width: width.columns(),
+        };
+        if let Err(error) = upsert_record(&self.state_dir, socket, record) {
+            eprintln!("herdr-context: could not record the open dock: {error}");
+        }
+    }
+
+    /// Drops the record for a closed dock. Best-effort like `persist_open`.
+    fn persist_close(&self, context: &LaunchContext) {
+        let Some(socket) = self.socket.as_deref() else {
+            return;
+        };
+        if let Err(error) = remove_record(
+            &self.state_dir,
+            socket,
+            context.workspace_id().as_str(),
+            context.tab_id().as_str(),
+        ) {
+            eprintln!("herdr-context: could not drop the closed dock record: {error}");
+        }
+    }
+}
+
+/// Fate of one persisted record after a restore pass.
+enum RecordOutcome {
+    /// Keep the (possibly refreshed) record for the next restart.
+    Kept(DockRecord),
+    /// The workspace or tab is gone; prune the record.
+    Dropped,
+}
+
+fn record_ids(record: &DockRecord) -> Option<(WorkspaceId, TabId)> {
+    Some((
+        WorkspaceId::new(record.workspace_id.as_str()).ok()?,
+        TabId::new(record.tab_id.as_str()).ok()?,
+    ))
+}
+
+fn note_restore_deferred(workspace_id: &WorkspaceId, tab_id: &TabId, error: impl fmt::Display) {
+    eprintln!(
+        "herdr-context: restore deferred {}/{}: {error}",
+        workspace_id.as_str(),
+        tab_id.as_str()
+    );
+}
+
+/// Re-focuses the pane that held focus when the restore hook ran, undoing the
+/// focus side effects of the identity probes and any partially opened dock.
+fn refocus_focused_pane(
+    host: &impl HostClient,
+    workspace_id: &WorkspaceId,
+    tab_id: &TabId,
+    focused_pane_id: Option<&PaneId>,
+) {
+    let Some(target) = focused_pane_id else {
+        return;
+    };
+    // The saved focus holder is usually not a plugin pane, so `plugin pane
+    // focus` cannot reach it; walk from the currently focused pane instead.
+    let current = host
+        .panes_in_tab(workspace_id, tab_id)
+        .ok()
+        .and_then(|panes| {
+            panes
+                .iter()
+                .find(|pane| pane.is_focused())
+                .map(|pane| pane.pane_id().clone())
+        });
+    let Some(current) = current else {
+        return;
+    };
+    if current == *target {
+        return;
+    }
+    if let Err(error) = host.focus_origin_pane(&current, target) {
+        eprintln!(
+            "herdr-context: restore could not refocus {}: {error}",
+            target.as_str()
+        );
     }
 }
 
@@ -276,7 +551,7 @@ fn lock_hash(seed: u64, workspace_id: &WorkspaceId, tab_id: &TabId) -> u64 {
     hash
 }
 
-fn ensure_private_directory(path: &Path) -> Result<(), LockError> {
+pub(super) fn ensure_private_directory(path: &Path) -> Result<(), LockError> {
     std::fs::create_dir_all(path).map_err(|source| LockError::Io {
         operation: "create directory",
         path: path.to_path_buf(),
@@ -301,7 +576,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), LockError> {
     Ok(())
 }
 
-fn open_private_lock_file(path: &Path) -> Result<File, LockError> {
+pub(super) fn open_private_lock_file(path: &Path) -> Result<File, LockError> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
     #[cfg(unix)]
@@ -414,6 +689,7 @@ impl Error for LockError {
 pub enum LauncherError {
     Lock(LockError),
     Host(HostError),
+    State(DockStateError),
     Invariant(String),
 }
 
@@ -423,6 +699,7 @@ impl fmt::Display for LauncherError {
             Self::Lock(error) => write!(formatter, "dock lock failed: {error}"),
             Self::Host(error) => write!(formatter, "Herdr operation failed: {error}"),
             Self::Invariant(message) => write!(formatter, "dock invariant failed: {message}"),
+            Self::State(error) => write!(formatter, "dock state failed: {error}"),
         }
     }
 }
@@ -433,6 +710,7 @@ impl Error for LauncherError {
             Self::Lock(error) => Some(error),
             Self::Host(error) => Some(error),
             Self::Invariant(_) => None,
+            Self::State(error) => Some(error),
         }
     }
 }
@@ -446,6 +724,12 @@ impl From<LockError> for LauncherError {
 impl From<HostError> for LauncherError {
     fn from(error: HostError) -> Self {
         Self::Host(error)
+    }
+}
+
+impl From<DockStateError> for LauncherError {
+    fn from(error: DockStateError) -> Self {
+        Self::State(error)
     }
 }
 
