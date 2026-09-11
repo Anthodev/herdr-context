@@ -52,6 +52,14 @@ The dock is a narrow Herdr pane rather than an extension of the native
 sidebar. That keeps the plugin on Herdr's public plugin surface, compatible
 with upstream Herdr, and independently installable.
 
+Docks survive Herdr server restarts: toggling a dock records where it was
+open, and after `herdr server stop` and a fresh start a startup hook re-opens
+those docks — without stealing focus and at their saved width. The plain shell
+pane Herdr leaves in the dock's old slot is not plugin-owned after the
+restart, so close it once manually. Opt out with `[dock]
+restore_on_startup = false` in the plugin config
+(`herdr plugin config-dir herdr-context`).
+
 The goal is simple: **know where the project stands — files, changes,
 conversations — without leaving the tab.**
 
@@ -204,6 +212,7 @@ warning in the dock.
 ```toml
 [dock]
 initial_width = 40       # 24..60
+restore_on_startup = true   # re-open docks after a Herdr server restart
 
 [ui]
 display_mode = "ascii" # ascii, unicode, or nerd

@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
+use herdr_context::host::dock_state::{self, DockRecord};
 use herdr_context::host::launch::{DockLauncher, ToggleOutcome};
 use herdr_context::host::{
     DockIdentity, DockWidth, HostClient, HostError, HostPane, LaunchContext, OpenDockRequest,
@@ -294,4 +295,77 @@ fn dock_width_is_clamped_to_supported_bounds() {
     assert_eq!(DockWidth::clamped(1).columns(), 24);
     assert_eq!(DockWidth::clamped(40).columns(), 40);
     assert_eq!(DockWidth::clamped(u16::MAX).columns(), 60);
+}
+
+#[test]
+fn open_toggle_persists_a_record_and_focus_toggle_leaves_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let state = TempDir::new()?;
+    let mut host = FakeHost::new(vec![pane_with_foreground("origin", true, "/live/project")]);
+    let socketed = || launcher(state.path()).with_socket(Some("sock".to_owned()));
+
+    assert_eq!(
+        socketed().toggle(&context()?, &mut host)?,
+        ToggleOutcome::Opened
+    );
+    assert_eq!(
+        dock_state::load(state.path()).records_for("sock"),
+        [DockRecord {
+            workspace_id: "workspace".to_owned(),
+            tab_id: "tab".to_owned(),
+            dock_pane_id: "dock".to_owned(),
+            width: 40,
+        }]
+    );
+
+    // The opened dock is unfocused in the fake host, so the next toggle only
+    // focuses it, and the persisted record must survive untouched.
+    assert_eq!(
+        socketed().toggle(&context()?, &mut host)?,
+        ToggleOutcome::Focused
+    );
+    assert_eq!(dock_state::load(state.path()).records_for("sock").len(), 1);
+    Ok(())
+}
+
+#[test]
+fn close_toggle_removes_the_persisted_record() -> Result<(), Box<dyn std::error::Error>> {
+    let state = TempDir::new()?;
+    dock_state::upsert_record(
+        state.path(),
+        "sock",
+        DockRecord {
+            workspace_id: "workspace".to_owned(),
+            tab_id: "tab".to_owned(),
+            dock_pane_id: "dock".to_owned(),
+            width: 40,
+        },
+    )?;
+    let mut host = FakeHost::new(vec![pane("origin", false), dock_pane("dock", true)]);
+
+    assert_eq!(
+        launcher(state.path())
+            .with_socket(Some("sock".to_owned()))
+            .toggle(&context()?, &mut host)?,
+        ToggleOutcome::Closed
+    );
+    assert!(
+        dock_state::load(state.path())
+            .records_for("sock")
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn toggle_without_a_socket_leaves_no_state() -> Result<(), Box<dyn std::error::Error>> {
+    let state = TempDir::new()?;
+    let mut host = FakeHost::new(vec![pane_with_foreground("origin", true, "/live/project")]);
+
+    assert_eq!(
+        launcher(state.path()).toggle(&context()?, &mut host)?,
+        ToggleOutcome::Opened
+    );
+    assert!(!state.path().join("docks.json").exists());
+    Ok(())
 }

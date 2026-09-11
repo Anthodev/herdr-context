@@ -64,6 +64,9 @@ fn unknown_mode_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
     let output = run_binary(Some("unknown"), None)?;
 
     assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("expected toggle or dock"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("expected toggle, dock, restore, or on-event")
+    );
     Ok(())
 }

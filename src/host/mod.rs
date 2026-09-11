@@ -1,6 +1,7 @@
 //! Herdr process boundary and normalized launch context.
 
 pub mod client;
+pub mod dock_state;
 pub mod launch;
 
 use std::collections::BTreeMap;
@@ -587,6 +588,7 @@ pub struct OpenDockRequest {
     tab_id: TabId,
     cwd: PathBuf,
     width: DockWidth,
+    focus: bool,
 }
 
 impl OpenDockRequest {
@@ -602,6 +604,25 @@ impl OpenDockRequest {
             tab_id,
             cwd,
             width,
+            focus: true,
+        }
+    }
+
+    /// Creates an open request that leaves pane focus untouched — used by the
+    /// restart restore, which must not steal the saved focused pane.
+    #[must_use]
+    pub const fn new_unfocused(
+        origin_pane_id: PaneId,
+        tab_id: TabId,
+        cwd: PathBuf,
+        width: DockWidth,
+    ) -> Self {
+        Self {
+            origin_pane_id,
+            tab_id,
+            cwd,
+            width,
+            focus: false,
         }
     }
 
@@ -623,6 +644,12 @@ impl OpenDockRequest {
     #[must_use]
     pub const fn width(&self) -> DockWidth {
         self.width
+    }
+
+    /// Whether opening this dock should focus it.
+    #[must_use]
+    pub const fn focus(&self) -> bool {
+        self.focus
     }
 }
 

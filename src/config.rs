@@ -177,6 +177,7 @@ impl ConfigLoad {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DockConfig {
     initial_width: u16,
+    restore_on_startup: bool,
 }
 
 impl DockConfig {
@@ -184,12 +185,19 @@ impl DockConfig {
     pub const fn initial_width(self) -> u16 {
         self.initial_width
     }
+
+    /// Whether the restore startup hook re-opens docks after a Herdr restart.
+    #[must_use]
+    pub const fn restore_on_startup(self) -> bool {
+        self.restore_on_startup
+    }
 }
 
 impl Default for DockConfig {
     fn default() -> Self {
         Self {
             initial_width: DEFAULT_DOCK_WIDTH,
+            restore_on_startup: true,
         }
     }
 }
@@ -684,7 +692,7 @@ fn parse_config(value: &toml::Value) -> ConfigLoad {
     if let Some(table) = optional_table(root, "dock", &mut warnings) {
         warn_unknown_fields(
             table,
-            &["initial_width"],
+            &["initial_width", "restore_on_startup"],
             "dock.unknown_field",
             &mut warnings,
         );
@@ -696,6 +704,13 @@ fn parse_config(value: &toml::Value) -> ConfigLoad {
             &mut warnings,
         )
         .unwrap_or(DEFAULT_DOCK_WIDTH);
+
+        config.dock.restore_on_startup = parse_bool(
+            table.get("restore_on_startup"),
+            "dock.restore_on_startup",
+            &mut warnings,
+        )
+        .unwrap_or(true);
     }
 
     if let Some(table) = optional_table(root, "ui", &mut warnings) {

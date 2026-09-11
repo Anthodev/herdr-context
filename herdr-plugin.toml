@@ -19,3 +19,10 @@ id = "toggle"
 title = "herdr-context: toggle dock"
 contexts = ["workspace", "tab", "pane"]
 command = ["./target/release/herdr-context", "toggle"]
+
+[[startup]]
+command = ["./target/release/herdr-context", "restore"]
+
+[[events]]
+on = "pane.exited"
+command = ["./target/release/herdr-context", "on-event"]

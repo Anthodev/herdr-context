@@ -180,6 +180,7 @@ fn valid_fields_survive_invalid_neighbors_and_limits_are_bounded() {
         r#"
 [dock]
 initial_width = 52
+restore_on_startup = false
 
 [ui]
 display_mode = "nerd"
@@ -210,6 +211,7 @@ passive_jujutsu_interval_ms = 2000
 
     let config = loaded.config();
     assert_eq!(config.dock().initial_width(), 52);
+    assert!(!config.dock().restore_on_startup());
     assert!(config.files().show_hidden());
     assert_eq!(
         config.files().exclusions(),
@@ -271,6 +273,7 @@ fn invalid_fields_fall_back_independently_and_warnings_never_echo_values() {
         r#"
 [dock]
 initial_width = "bad\u001b[2J"
+restore_on_startup = "nope"
 
 [ui]
 display_mode = "emoji\u001b"
@@ -295,6 +298,7 @@ jujutsu_mode = "fresh"
 
     let config = loaded.config();
     assert_eq!(config.dock().initial_width(), 40);
+    assert!(config.dock().restore_on_startup());
     assert_eq!(config.files().exclusions(), [PathBuf::from("valid")]);
     assert_eq!(config.ui().display_mode(), DisplayMode::Ascii);
     assert_eq!(

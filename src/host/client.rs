@@ -498,7 +498,7 @@ impl HostClient for CommandHostClient {
         let mut origin_pane_id = OsString::from("HERDR_CONTEXT_ORIGIN_PANE_ID=");
         origin_pane_id.push(request.origin_pane_id().as_str());
         let pane_cwd = self.plugin_root.as_deref().unwrap_or_else(|| request.cwd());
-        let args = vec![
+        let mut args = vec![
             OsString::from("plugin"),
             OsString::from("pane"),
             OsString::from("open"),
@@ -518,8 +518,14 @@ impl HostClient for CommandHostClient {
             origin_cwd,
             OsString::from("--env"),
             origin_pane_id,
-            OsString::from("--focus"),
         ];
+        if request.focus() {
+            args.push(OsString::from("--focus"));
+        } else {
+            // Herdr focuses a newly opened pane by default; the explicit
+            // negation is what keeps restore from stealing focus.
+            args.push(OsString::from("--no-focus"));
+        }
         let result = self.invoke(args)?;
         expect_type(&result, "plugin_pane_opened")?;
         let pane_id = required_string(&result, "/plugin_pane/pane/pane_id", "opened pane id")?;
