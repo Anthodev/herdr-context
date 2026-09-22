@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.19.7] - 2026-09-23
+
+Restarting Herdr no longer leaves the dock's old shell behind: once the replacement dock is open and reconciled, herdr-context verifies Herdr's restored plain shell is not the live dock and closes it, keeping focus on a surviving terminal. Releases are now published with curated notes from the versioned `CHANGELOG.md`, CI and release workflows run on Avrea runners, and the historical release notes are backfilled.
+
+### Fixes
+
+- fix(dock): replace stale shell after startup restore ([0cd00ebb](https://github.com/Anthodev/herdr-context/commit/0cd00ebb))
+
+**Full changelog**: [v0.19.6...v0.19.7](https://github.com/Anthodev/herdr-context/compare/v0.19.6...v0.19.7)
+
 ## [0.19.6] - 2026-09-11
 
 Docks now come back on their own after a Herdr server restart: herdr-context restores the dock layout recorded in `docks.json`, reconciles the restored panes against the fresh session, and refreshes pane IDs without stealing focus — no more reopening your context dock by hand after every restart.
