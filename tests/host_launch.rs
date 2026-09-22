@@ -103,6 +103,13 @@ impl HostClient for FakeHost {
         Ok(())
     }
 
+    fn close_terminal_pane(&mut self, pane_id: &PaneId) -> Result<(), HostError> {
+        self.operations
+            .push(format!("close-terminal:{}", pane_id.as_str()));
+        self.panes.retain(|pane| pane.pane_id() != pane_id);
+        Ok(())
+    }
+
     fn move_to_right_edge(&mut self, pane_id: &PaneId) -> Result<(), HostError> {
         self.operations.push(format!("move:{}", pane_id.as_str()));
         Ok(())

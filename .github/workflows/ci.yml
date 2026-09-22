@@ -15,7 +15,7 @@ permissions:
 jobs:
   test:
     name: Rust and release checks
-    runs-on: ubuntu-22.04
+    runs-on: avrea-ubuntu-latest
 
     steps:
       - name: Check out repository

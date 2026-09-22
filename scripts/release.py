@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Validate the herdr-context release contracts.
+"""Validate the herdr-context release contracts and generate release notes.
 
 The plugin installs from source through `herdr plugin install`; a pushed
-`v*` tag runs these checks and publishes generated release notes without
-attaching any packaged assets.
+`v*` tag runs these checks and publishes release notes extracted from the
+CHANGELOG.md section of the tagged commit without attaching any packaged
+assets.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tomllib
 from typing import Any, NamedTuple
@@ -22,6 +24,11 @@ MIN_HERDR_VERSION = "0.8.0"
 VERSION_PATTERN = re.compile(
     r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z"
 )
+TAG_PATTERN = re.compile(
+    r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z"
+)
+_FENCE_OPEN_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)")
+_FENCE_CLOSE_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
 
 
 class ReleaseError(RuntimeError):
@@ -258,6 +265,101 @@ def validate_trigger_tag(contract: ReleaseContract, tag: str) -> None:
         raise ReleaseError(f"release tag must be exactly {expected}; got {tag!r}")
 
 
+def extract_changelog_section(changelog: str, version: str) -> str:
+    """Return the release section body for exactly one changelog heading."""
+    if not VERSION_PATTERN.fullmatch(version):
+        raise ReleaseError(f"release version is not stable SemVer: {version!r}")
+    section_heading = re.compile(rf"^ {{0,3}}## \[{re.escape(version)}\](?:[ \t].*)?$")
+    lines = changelog.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    matches: list[int] = []
+    boundaries: list[int] = []
+    fence_marker: str | None = None
+    fence_length = 0
+    for index, line in enumerate(lines):
+        if fence_marker is not None:
+            closing = _FENCE_CLOSE_PATTERN.match(line)
+            if (
+                closing is not None
+                and closing.group(1)[0] == fence_marker
+                and len(closing.group(1)) >= fence_length
+            ):
+                fence_marker = None
+            continue
+        opening = _FENCE_OPEN_PATTERN.match(line)
+        if opening is not None and not (
+            opening.group(1)[0] == "`" and "`" in opening.group(2)
+        ):
+            fence_marker = opening.group(1)[0]
+            fence_length = len(opening.group(1))
+            continue
+        if section_heading.match(line):
+            matches.append(index)
+        if re.match(r"^ {0,3}##(?:[ \t]|$)", line):
+            boundaries.append(index)
+    if not matches:
+        raise ReleaseError(f"changelog has no section for version {version}")
+    if len(matches) > 1:
+        raise ReleaseError(f"changelog has duplicate sections for version {version}")
+    start = matches[0] + 1
+    end = len(lines)
+    for boundary in boundaries:
+        if boundary >= start:
+            end = boundary
+            break
+    body = lines[start:end]
+    while body and not body[0].strip():
+        del body[0]
+    while body and not body[-1].strip():
+        del body[-1]
+    if not body:
+        raise ReleaseError(f"changelog section for version {version} is empty")
+    return "\n".join(body) + "\n"
+
+
+def _git_text(root: Path, *arguments: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *arguments],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as error:
+        raise ReleaseError(f"cannot execute git: {error}") from error
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise ReleaseError(f"git {arguments[0]} failed: {detail}")
+    try:
+        return completed.stdout.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ReleaseError(f"git {arguments[0]} produced non-UTF-8 output") from error
+
+
+def generate_release_notes(root: Path, tag: str, revision: str) -> str:
+    """Return release notes from the CHANGELOG.md of the commit a tag points to."""
+    if not TAG_PATTERN.fullmatch(tag):
+        raise ReleaseError(
+            f"release tag must be a strict vMAJOR.MINOR.PATCH tag; got {tag!r}"
+        )
+    version = tag[1:]
+    revision_commit = _git_text(
+        root, "rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}"
+    ).strip()
+    tagged_commit = _git_text(
+        root,
+        "rev-parse",
+        "--verify",
+        "--end-of-options",
+        f"refs/tags/{tag}^{{commit}}",
+    ).strip()
+    if revision_commit != tagged_commit:
+        raise ReleaseError(f"revision {revision} is not the commit tagged by {tag}")
+    # tagged_commit is a hex object name from rev-parse, so "<sha>:CHANGELOG.md"
+    # can never look like an option; git show rejects --end-of-options here.
+    changelog = _git_text(root, "show", f"{tagged_commit}:CHANGELOG.md")
+    return extract_changelog_section(changelog, version)
+
+
 def _default_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -269,12 +371,37 @@ def _parser() -> argparse.ArgumentParser:
         "validate", help="validate repository release contracts"
     )
     validate.add_argument("--tag", help="require the exact triggering release tag")
+    notes = subparsers.add_parser(
+        "notes", help="write release notes extracted from the tagged changelog"
+    )
+    notes.add_argument(
+        "--tag", required=True, help="stable release tag (vMAJOR.MINOR.PATCH)"
+    )
+    notes.add_argument(
+        "--revision", required=True, help="commit revision the tag must reference"
+    )
+    notes.add_argument(
+        "--output",
+        default="release-notes.md",
+        help="path of the generated notes file (default: release-notes.md)",
+    )
     return parser
 
 
 def main(arguments: list[str] | None = None) -> int:
     args = _parser().parse_args(arguments)
     try:
+        if args.command == "notes":
+            notes = generate_release_notes(_default_root(), args.tag, args.revision)
+            output = Path(args.output)
+            try:
+                output.write_text(notes, encoding="utf-8", newline="\n")
+            except OSError as error:
+                raise ReleaseError(
+                    f"cannot write release notes {output}: {error}"
+                ) from error
+            print(f"release notes written: {output}")
+            return 0
         contract = validate_repository(_default_root())
         if args.tag is not None:
             validate_trigger_tag(contract, args.tag)

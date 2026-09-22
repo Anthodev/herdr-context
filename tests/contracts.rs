@@ -71,6 +71,10 @@ impl HostClient for FakeHost {
         Ok(())
     }
 
+    fn close_terminal_pane(&mut self, _pane_id: &PaneId) -> Result<(), HostError> {
+        Ok(())
+    }
+
     fn move_to_right_edge(&mut self, _pane_id: &PaneId) -> Result<(), HostError> {
         Ok(())
     }

@@ -54,9 +54,10 @@ with upstream Herdr, and independently installable.
 
 Docks survive Herdr server restarts: toggling a dock records where it was
 open, and after `herdr server stop` and a fresh start a startup hook re-opens
-those docks — without stealing focus and at their saved width. The plain shell
-pane Herdr leaves in the dock's old slot is not plugin-owned after the
-restart, so close it once manually. Opt out with `[dock]
+those docks — without stealing focus and at their saved width. Herdr restores
+the old dock slot as a plain shell; the startup hook closes that shell once
+the dock is ready, provided another terminal remains in the tab. Opt out with
+`[dock]
 restore_on_startup = false` in the plugin config
 (`herdr plugin config-dir herdr-context`).
 

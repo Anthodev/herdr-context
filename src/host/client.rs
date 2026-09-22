@@ -542,6 +542,10 @@ impl HostClient for CommandHostClient {
         expect_type(&result, "plugin_pane_closed")
     }
 
+    fn close_terminal_pane(&mut self, pane_id: &PaneId) -> Result<(), HostError> {
+        self.invoke_without_response(["pane", "close", pane_id.as_str()])
+    }
+
     fn move_to_right_edge(&mut self, pane_id: &PaneId) -> Result<(), HostError> {
         for _ in 0..MAX_RIGHT_SWAPS {
             let result = self.invoke([

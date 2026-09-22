@@ -165,6 +165,14 @@ impl HostClient for FakeHost {
         Ok(())
     }
 
+    fn close_terminal_pane(&mut self, pane_id: &PaneId) -> Result<(), HostError> {
+        self.operations
+            .borrow_mut()
+            .push(format!("close-terminal:{}", pane_id.as_str()));
+        self.panes.retain(|pane| pane.pane_id() != pane_id);
+        Ok(())
+    }
+
     fn move_to_right_edge(&mut self, pane_id: &PaneId) -> Result<(), HostError> {
         self.operations
             .borrow_mut()
@@ -258,6 +266,132 @@ fn restore_opens_the_saved_dock_without_stealing_focus_and_refreshes_the_record(
         ]
     );
     assert_eq!(stored(state.path(), SOCKET), [record("dock", 48)]);
+    Ok(())
+}
+
+#[test]
+fn restore_replaces_the_shell_left_in_the_old_dock_pane() -> Result<(), Box<dyn std::error::Error>>
+{
+    let state = TempDir::new()?;
+    seed(state.path(), SOCKET, record("dock-old", 40));
+    let mut host = FakeHost::new(vec![pane("origin", true), pane("dock-old", false)]);
+
+    launcher(state.path()).restore(SOCKET, &mut host)?;
+
+    assert_eq!(
+        *host.operations.borrow(),
+        [
+            "open:origin:/project:40",
+            "verify:dock",
+            "move:dock",
+            "resize:dock:40",
+            "verify:dock-old",
+            "close-terminal:dock-old",
+            "refocus:dock:origin",
+        ]
+    );
+    assert_eq!(host.panes.len(), 2);
+    assert!(
+        host.panes
+            .iter()
+            .any(|pane| pane.pane_id().as_str() == "origin")
+    );
+    assert!(
+        host.panes
+            .iter()
+            .any(|pane| pane.pane_id().as_str() == "dock")
+    );
+    assert_eq!(stored(state.path(), SOCKET), [record("dock", 40)]);
+    Ok(())
+}
+
+#[test]
+fn restore_uses_the_surviving_terminal_when_the_old_dock_shell_is_focused()
+-> Result<(), Box<dyn std::error::Error>> {
+    let state = TempDir::new()?;
+    seed(state.path(), SOCKET, record("dock-old", 40));
+    let mut host = FakeHost::new(vec![pane("origin", false), pane("dock-old", true)]);
+
+    launcher(state.path()).restore(SOCKET, &mut host)?;
+
+    assert_eq!(host.operations.borrow()[0], "open:origin:/project:40");
+    assert!(
+        host.operations
+            .borrow()
+            .iter()
+            .any(|operation| operation == "refocus:dock:origin")
+    );
+    assert_eq!(host.panes.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn restore_keeps_the_only_terminal_even_when_its_id_matches_the_old_dock()
+-> Result<(), Box<dyn std::error::Error>> {
+    let state = TempDir::new()?;
+    seed(state.path(), SOCKET, record("dock-old", 40));
+    let mut host = FakeHost::new(vec![pane("dock-old", true)]);
+
+    launcher(state.path()).restore(SOCKET, &mut host)?;
+
+    assert!(
+        !host
+            .operations
+            .borrow()
+            .iter()
+            .any(|operation| operation == "close-terminal:dock-old")
+    );
+    assert_eq!(host.panes.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn restore_does_not_close_a_live_dock_with_the_saved_id() -> Result<(), Box<dyn std::error::Error>>
+{
+    let state = TempDir::new()?;
+    seed(state.path(), SOCKET, record("dock-old", 40));
+    let mut host = FakeHost::new(vec![pane("origin", true), dock_pane("dock-old", false)]);
+
+    launcher(state.path()).restore(SOCKET, &mut host)?;
+
+    assert_eq!(
+        *host.operations.borrow(),
+        ["verify:dock-old", "refocus:dock-old:origin"]
+    );
+    assert_eq!(host.panes.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn restore_keeps_focus_on_a_live_dock_with_the_saved_id() -> Result<(), Box<dyn std::error::Error>>
+{
+    let state = TempDir::new()?;
+    seed(state.path(), SOCKET, record("dock-old", 40));
+    let mut host = FakeHost::new(vec![pane("origin", false), dock_pane("dock-old", true)]);
+
+    launcher(state.path()).restore(SOCKET, &mut host)?;
+
+    assert_eq!(
+        *host.operations.borrow(),
+        ["verify:dock-old", "focus:dock-old"]
+    );
+    assert_eq!(host.panes.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn restore_does_not_close_the_old_shell_when_open_fails() -> Result<(), Box<dyn std::error::Error>>
+{
+    let state = TempDir::new()?;
+    seed(state.path(), SOCKET, record("dock-old", 40));
+    let mut host = FakeHost::new(vec![pane("origin", true), pane("dock-old", false)]);
+    host.fail_open = true;
+
+    launcher(state.path()).restore(SOCKET, &mut host)?;
+
+    assert_eq!(*host.operations.borrow(), ["open:origin:/project:40"]);
+    assert_eq!(host.panes.len(), 2);
+    assert_eq!(stored(state.path(), SOCKET), [record("dock-old", 40)]);
     Ok(())
 }
 

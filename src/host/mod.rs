@@ -674,7 +674,10 @@ pub trait HostClient: Send {
     ) -> Result<Option<DockIdentity>, HostError>;
     fn open_dock(&mut self, request: &OpenDockRequest) -> Result<PaneId, HostError>;
     fn focus_pane(&mut self, pane_id: &PaneId) -> Result<(), HostError>;
+    /// Closes a pane still owned by the plugin.
     fn close_pane(&mut self, pane_id: &PaneId) -> Result<(), HostError>;
+    /// Closes a plain terminal left in a former dock slot after server restore.
+    fn close_terminal_pane(&mut self, pane_id: &PaneId) -> Result<(), HostError>;
     fn move_to_right_edge(&mut self, pane_id: &PaneId) -> Result<(), HostError>;
     fn resize_pane(&mut self, pane_id: &PaneId, width: DockWidth) -> Result<(), HostError>;
 }

@@ -234,6 +234,18 @@ impl DockLauncher {
             return RecordOutcome::Dropped;
         }
 
+        // Herdr restores the former plugin pane as a shell with its saved ID.
+        // Keep another ordinary terminal before removing that shell.
+        let stale_pane_id = panes
+            .iter()
+            .find(|pane| pane.pane_id().as_str() == record.dock_pane_id)
+            .and_then(|stale| {
+                panes
+                    .iter()
+                    .any(|pane| pane.pane_id() != stale.pane_id() && !pane.is_dock())
+                    .then(|| stale.pane_id().clone())
+            });
+
         // Capture focus before reconcile: the identity probes below focus
         // candidate panes as a side effect of verifying them.
         let focused_pane_id = panes
@@ -247,7 +259,14 @@ impl DockLauncher {
         let keeper = match reconcile_docks(host, &panes) {
             Ok(Some(dock)) => dock.pane_id().clone(),
             Ok(None) => {
-                match self.open_restored_dock(host, &workspace_id, &tab_id, &panes, record) {
+                match self.open_restored_dock(
+                    host,
+                    &workspace_id,
+                    &tab_id,
+                    &panes,
+                    stale_pane_id.as_ref(),
+                    record,
+                ) {
                     Ok(keeper) => keeper,
                     Err(error) => {
                         return self.defer_record(
@@ -265,7 +284,26 @@ impl DockLauncher {
                 return self.defer_record(host, &workspace_id, &tab_id, focused, &error, record);
             }
         };
-        refocus_focused_pane(host, &workspace_id, &tab_id, focused);
+        if let Some(stale_pane_id) = &stale_pane_id
+            && *stale_pane_id != keeper
+            && let Err(error) = close_restored_shell(host, &workspace_id, &tab_id, stale_pane_id)
+        {
+            eprintln!(
+                "herdr-context: restore could not close old dock shell {}: {error}",
+                stale_pane_id.as_str()
+            );
+        }
+        let restored_focus = if focused == stale_pane_id.as_ref()
+            && stale_pane_id.as_ref().is_some_and(|stale| *stale != keeper)
+        {
+            panes
+                .iter()
+                .find(|pane| Some(pane.pane_id()) != stale_pane_id.as_ref() && !pane.is_dock())
+                .map(|pane| pane.pane_id())
+        } else {
+            focused
+        };
+        refocus_focused_pane(host, &workspace_id, &tab_id, restored_focus);
         RecordOutcome::Kept(DockRecord {
             workspace_id: record.workspace_id.clone(),
             tab_id: record.tab_id.clone(),
@@ -301,11 +339,18 @@ impl DockLauncher {
         workspace_id: &WorkspaceId,
         tab_id: &TabId,
         panes: &[HostPane],
+        stale_pane_id: Option<&PaneId>,
         record: &DockRecord,
     ) -> Result<PaneId, LauncherError> {
         let target = panes
             .iter()
+            .filter(|pane| Some(pane.pane_id()) != stale_pane_id)
             .find(|pane| pane.is_focused())
+            .or_else(|| {
+                panes
+                    .iter()
+                    .find(|pane| Some(pane.pane_id()) != stale_pane_id && !pane.is_dock())
+            })
             .or_else(|| panes.first())
             .ok_or_else(|| {
                 LauncherError::Invariant("target tab has no pane to split".to_owned())
@@ -376,6 +421,25 @@ impl DockLauncher {
             eprintln!("herdr-context: could not drop the closed dock record: {error}");
         }
     }
+}
+
+fn close_restored_shell(
+    host: &mut impl HostClient,
+    workspace_id: &WorkspaceId,
+    tab_id: &TabId,
+    pane_id: &PaneId,
+) -> Result<(), HostError> {
+    let Some(pane) = host
+        .panes_in_tab(workspace_id, tab_id)?
+        .into_iter()
+        .find(|pane| pane.pane_id() == pane_id)
+    else {
+        return Ok(());
+    };
+    if host.verified_dock_identity(&pane)?.is_none() {
+        host.close_terminal_pane(pane_id)?;
+    }
+    Ok(())
 }
 
 /// Fate of one persisted record after a restore pass.

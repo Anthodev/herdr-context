@@ -46,6 +46,9 @@ case "$*" in
   "plugin pane close opened")
     printf '%s\n' '{{"id":"test","result":{{"type":"plugin_pane_closed","pane_id":"opened"}}}}'
     ;;
+  "pane close dock-old")
+    printf '%s\n' '{{"id":"test","result":{{"type":"pane_closed","pane_id":"dock-old"}}}}'
+    ;;
   "pane swap --direction right --pane opened")
     printf '%s\n' '{{"id":"test","result":{{"type":"pane_swap","swap":{{"changed":false}}}}}}'
     ;;
@@ -109,6 +112,7 @@ esac
     client.resize_pane(&opened, DockWidth::clamped(40))?;
     client.focus_pane(&opened)?;
     client.close_pane(&opened)?;
+    client.close_terminal_pane(&PaneId::new("dock-old")?)?;
     client.send_text(&PaneId::new("origin")?, "@src/file.tmp ")?;
     client.focus_origin_pane(&opened, &PaneId::new("origin")?)?;
 
@@ -119,6 +123,7 @@ esac
     assert!(argv.contains("pane resize --direction right"));
     assert!(argv.contains("plugin pane focus opened"));
     assert!(argv.contains("plugin pane close opened"));
+    assert!(argv.contains("pane close dock-old"));
     assert!(argv.contains("pane send-text origin @src/file.tmp \n"));
     assert!(argv.contains("pane focus --direction left --pane opened"));
     assert!(argv.contains("pane focus --direction left --pane middle"));
